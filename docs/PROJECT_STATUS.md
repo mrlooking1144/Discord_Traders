@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2B.3 Complete
+Milestone 2B.4 Complete
 
 # Completed
 - Project structure
@@ -16,12 +16,13 @@ Milestone 2B.3 Complete
 - Milestone 2B.1: database/schema.sql implemented and validated (see docs/HANDOFFS/2B.1_schema.md)
 - Milestone 2B.2: database/config.py implemented and validated (see docs/HANDOFFS/2B.2_config.md)
 - Milestone 2B.3: database/db.py implemented and validated (see docs/HANDOFFS/2B.3_db.md; commit ae3ebf07d0b2784c2fd849b7174be210e51bfc76)
+- Milestone 2B.4: database/models.py implemented and validated (see docs/HANDOFFS/2B.4_models.md; commit 740e2556b6143d7e0fd983df5f325c516a7b506d)
 
 # Current Focus
-Preparing Milestone 2B.4: data models (database/models.py)
+Preparing Milestone 2B.5: repository access layer (database/repository.py)
 
 # Next Milestone
-Milestone 2B.4 - database/models.py
+Milestone 2B.5 - database/repository.py
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -40,7 +41,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2B.3 (Complete)
+2B.4 (Complete)
 
 Next Action:
-Implement Milestone 2B.4
+Implement Milestone 2B.5

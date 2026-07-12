@@ -10,10 +10,18 @@ rolling back the transaction, exactly as with repository.py.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from database.repository import get_trade_signals_matching
+from database.models import TradeSignal
+from database.repository import (
+    create_trade_signal_edit,
+    get_trade_signal_by_id,
+    get_trade_signals_matching,
+    update_trade_signal as _repository_update_trade_signal,
+    validate_trade_signal_update_fields,
+)
 
 DUPLICATE_WINDOW_MINUTES = 5
 
@@ -110,4 +118,52 @@ class TradeService:
             f"Possible duplicate: {len(matches)} matching trade signal(s) "
             f"found for trader {trader_id} ({symbol} {action}) within the "
             f"last {DUPLICATE_WINDOW_MINUTES} minutes."
+        )
+
+    def update_trade_signal(
+        self,
+        trade_signal_id: int,
+        **changed_fields,
+    ) -> TradeSignal:
+        """Update a trade signal, always preserving edit history.
+
+        Enforces docs/DATABASE_DESIGN_V1.md Section 6: before any correction
+        to trade_signals, a full-row JSON snapshot of the pre-edit values is
+        written to trade_signal_edits via database/repository.py. Field
+        validation is delegated to
+        repository.validate_trade_signal_update_fields(), the single source
+        of truth shared with repository.update_trade_signal(), so this
+        method cannot diverge from the repository layer on what counts as a
+        valid update.
+
+        Execution order: validate changed_fields, fetch the existing row,
+        write the edit snapshot, then apply the update - in that order, so
+        no edit row is ever written for an update that will not happen.
+
+        Args:
+            trade_signal_id: Primary key of the trade signal to update.
+            **changed_fields: One or more of raw_message_id, trader_id,
+                symbol, action, option_type, price, expiration,
+                position_size. Optional fields may be explicitly set to
+                None.
+
+        Returns:
+            The updated TradeSignal.
+
+        Raises:
+            ValueError: If changed_fields fails validation (see
+                repository.validate_trade_signal_update_fields), or if no
+                trade signal exists with trade_signal_id.
+            TypeError: If price is supplied and is not a Decimal.
+        """
+        validate_trade_signal_update_fields(changed_fields)
+
+        existing = get_trade_signal_by_id(self.conn, trade_signal_id)
+        if existing is None:
+            raise ValueError(f"No trade signal exists with id {trade_signal_id}.")
+
+        create_trade_signal_edit(self.conn, trade_signal_id, asdict(existing))
+
+        return _repository_update_trade_signal(
+            self.conn, trade_signal_id, **changed_fields
         )

@@ -2,13 +2,16 @@
 
 Covers Milestone 2B.6a: TradeService scaffold and the
 check_duplicate_signal advisory duplicate check.
+Covers Milestone 2B.6b: the edit-on-update rule.
 """
 
+import json
 import os
 import tempfile
 import unittest
 from decimal import Decimal
 
+from database import repository
 from database.config import DatabaseConfig
 from database.db import get_connection, initialize_database
 from database.repository import (
@@ -16,6 +19,7 @@ from database.repository import (
     create_trade_signal,
     create_trader,
     get_or_create_source,
+    get_trade_signal_edits,
 )
 from database.service import DUPLICATE_WINDOW_MINUTES, TradeService
 
@@ -296,6 +300,124 @@ class TradeServiceCheckDuplicateSignalTests(unittest.TestCase):
             self.assertEqual(row[0], 0)
         finally:
             other_connection.close()
+
+
+class TradeServiceUpdateTradeSignalTests(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader.id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+        )
+        self.connection.commit()
+
+        self.trader_id = trader.id
+        self.raw_message_id = raw_message.id
+        self.signal_id = signal.id
+        self.original_symbol = signal.symbol
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _edit_count(self):
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_signal_edits"
+        ).fetchone()
+        return row[0]
+
+    def test_update_returns_updated_signal(self):
+        updated = self.service.update_trade_signal(self.signal_id, symbol="QQQ")
+
+        self.assertEqual(updated.symbol, "QQQ")
+        self.assertEqual(updated.id, self.signal_id)
+
+    def test_update_writes_exactly_one_edit_with_correct_pre_edit_snapshot(self):
+        self.service.update_trade_signal(self.signal_id, symbol="QQQ")
+
+        edits = get_trade_signal_edits(self.connection, self.signal_id)
+
+        self.assertEqual(len(edits), 1)
+        snapshot = json.loads(edits[0].previous_values)
+        self.assertEqual(snapshot["symbol"], "SPY")
+        self.assertEqual(snapshot["option_type"], "call")
+        self.assertEqual(snapshot["price"], "3.25")
+
+    def test_multiple_updates_produce_ordered_history(self):
+        self.service.update_trade_signal(self.signal_id, symbol="QQQ")
+        self.service.update_trade_signal(self.signal_id, symbol="IWM")
+
+        edits = get_trade_signal_edits(self.connection, self.signal_id)
+
+        self.assertEqual(len(edits), 2)
+        self.assertLess(edits[0].id, edits[1].id)
+        self.assertEqual(json.loads(edits[0].previous_values)["symbol"], "SPY")
+        self.assertEqual(json.loads(edits[1].previous_values)["symbol"], "QQQ")
+
+    def test_missing_trade_signal_raises_and_writes_no_edit(self):
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(999999, symbol="QQQ")
+
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_empty_update_raises_and_writes_no_edit(self):
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(self.signal_id)
+
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_unknown_field_raises_and_writes_no_edit(self):
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(self.signal_id, not_a_real_field="x")
+
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_invalid_price_type_raises_and_writes_no_edit(self):
+        with self.assertRaises(TypeError):
+            self.service.update_trade_signal(self.signal_id, price=3.25)
+
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_service_and_repository_reject_the_same_invalid_updates(self):
+        invalid_cases = [
+            ({}, ValueError),
+            ({"not_a_real_field": "x"}, ValueError),
+            ({"id": 999}, ValueError),
+            ({"created_at": "2000-01-01T00:00:00"}, ValueError),
+            ({"updated_at": "2000-01-01T00:00:00"}, ValueError),
+            ({"raw_message_id": None}, ValueError),
+            ({"trader_id": None}, ValueError),
+            ({"symbol": "   "}, ValueError),
+            ({"action": "   "}, ValueError),
+            ({"price": 3.25}, TypeError),
+            ({"price": "3.25"}, TypeError),
+        ]
+
+        for changed_fields, expected_exception in invalid_cases:
+            with self.subTest(changed_fields=changed_fields):
+                with self.assertRaises(expected_exception):
+                    repository.update_trade_signal(
+                        self.connection, self.signal_id, **changed_fields
+                    )
+                with self.assertRaises(expected_exception):
+                    self.service.update_trade_signal(self.signal_id, **changed_fields)
+
+                self.assertEqual(self._edit_count(), 0)
 
 
 if __name__ == "__main__":

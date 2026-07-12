@@ -516,6 +516,59 @@ def get_trade_signal_by_id(
     return _row_to_trade_signal(row)
 
 
+def validate_trade_signal_update_fields(changed_fields: dict) -> None:
+    """Validate a proposed set of trade_signals update fields.
+
+    Single source of truth for update-field validation: both
+    update_trade_signal() (below) and TradeService.update_trade_signal()
+    (database/service.py) call this, so the two layers cannot diverge on
+    what counts as a valid update. This function only validates - it makes
+    no database calls and performs no serialization.
+
+    Args:
+        changed_fields: Proposed field/value pairs, in the same shape as
+            update_trade_signal()'s **changed_fields.
+
+    Raises:
+        ValueError: If changed_fields is empty, contains an unknown field
+            name, contains a protected field (id, created_at, updated_at),
+            or sets a required field (raw_message_id, trader_id, symbol,
+            action) to an invalid value.
+        TypeError: If price is supplied and is not a Decimal or None.
+    """
+    if not changed_fields:
+        raise ValueError("update_trade_signal requires at least one field to update.")
+
+    unknown_fields = (
+        set(changed_fields) - _TRADE_SIGNAL_EDITABLE_FIELDS - _TRADE_SIGNAL_PROTECTED_FIELDS
+    )
+    if unknown_fields:
+        raise ValueError(f"Unknown trade_signal field(s): {sorted(unknown_fields)}")
+
+    protected_fields = set(changed_fields) & _TRADE_SIGNAL_PROTECTED_FIELDS
+    if protected_fields:
+        raise ValueError(f"Cannot update protected field(s): {sorted(protected_fields)}")
+
+    if "raw_message_id" in changed_fields and changed_fields["raw_message_id"] is None:
+        raise ValueError("raw_message_id is required.")
+    if "trader_id" in changed_fields and changed_fields["trader_id"] is None:
+        raise ValueError("trader_id is required.")
+    if "symbol" in changed_fields:
+        symbol = changed_fields["symbol"]
+        if symbol is None or not symbol.strip():
+            raise ValueError("symbol must not be empty or whitespace-only.")
+    if "action" in changed_fields:
+        action = changed_fields["action"]
+        if action is None or not action.strip():
+            raise ValueError("action must not be empty or whitespace-only.")
+    if "price" in changed_fields:
+        price = changed_fields["price"]
+        if price is not None and not isinstance(price, Decimal):
+            raise TypeError(
+                f"price must be a Decimal or None, got {type(price).__name__}."
+            )
+
+
 def update_trade_signal(
     conn: sqlite3.Connection,
     trade_signal_id: int,
@@ -546,31 +599,7 @@ def update_trade_signal(
             action) to an invalid value.
         TypeError: If price is supplied and is not a Decimal.
     """
-    if not changed_fields:
-        raise ValueError("update_trade_signal requires at least one field to update.")
-
-    unknown_fields = (
-        set(changed_fields) - _TRADE_SIGNAL_EDITABLE_FIELDS - _TRADE_SIGNAL_PROTECTED_FIELDS
-    )
-    if unknown_fields:
-        raise ValueError(f"Unknown trade_signal field(s): {sorted(unknown_fields)}")
-
-    protected_fields = set(changed_fields) & _TRADE_SIGNAL_PROTECTED_FIELDS
-    if protected_fields:
-        raise ValueError(f"Cannot update protected field(s): {sorted(protected_fields)}")
-
-    if "raw_message_id" in changed_fields and changed_fields["raw_message_id"] is None:
-        raise ValueError("raw_message_id is required.")
-    if "trader_id" in changed_fields and changed_fields["trader_id"] is None:
-        raise ValueError("trader_id is required.")
-    if "symbol" in changed_fields:
-        symbol = changed_fields["symbol"]
-        if symbol is None or not symbol.strip():
-            raise ValueError("symbol must not be empty or whitespace-only.")
-    if "action" in changed_fields:
-        action = changed_fields["action"]
-        if action is None or not action.strip():
-            raise ValueError("action must not be empty or whitespace-only.")
+    validate_trade_signal_update_fields(changed_fields)
 
     values = dict(changed_fields)
     if "price" in values:

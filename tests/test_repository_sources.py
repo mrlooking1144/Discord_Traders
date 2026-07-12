@@ -1,7 +1,8 @@
 """Tests for repository access.
 
 Covers Milestone 2B.5a (sources), 2B.5b (traders), 2B.5c (raw_messages),
-2B.5d (trade_signals), and 2B.5e (trade_signal_edits).
+2B.5d (trade_signals), 2B.5e (trade_signal_edits), and the
+get_trade_signals_matching lookup added in 2B.6a.
 """
 
 import hashlib
@@ -28,6 +29,7 @@ from database.repository import (
     get_source_by_name,
     get_trade_signal_by_id,
     get_trade_signal_edits,
+    get_trade_signals_matching,
     get_trader_by_external_id,
     get_traders_by_name,
     update_trade_signal,
@@ -1185,6 +1187,331 @@ class TradeSignalEditsRepositoryTests(unittest.TestCase):
         history = get_trade_signal_edits(self.connection, self.trade_signal_id)
 
         self.assertEqual(history, [])
+
+
+class TradeSignalsMatchingRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        self.connection.commit()
+
+        self.source_id = source_id
+        self.trader_id = trader.id
+        self.raw_message_id = raw_message.id
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _create_signal_at(self, created_at, **kwargs):
+        fields = {
+            "raw_message_id": self.raw_message_id,
+            "trader_id": self.trader_id,
+            "symbol": "SPY",
+            "action": "BTO",
+            "option_type": "call",
+            "price": Decimal("3.25"),
+            "expiration": "2026-12-18",
+        }
+        fields.update(kwargs)
+        signal = create_trade_signal(self.connection, **fields)
+        self.connection.execute(
+            "UPDATE trade_signals SET created_at = ? WHERE id = ?",
+            (created_at, signal.id),
+        )
+        self.connection.commit()
+        return signal
+
+    def test_match_found_within_window(self):
+        self._create_signal_at("2026-07-12 12:03:00")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(len(matches), 1)
+
+    def test_no_match_trader_id_differs(self):
+        other_trader = create_trader(self.connection, self.source_id, "bob")
+        self.connection.commit()
+        self._create_signal_at("2026-07-12 12:03:00", trader_id=other_trader.id)
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_symbol_differs(self):
+        self._create_signal_at("2026-07-12 12:03:00", symbol="QQQ")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_action_differs(self):
+        self._create_signal_at("2026-07-12 12:03:00", action="STC")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_option_type_differs(self):
+        self._create_signal_at("2026-07-12 12:03:00", option_type="put")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_price_differs(self):
+        self._create_signal_at("2026-07-12 12:03:00", price=Decimal("4.00"))
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_expiration_differs(self):
+        self._create_signal_at("2026-07-12 12:03:00", expiration="2026-11-20")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_no_match_outside_window(self):
+        self._create_signal_at("2026-07-12 11:54:00")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_window_start_boundary_is_inclusive(self):
+        self._create_signal_at("2026-07-12 12:00:00")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(len(matches), 1)
+
+    def test_window_end_boundary_is_inclusive(self):
+        self._create_signal_at("2026-07-12 12:05:00")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(len(matches), 1)
+
+    def test_none_option_type_price_expiration_matches(self):
+        self._create_signal_at(
+            "2026-07-12 12:03:00", option_type=None, price=None, expiration=None
+        )
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            None,
+            None,
+            None,
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(len(matches), 1)
+
+    def test_empty_list_when_no_matches_exist(self):
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_multiple_matches_ordered_by_id_ascending(self):
+        first = self._create_signal_at("2026-07-12 12:01:00")
+        second = self._create_signal_at("2026-07-12 12:02:00")
+        third = self._create_signal_at("2026-07-12 12:03:00")
+
+        matches = get_trade_signals_matching(
+            self.connection,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "2026-07-12 12:00:00",
+            "2026-07-12 12:05:00",
+        )
+
+        self.assertEqual(
+            [match.id for match in matches], [first.id, second.id, third.id]
+        )
+
+    def test_missing_trader_id_rejected(self):
+        with self.assertRaises(ValueError):
+            get_trade_signals_matching(
+                self.connection,
+                None,
+                "SPY",
+                "BTO",
+                "call",
+                Decimal("3.25"),
+                "2026-12-18",
+                "2026-07-12 12:00:00",
+                "2026-07-12 12:05:00",
+            )
+
+    def test_whitespace_only_symbol_rejected(self):
+        with self.assertRaises(ValueError):
+            get_trade_signals_matching(
+                self.connection,
+                self.trader_id,
+                "   ",
+                "BTO",
+                "call",
+                Decimal("3.25"),
+                "2026-12-18",
+                "2026-07-12 12:00:00",
+                "2026-07-12 12:05:00",
+            )
+
+    def test_whitespace_only_action_rejected(self):
+        with self.assertRaises(ValueError):
+            get_trade_signals_matching(
+                self.connection,
+                self.trader_id,
+                "SPY",
+                "   ",
+                "call",
+                Decimal("3.25"),
+                "2026-12-18",
+                "2026-07-12 12:00:00",
+                "2026-07-12 12:05:00",
+            )
+
+    def test_invalid_price_type_rejected(self):
+        with self.assertRaises(TypeError):
+            get_trade_signals_matching(
+                self.connection,
+                self.trader_id,
+                "SPY",
+                "BTO",
+                "call",
+                3.25,
+                "2026-12-18",
+                "2026-07-12 12:00:00",
+                "2026-07-12 12:05:00",
+            )
 
 
 if __name__ == "__main__":

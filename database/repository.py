@@ -678,3 +678,73 @@ def get_trade_signal_edits(
         (trade_signal_id,),
     ).fetchall()
     return [_row_to_trade_signal_edit(row) for row in rows]
+
+
+def get_trade_signals_matching(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    action: str,
+    option_type: str | None,
+    price: Decimal | None,
+    expiration: str | None,
+    window_start: str,
+    window_end: str,
+) -> list[TradeSignal]:
+    """Look up trade signals matching an exact field set within a time range.
+
+    Purely mechanical field- and time-range matching: this function has no
+    concept of "duplicate" or "advisory window" - that meaning belongs to
+    TradeService (Milestone 2B.6a). option_type, price, and expiration are
+    matched with SQL's NULL-safe ``IS`` so that None on both sides counts as
+    a match.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol to match exactly.
+        action: Free-text trade action to match exactly.
+        option_type: Free-text call/put to match exactly, or None.
+        price: A Decimal price to match exactly, or None. Never a float or
+            string.
+        expiration: ISO8601 date string to match exactly, or None.
+        window_start: Inclusive lower bound on trade_signals.created_at.
+        window_end: Inclusive upper bound on trade_signals.created_at.
+
+    Returns:
+        All matching TradeSignals, ordered by id ascending. Empty list if
+        none match.
+
+    Raises:
+        ValueError: If trader_id is None, or if symbol or action is None,
+            empty, or whitespace-only.
+        TypeError: If price is supplied and is not a Decimal.
+    """
+    if trader_id is None:
+        raise ValueError("trader_id is required.")
+    if symbol is None or not symbol.strip():
+        raise ValueError("symbol must not be empty or whitespace-only.")
+    if action is None or not action.strip():
+        raise ValueError("action must not be empty or whitespace-only.")
+    price_text = _serialize_price(price)
+
+    rows = conn.execute(
+        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
+        "price, expiration, position_size, created_at, updated_at "
+        "FROM trade_signals "
+        "WHERE trader_id = ? AND symbol = ? AND action = ? "
+        "AND option_type IS ? AND price IS ? AND expiration IS ? "
+        "AND created_at BETWEEN ? AND ? "
+        "ORDER BY id",
+        (
+            trader_id,
+            symbol,
+            action,
+            option_type,
+            price_text,
+            expiration,
+            window_start,
+            window_end,
+        ),
+    ).fetchall()
+    return [_row_to_trade_signal(row) for row in rows]

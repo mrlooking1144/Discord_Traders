@@ -1,11 +1,12 @@
 """Tests for repository access.
 
 Covers Milestone 2B.5a (sources), 2B.5b (traders), 2B.5c (raw_messages),
-and 2B.5d (trade_signals).
+2B.5d (trade_signals), and 2B.5e (trade_signal_edits).
 """
 
 import hashlib
 import inspect
+import json
 import os
 import sqlite3
 import tempfile
@@ -14,17 +15,19 @@ from decimal import Decimal
 
 from database.config import DatabaseConfig
 from database.db import get_connection, initialize_database
-from database.models import RawMessage, Source, Trader, TradeSignal
+from database.models import RawMessage, Source, Trader, TradeSignal, TradeSignalEdit
 from database import repository
 from database.repository import (
     create_raw_message,
     create_trade_signal,
+    create_trade_signal_edit,
     create_trader,
     get_or_create_source,
     get_raw_message_by_external_id,
     get_raw_messages_by_content_hash,
     get_source_by_name,
     get_trade_signal_by_id,
+    get_trade_signal_edits,
     get_trader_by_external_id,
     get_traders_by_name,
     update_trade_signal,
@@ -960,8 +963,228 @@ class TradeSignalsRepositoryTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(count, 0)
 
+        update_source = inspect.getsource(repository.update_trade_signal)
+        self.assertNotIn("INSERT INTO trade_signal_edits", update_source)
+        self.assertNotIn("create_trade_signal_edit", update_source)
+
+
+class TradeSignalEditsRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        signal = create_trade_signal(
+            self.connection, raw_message.id, trader.id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        self.source_id = source_id
+        self.trader_id = trader.id
+        self.raw_message_id = raw_message.id
+        self.trade_signal_id = signal.id
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def test_create_trade_signal_edit_from_dict(self):
+        edit = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY", "action": "BTO"}
+        )
+        self.connection.commit()
+
+        self.assertIsInstance(edit, TradeSignalEdit)
+        self.assertEqual(edit.trade_signal_id, self.trade_signal_id)
+        self.assertEqual(edit.previous_values, '{"action": "BTO", "symbol": "SPY"}')
+
+    def test_create_trade_signal_edit_returns_generated_id_and_edited_at(self):
+        edit = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY"}
+        )
+        self.connection.commit()
+
+        self.assertIsNotNone(edit.id)
+        self.assertIsNotNone(edit.edited_at)
+
+    def test_serialization_is_deterministic_with_sorted_keys(self):
+        edit_a = create_trade_signal_edit(
+            self.connection,
+            self.trade_signal_id,
+            {"symbol": "SPY", "action": "BTO", "price": "3.25"},
+        )
+        edit_b = create_trade_signal_edit(
+            self.connection,
+            self.trade_signal_id,
+            {"price": "3.25", "action": "BTO", "symbol": "SPY"},
+        )
+        self.connection.commit()
+
+        self.assertEqual(edit_a.previous_values, edit_b.previous_values)
+        self.assertEqual(
+            edit_a.previous_values,
+            '{"action": "BTO", "price": "3.25", "symbol": "SPY"}',
+        )
+
+    def test_nested_dicts_and_lists_round_trip(self):
+        previous_values = {
+            "symbol": "SPY",
+            "legs": [{"strike": 500, "type": "call"}, {"strike": 505, "type": "call"}],
+            "meta": {"source": "discord", "tags": ["swing", "options"]},
+        }
+
+        edit = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, previous_values
+        )
+        self.connection.commit()
+
+        found = get_trade_signal_edits(self.connection, self.trade_signal_id)[0]
+
+        self.assertEqual(json.loads(found.previous_values), previous_values)
+        self.assertEqual(found.id, edit.id)
+
+    def test_empty_dict_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal_edit(self.connection, self.trade_signal_id, {})
+
+    def test_none_previous_values_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal_edit(self.connection, self.trade_signal_id, None)
+
+    def test_string_previous_values_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal_edit(
+                self.connection, self.trade_signal_id, '{"symbol": "SPY"}'
+            )
+
+    def test_list_previous_values_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal_edit(self.connection, self.trade_signal_id, ["SPY"])
+
+    def test_int_previous_values_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal_edit(self.connection, self.trade_signal_id, 123)
+
+    def test_missing_trade_signal_id_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal_edit(self.connection, None, {"symbol": "SPY"})
+
+    def test_foreign_key_failure_propagates(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            create_trade_signal_edit(self.connection, 999999, {"symbol": "SPY"})
+
+    def test_multiple_edits_ordered_by_id_ascending(self):
+        first = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY"}
+        )
+        second = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "QQQ"}
+        )
+        third = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "IWM"}
+        )
+        self.connection.commit()
+
+        history = get_trade_signal_edits(self.connection, self.trade_signal_id)
+
+        self.assertEqual([edit.id for edit in history], [first.id, second.id, third.id])
+
+    def test_results_scoped_to_requested_trade_signal_id(self):
+        other_raw_message = create_raw_message(
+            self.connection, self.source_id, "STC SPY 500c"
+        )
+        other_signal = create_trade_signal(
+            self.connection, other_raw_message.id, self.trader_id, "SPY", "STC"
+        )
+        self.connection.commit()
+
+        create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY"}
+        )
+        create_trade_signal_edit(
+            self.connection, other_signal.id, {"symbol": "OTHER"}
+        )
+        self.connection.commit()
+
+        history = get_trade_signal_edits(self.connection, self.trade_signal_id)
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].trade_signal_id, self.trade_signal_id)
+
+    def test_no_edits_returns_empty_list(self):
+        history = get_trade_signal_edits(self.connection, self.trade_signal_id)
+
+        self.assertEqual(history, [])
+
+    def test_identical_snapshots_insertable_more_than_once(self):
+        first = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY"}
+        )
+        second = create_trade_signal_edit(
+            self.connection, self.trade_signal_id, {"symbol": "SPY"}
+        )
+        self.connection.commit()
+
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.previous_values, second.previous_values)
+
+        history = get_trade_signal_edits(self.connection, self.trade_signal_id)
+        self.assertEqual(len(history), 2)
+
+    def test_create_trade_signal_edit_not_committed_automatically(self):
+        other_connection = get_connection(self.config)
+        try:
+            created = create_trade_signal_edit(
+                self.connection, self.trade_signal_id, {"symbol": "SPY"}
+            )
+
+            row = other_connection.execute(
+                "SELECT * FROM trade_signal_edits WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertIsNone(row)
+
+            self.connection.commit()
+
+            row = other_connection.execute(
+                "SELECT * FROM trade_signal_edits WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            other_connection.close()
+
+    def test_no_trade_signal_edit_update_or_delete_function_exists(self):
+        public_names = [
+            name
+            for name in dir(repository)
+            if not name.startswith("_") and callable(getattr(repository, name))
+        ]
+        self.assertFalse(
+            any(
+                "trade_signal_edit" in name.lower()
+                and ("update" in name.lower() or "delete" in name.lower())
+                for name in public_names
+            ),
+            "No update or delete function should exist for trade_signal_edits; "
+            "it is append-only.",
+        )
+
         source = inspect.getsource(repository)
-        self.assertNotIn("INSERT INTO trade_signal_edits", source)
+        self.assertNotIn("UPDATE trade_signal_edits", source)
+        self.assertNotIn("DELETE FROM trade_signal_edits", source)
+
+    def test_update_trade_signal_still_does_not_create_history(self):
+        update_trade_signal(self.connection, self.trade_signal_id, symbol="QQQ")
+        self.connection.commit()
+
+        history = get_trade_signal_edits(self.connection, self.trade_signal_id)
+
+        self.assertEqual(history, [])
 
 
 if __name__ == "__main__":

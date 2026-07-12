@@ -14,7 +14,7 @@ import sqlite3
 from decimal import Decimal
 from typing import Optional
 
-from database.models import RawMessage, Source, Trader, TradeSignal
+from database.models import RawMessage, Source, Trader, TradeSignal, TradeSignalEdit
 
 
 def _validate_source_name(name: str) -> None:
@@ -586,3 +586,95 @@ def update_trade_signal(
     )
 
     return get_trade_signal_by_id(conn, trade_signal_id)
+
+
+def _row_to_trade_signal_edit(row: sqlite3.Row) -> TradeSignalEdit:
+    """Map a ``trade_signal_edits`` table row to a TradeSignalEdit model.
+
+    Args:
+        row: A row from the trade_signal_edits table, with all columns
+            selected.
+
+    Returns:
+        The corresponding TradeSignalEdit.
+    """
+    return TradeSignalEdit(
+        id=row["id"],
+        trade_signal_id=row["trade_signal_id"],
+        previous_values=row["previous_values"],
+        edited_at=row["edited_at"],
+    )
+
+
+def create_trade_signal_edit(
+    conn: sqlite3.Connection,
+    trade_signal_id: int,
+    previous_values: dict,
+) -> TradeSignalEdit:
+    """Insert a full-row JSON snapshot of a trade signal's pre-edit values.
+
+    This function only records a snapshot; it does not decide when an edit
+    occurs or call update_trade_signal - that orchestration belongs to
+    TradeService (Milestone 2B.6).
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_id: FK to trade_signals.id.
+        previous_values: The full pre-edit trade_signals row, as a dict. No
+            schema is enforced on its contents.
+
+    Returns:
+        The newly created TradeSignalEdit, including its generated id and
+        DB-defaulted edited_at.
+
+    Raises:
+        ValueError: If trade_signal_id is None, or if previous_values is an
+            empty dict.
+        TypeError: If previous_values is not a dict (including None).
+        sqlite3.IntegrityError: If trade_signal_id does not reference an
+            existing trade_signals row.
+    """
+    if trade_signal_id is None:
+        raise ValueError("trade_signal_id is required.")
+    if not isinstance(previous_values, dict):
+        raise TypeError(
+            f"previous_values must be a dict, got {type(previous_values).__name__}."
+        )
+    if not previous_values:
+        raise ValueError("previous_values must not be an empty dict.")
+
+    serialized_previous_values = json.dumps(previous_values, sort_keys=True)
+
+    cursor = conn.execute(
+        "INSERT INTO trade_signal_edits (trade_signal_id, previous_values) "
+        "VALUES (?, ?)",
+        (trade_signal_id, serialized_previous_values),
+    )
+    row = conn.execute(
+        "SELECT id, trade_signal_id, previous_values, edited_at "
+        "FROM trade_signal_edits WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_trade_signal_edit(row)
+
+
+def get_trade_signal_edits(
+    conn: sqlite3.Connection,
+    trade_signal_id: int,
+) -> list[TradeSignalEdit]:
+    """Look up the edit history for a trade signal.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_id: FK to trade_signals.id.
+
+    Returns:
+        All matching TradeSignalEdits, ordered by id ascending (i.e.
+        chronologically). Empty list if none exist.
+    """
+    rows = conn.execute(
+        "SELECT id, trade_signal_id, previous_values, edited_at "
+        "FROM trade_signal_edits WHERE trade_signal_id = ? ORDER BY id",
+        (trade_signal_id,),
+    ).fetchall()
+    return [_row_to_trade_signal_edit(row) for row in rows]

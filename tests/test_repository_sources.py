@@ -1,7 +1,7 @@
 """Tests for repository access.
 
-Covers Milestone 2B.5a (sources), 2B.5b (traders), and 2B.5c
-(raw_messages).
+Covers Milestone 2B.5a (sources), 2B.5b (traders), 2B.5c (raw_messages),
+and 2B.5d (trade_signals).
 """
 
 import hashlib
@@ -10,20 +10,24 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from decimal import Decimal
 
 from database.config import DatabaseConfig
 from database.db import get_connection, initialize_database
-from database.models import RawMessage, Source, Trader
+from database.models import RawMessage, Source, Trader, TradeSignal
 from database import repository
 from database.repository import (
     create_raw_message,
+    create_trade_signal,
     create_trader,
     get_or_create_source,
     get_raw_message_by_external_id,
     get_raw_messages_by_content_hash,
     get_source_by_name,
+    get_trade_signal_by_id,
     get_trader_by_external_id,
     get_traders_by_name,
+    update_trade_signal,
 )
 
 
@@ -522,12 +526,442 @@ class RawMessagesRepositoryTests(unittest.TestCase):
             if not name.startswith("_") and callable(getattr(repository, name))
         ]
         self.assertFalse(
-            any("update" in name.lower() for name in public_names),
-            "No raw-message (or other) update function should exist yet.",
+            any("raw_message" in name.lower() and "update" in name.lower() for name in public_names),
+            "No raw-message update function should exist; raw_text is write-once.",
         )
 
         source = inspect.getsource(repository)
         self.assertNotIn("UPDATE raw_messages", source)
+
+
+class TradeSignalsRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        self.connection.commit()
+
+        self.source_id = source_id
+        self.trader_id = trader.id
+        self.raw_message_id = raw_message.id
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def test_create_trade_signal_required_only(self):
+        signal = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        self.assertIsInstance(signal, TradeSignal)
+        self.assertEqual(signal.raw_message_id, self.raw_message_id)
+        self.assertEqual(signal.trader_id, self.trader_id)
+        self.assertEqual(signal.symbol, "SPY")
+        self.assertEqual(signal.action, "BTO")
+        self.assertIsNone(signal.option_type)
+        self.assertIsNone(signal.price)
+        self.assertIsNone(signal.expiration)
+        self.assertIsNone(signal.position_size)
+
+    def test_create_trade_signal_full_fields(self):
+        signal = create_trade_signal(
+            self.connection,
+            self.raw_message_id,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+            expiration="2026-12-18",
+            position_size="half position",
+        )
+        self.connection.commit()
+
+        self.assertEqual(signal.option_type, "call")
+        self.assertEqual(signal.price, "3.25")
+        self.assertEqual(signal.expiration, "2026-12-18")
+        self.assertEqual(signal.position_size, "half position")
+
+    def test_create_trade_signal_returns_generated_id_created_at_updated_at(self):
+        signal = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        self.assertIsNotNone(signal.id)
+        self.assertIsNotNone(signal.created_at)
+        self.assertIsNotNone(signal.updated_at)
+
+    def test_required_fields_round_trip(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        found = get_trade_signal_by_id(self.connection, created.id)
+
+        self.assertEqual(found.raw_message_id, self.raw_message_id)
+        self.assertEqual(found.trader_id, self.trader_id)
+        self.assertEqual(found.symbol, "SPY")
+        self.assertEqual(found.action, "BTO")
+
+    def test_optional_none_fields_round_trip(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        found = get_trade_signal_by_id(self.connection, created.id)
+
+        self.assertIsNone(found.option_type)
+        self.assertIsNone(found.price)
+        self.assertIsNone(found.expiration)
+        self.assertIsNone(found.position_size)
+
+    def test_full_optional_fields_round_trip(self):
+        created = create_trade_signal(
+            self.connection,
+            self.raw_message_id,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            option_type="put",
+            price=Decimal("0.85"),
+            expiration="2026-01-16",
+            position_size="10 contracts",
+        )
+        self.connection.commit()
+
+        found = get_trade_signal_by_id(self.connection, created.id)
+
+        self.assertEqual(found.option_type, "put")
+        self.assertEqual(found.price, "0.85")
+        self.assertEqual(found.expiration, "2026-01-16")
+        self.assertEqual(found.position_size, "10 contracts")
+
+    def test_decimal_price_stored_and_returned_exactly(self):
+        signal = create_trade_signal(
+            self.connection,
+            self.raw_message_id,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            price=Decimal("3.25"),
+        )
+        self.connection.commit()
+
+        self.assertEqual(signal.price, "3.25")
+        self.assertIsInstance(signal.price, str)
+
+    def test_float_price_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal(
+                self.connection,
+                self.raw_message_id,
+                self.trader_id,
+                "SPY",
+                "BTO",
+                price=3.25,
+            )
+
+    def test_string_price_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal(
+                self.connection,
+                self.raw_message_id,
+                self.trader_id,
+                "SPY",
+                "BTO",
+                price="3.25",
+            )
+
+    def test_int_price_rejected(self):
+        with self.assertRaises(TypeError):
+            create_trade_signal(
+                self.connection,
+                self.raw_message_id,
+                self.trader_id,
+                "SPY",
+                "BTO",
+                price=3,
+            )
+
+    def test_missing_raw_message_id_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(self.connection, None, self.trader_id, "SPY", "BTO")
+
+    def test_missing_trader_id_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(
+                self.connection, self.raw_message_id, None, "SPY", "BTO"
+            )
+
+    def test_empty_symbol_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(
+                self.connection, self.raw_message_id, self.trader_id, "", "BTO"
+            )
+
+    def test_whitespace_only_symbol_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(
+                self.connection, self.raw_message_id, self.trader_id, "   ", "BTO"
+            )
+
+    def test_empty_action_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(
+                self.connection, self.raw_message_id, self.trader_id, "SPY", ""
+            )
+
+    def test_whitespace_only_action_rejected(self):
+        with self.assertRaises(ValueError):
+            create_trade_signal(
+                self.connection, self.raw_message_id, self.trader_id, "SPY", "   "
+            )
+
+    def test_foreign_key_failure_propagates(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            create_trade_signal(self.connection, 999999, self.trader_id, "SPY", "BTO")
+
+    def test_lookup_by_existing_id_returns_row(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        found = get_trade_signal_by_id(self.connection, created.id)
+
+        self.assertEqual(found, created)
+
+    def test_lookup_by_missing_id_returns_none(self):
+        result = get_trade_signal_by_id(self.connection, 999999)
+
+        self.assertIsNone(result)
+
+    def test_partial_update_changes_only_supplied_fields(self):
+        created = create_trade_signal(
+            self.connection,
+            self.raw_message_id,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+        )
+        self.connection.commit()
+
+        updated = update_trade_signal(self.connection, created.id, symbol="QQQ")
+        self.connection.commit()
+
+        self.assertEqual(updated.symbol, "QQQ")
+        self.assertEqual(updated.action, "BTO")
+        self.assertEqual(updated.option_type, "call")
+        self.assertEqual(updated.price, "3.25")
+
+    def test_update_changes_updated_at(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        # Deterministically age the row instead of sleeping across a
+        # CURRENT_TIMESTAMP tick.
+        self.connection.execute(
+            "UPDATE trade_signals SET updated_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", created.id),
+        )
+        self.connection.commit()
+
+        updated = update_trade_signal(self.connection, created.id, symbol="QQQ")
+        self.connection.commit()
+
+        self.assertNotEqual(updated.updated_at, "2000-01-01T00:00:00")
+
+    def test_optional_fields_can_be_updated_to_none(self):
+        created = create_trade_signal(
+            self.connection,
+            self.raw_message_id,
+            self.trader_id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+        )
+        self.connection.commit()
+
+        updated = update_trade_signal(
+            self.connection, created.id, option_type=None, price=None
+        )
+        self.connection.commit()
+
+        self.assertIsNone(updated.option_type)
+        self.assertIsNone(updated.price)
+
+    def test_update_rejects_none_raw_message_id(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, raw_message_id=None)
+
+    def test_update_rejects_none_trader_id(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, trader_id=None)
+
+    def test_update_rejects_whitespace_only_symbol(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, symbol="   ")
+
+    def test_update_rejects_whitespace_only_action(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, action="   ")
+
+    def test_update_rejects_float_price(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(TypeError):
+            update_trade_signal(self.connection, created.id, price=3.25)
+
+    def test_update_rejects_string_price(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(TypeError):
+            update_trade_signal(self.connection, created.id, price="3.25")
+
+    def test_unknown_update_field_rejected(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, not_a_real_field="x")
+
+    def test_protected_fields_cannot_be_updated(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id, id=999)
+        with self.assertRaises(ValueError):
+            update_trade_signal(
+                self.connection, created.id, created_at="2000-01-01T00:00:00"
+            )
+        with self.assertRaises(ValueError):
+            update_trade_signal(
+                self.connection, created.id, updated_at="2000-01-01T00:00:00"
+            )
+
+    def test_empty_update_rejected(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            update_trade_signal(self.connection, created.id)
+
+    def test_missing_row_update_returns_none(self):
+        result = update_trade_signal(self.connection, 999999, symbol="QQQ")
+
+        self.assertIsNone(result)
+
+    def test_create_trade_signal_not_committed_automatically(self):
+        other_connection = get_connection(self.config)
+        try:
+            created = create_trade_signal(
+                self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+            )
+
+            row = other_connection.execute(
+                "SELECT * FROM trade_signals WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertIsNone(row)
+
+            self.connection.commit()
+
+            row = other_connection.execute(
+                "SELECT * FROM trade_signals WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            other_connection.close()
+
+    def test_update_trade_signal_not_committed_automatically(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        other_connection = get_connection(self.config)
+        try:
+            update_trade_signal(self.connection, created.id, symbol="QQQ")
+
+            row = other_connection.execute(
+                "SELECT symbol FROM trade_signals WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertEqual(row["symbol"], "SPY")
+
+            self.connection.commit()
+
+            row = other_connection.execute(
+                "SELECT symbol FROM trade_signals WHERE id = ?", (created.id,)
+            ).fetchone()
+            self.assertEqual(row["symbol"], "QQQ")
+        finally:
+            other_connection.close()
+
+    def test_no_trade_signal_edits_row_created(self):
+        created = create_trade_signal(
+            self.connection, self.raw_message_id, self.trader_id, "SPY", "BTO"
+        )
+        self.connection.commit()
+
+        update_trade_signal(self.connection, created.id, symbol="QQQ")
+        self.connection.commit()
+
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_signal_edits"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+        source = inspect.getsource(repository)
+        self.assertNotIn("INSERT INTO trade_signal_edits", source)
 
 
 if __name__ == "__main__":

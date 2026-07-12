@@ -11,9 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from decimal import Decimal
 from typing import Optional
 
-from database.models import RawMessage, Source, Trader
+from database.models import RawMessage, Source, Trader, TradeSignal
 
 
 def _validate_source_name(name: str) -> None:
@@ -331,3 +332,257 @@ def get_raw_messages_by_content_hash(
         (content_hash,),
     ).fetchall()
     return [_row_to_raw_message(row) for row in rows]
+
+
+_TRADE_SIGNAL_EDITABLE_FIELDS = frozenset(
+    {
+        "raw_message_id",
+        "trader_id",
+        "symbol",
+        "action",
+        "option_type",
+        "price",
+        "expiration",
+        "position_size",
+    }
+)
+
+_TRADE_SIGNAL_PROTECTED_FIELDS = frozenset({"id", "created_at", "updated_at"})
+
+
+def _validate_trade_signal_required_fields(
+    raw_message_id: int | None,
+    trader_id: int | None,
+    symbol: str | None,
+    action: str | None,
+) -> None:
+    """Validate the trade_signals fields required by the schema.
+
+    Args:
+        raw_message_id: FK to raw_messages.id.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol.
+        action: Free-text trade action (e.g. BTO/STC).
+
+    Raises:
+        ValueError: If raw_message_id or trader_id is None, or if symbol or
+            action is None, empty, or whitespace-only.
+    """
+    if raw_message_id is None:
+        raise ValueError("raw_message_id is required.")
+    if trader_id is None:
+        raise ValueError("trader_id is required.")
+    if symbol is None or not symbol.strip():
+        raise ValueError("symbol must not be empty or whitespace-only.")
+    if action is None or not action.strip():
+        raise ValueError("action must not be empty or whitespace-only.")
+
+
+def _serialize_price(price: Decimal | None) -> str | None:
+    """Convert a trade signal price to its exact decimal string for storage.
+
+    Binary floating-point is never used for trade prices, per
+    docs/DATABASE_DESIGN_V1.md Section 3. No arithmetic, rounding, or
+    quantization is performed; the Decimal's own string representation is
+    used as-is.
+
+    Args:
+        price: A Decimal price, or None.
+
+    Returns:
+        The exact string representation of price, or None.
+
+    Raises:
+        TypeError: If price is not a Decimal and not None (e.g. float, str,
+            int, or any other type).
+    """
+    if price is None:
+        return None
+    if not isinstance(price, Decimal):
+        raise TypeError(
+            f"price must be a Decimal or None, got {type(price).__name__}."
+        )
+    return str(price)
+
+
+def _row_to_trade_signal(row: sqlite3.Row) -> TradeSignal:
+    """Map a ``trade_signals`` table row to a TradeSignal model.
+
+    Args:
+        row: A row from the trade_signals table, with all columns selected.
+
+    Returns:
+        The corresponding TradeSignal.
+    """
+    return TradeSignal(
+        id=row["id"],
+        raw_message_id=row["raw_message_id"],
+        trader_id=row["trader_id"],
+        symbol=row["symbol"],
+        action=row["action"],
+        option_type=row["option_type"],
+        price=row["price"],
+        expiration=row["expiration"],
+        position_size=row["position_size"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def create_trade_signal(
+    conn: sqlite3.Connection,
+    raw_message_id: int,
+    trader_id: int,
+    symbol: str,
+    action: str,
+    option_type: str | None = None,
+    price: Decimal | None = None,
+    expiration: str | None = None,
+    position_size: str | None = None,
+) -> TradeSignal:
+    """Insert a new trade signal row.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_id: FK to raw_messages.id.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol.
+        action: Free-text trade action (e.g. BTO/STC), stored exactly as
+            supplied (not stripped, uppercased, or otherwise normalized).
+        option_type: Free-text call/put, or None for non-option trades.
+        price: A Decimal price, or None. Never a float or string.
+        expiration: ISO8601 date string, or None.
+        position_size: Raw wording of position size, or None.
+
+    Returns:
+        The newly created TradeSignal, including its generated id,
+        created_at, and updated_at.
+
+    Raises:
+        ValueError: If raw_message_id or trader_id is None, or if symbol or
+            action is None, empty, or whitespace-only.
+        TypeError: If price is supplied and is not a Decimal.
+        sqlite3.IntegrityError: If raw_message_id or trader_id does not
+            reference an existing row.
+    """
+    _validate_trade_signal_required_fields(raw_message_id, trader_id, symbol, action)
+    price_text = _serialize_price(price)
+
+    cursor = conn.execute(
+        "INSERT INTO trade_signals "
+        "(raw_message_id, trader_id, symbol, action, option_type, price, "
+        "expiration, position_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            raw_message_id,
+            trader_id,
+            symbol,
+            action,
+            option_type,
+            price_text,
+            expiration,
+            position_size,
+        ),
+    )
+    row = conn.execute(
+        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
+        "price, expiration, position_size, created_at, updated_at "
+        "FROM trade_signals WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_trade_signal(row)
+
+
+def get_trade_signal_by_id(
+    conn: sqlite3.Connection,
+    trade_signal_id: int,
+) -> TradeSignal | None:
+    """Look up a trade signal by id.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_id: Primary key to look up.
+
+    Returns:
+        The matching TradeSignal, or None if no row exists with this id.
+    """
+    row = conn.execute(
+        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
+        "price, expiration, position_size, created_at, updated_at "
+        "FROM trade_signals WHERE id = ?",
+        (trade_signal_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_trade_signal(row)
+
+
+def update_trade_signal(
+    conn: sqlite3.Connection,
+    trade_signal_id: int,
+    **changed_fields,
+) -> TradeSignal | None:
+    """Apply a partial update to an existing trade signal.
+
+    Only the fields explicitly passed in changed_fields are updated;
+    updated_at is always bumped to CURRENT_TIMESTAMP on a successful update.
+    This function does not write to trade_signal_edits and performs no
+    audit snapshot - that is out of scope for this milestone.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_id: Primary key of the trade signal to update.
+        **changed_fields: One or more of raw_message_id, trader_id, symbol,
+            action, option_type, price, expiration, position_size. Optional
+            fields may be explicitly set to None.
+
+    Returns:
+        The updated TradeSignal, or None if no trade signal exists with
+        this id.
+
+    Raises:
+        ValueError: If changed_fields is empty, contains an unknown field
+            name, contains a protected field (id, created_at, updated_at),
+            or sets a required field (raw_message_id, trader_id, symbol,
+            action) to an invalid value.
+        TypeError: If price is supplied and is not a Decimal.
+    """
+    if not changed_fields:
+        raise ValueError("update_trade_signal requires at least one field to update.")
+
+    unknown_fields = (
+        set(changed_fields) - _TRADE_SIGNAL_EDITABLE_FIELDS - _TRADE_SIGNAL_PROTECTED_FIELDS
+    )
+    if unknown_fields:
+        raise ValueError(f"Unknown trade_signal field(s): {sorted(unknown_fields)}")
+
+    protected_fields = set(changed_fields) & _TRADE_SIGNAL_PROTECTED_FIELDS
+    if protected_fields:
+        raise ValueError(f"Cannot update protected field(s): {sorted(protected_fields)}")
+
+    if "raw_message_id" in changed_fields and changed_fields["raw_message_id"] is None:
+        raise ValueError("raw_message_id is required.")
+    if "trader_id" in changed_fields and changed_fields["trader_id"] is None:
+        raise ValueError("trader_id is required.")
+    if "symbol" in changed_fields:
+        symbol = changed_fields["symbol"]
+        if symbol is None or not symbol.strip():
+            raise ValueError("symbol must not be empty or whitespace-only.")
+    if "action" in changed_fields:
+        action = changed_fields["action"]
+        if action is None or not action.strip():
+            raise ValueError("action must not be empty or whitespace-only.")
+
+    values = dict(changed_fields)
+    if "price" in values:
+        values["price"] = _serialize_price(values["price"])
+
+    set_clauses = [f"{field} = ?" for field in values]
+    set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+    params = list(values.values()) + [trade_signal_id]
+
+    conn.execute(
+        f"UPDATE trade_signals SET {', '.join(set_clauses)} WHERE id = ?",
+        params,
+    )
+
+    return get_trade_signal_by_id(conn, trade_signal_id)

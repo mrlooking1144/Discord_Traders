@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2B.5b Complete
+Milestone 2B.5c Complete
 
 # Completed
 - Project structure
@@ -21,12 +21,15 @@ Milestone 2B.5b Complete
 - Milestone 2B.5b: database/repository.py traders access implemented and validated (see docs/HANDOFFS/2B.5b_traders_repository.md; commit d03eae5)
   - `create_trader()`, `get_trader_by_external_id()`, `get_traders_by_name()`
   - 27/27 tests passing
+- Milestone 2B.5c: database/repository.py raw_messages access implemented and validated (see docs/HANDOFFS/2B.5c_messages_repository.md; commit 9aa33e4)
+  - `create_raw_message()`, `get_raw_message_by_external_id()`, `get_raw_messages_by_content_hash()`
+  - 47/47 tests passing
 
 # Current Focus
-Preparing Milestone 2B.5c: raw_messages repository access (database/repository.py)
+Preparing Milestone 2B.5d — Trades Repository (database/repository.py)
 
 # Next Milestone
-Milestone 2B.5c - database/repository.py (raw_messages access)
+Milestone 2B.5d — Trades Repository (database/repository.py)
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -45,7 +48,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2B.5b (Complete)
+2B.5c (Complete)
 
 Next Action:
-Implement Milestone 2B.5c
+Implement Milestone 2B.5d

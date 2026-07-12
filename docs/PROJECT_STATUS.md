@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2B.6a Complete
+Milestone 2B.6b Complete
 
 # Completed
 - Project structure
@@ -33,12 +33,15 @@ Milestone 2B.6a Complete
 - Milestone 2B.6a: database/service.py TradeService scaffold + duplicate detection implemented and validated (see docs/HANDOFFS/2B.6a_trade_service_duplicate_detection.md; commit 799506bee7c3e320fb1d25044cbf2382637f5511)
   - `TradeService.check_duplicate_signal()`; repository addition: `get_trade_signals_matching()`
   - 133/133 tests passing
+- Milestone 2B.6b: database/service.py edit-on-update rule implemented and validated (see docs/HANDOFFS/2B.6b_trade_service_edit_on_update.md; commit 1ae5dad52b7821ddf5fb92fcd327e2557969658e)
+  - `TradeService.update_trade_signal()`; repository addition: `validate_trade_signal_update_fields()` shared validation helper
+  - 141/141 tests passing
 
 # Current Focus
-Preparing Milestone 2B.6b — edit-on-update rule (database/service.py)
+Preparing Milestone 2B.6c — TradeService.ingest_message(...) (database/service.py)
 
 # Next Milestone
-Milestone 2B.6b — edit-on-update rule (database/service.py)
+Milestone 2B.6c — TradeService.ingest_message(...) (database/service.py)
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -56,7 +59,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2B.6a (Complete)
+2B.6b (Complete)
 
 Next Action:
-Implement Milestone 2B.6b
+Implement Milestone 2B.6c

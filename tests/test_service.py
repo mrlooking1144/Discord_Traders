@@ -3,12 +3,15 @@
 Covers Milestone 2B.6a: TradeService scaffold and the
 check_duplicate_signal advisory duplicate check.
 Covers Milestone 2B.6b: the edit-on-update rule.
+Covers Milestone 2B.6c: the ingest_message entry point.
 """
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from database import repository
@@ -418,6 +421,346 @@ class TradeServiceUpdateTradeSignalTests(unittest.TestCase):
                     self.service.update_trade_signal(self.signal_id, **changed_fields)
 
                 self.assertEqual(self._edit_count(), 0)
+
+
+class TradeServiceIngestMessageTests(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _signal_count(self):
+        row = self.connection.execute("SELECT COUNT(*) FROM trade_signals").fetchone()
+        return row[0]
+
+    def _raw_message_count(self):
+        row = self.connection.execute("SELECT COUNT(*) FROM raw_messages").fetchone()
+        return row[0]
+
+    def _trader_count(self):
+        row = self.connection.execute("SELECT COUNT(*) FROM traders").fetchone()
+        return row[0]
+
+    def _reference_time(self):
+        # trade_signals.created_at is DB-generated using SQLite's
+        # CURRENT_TIMESTAMP, which is UTC, so tests exercising duplicate
+        # detection through ingest_message (as opposed to
+        # check_duplicate_signal directly, which takes signal created_at as
+        # an explicit fixture) need a UTC reference_time bracketing real
+        # "now", not a fixed fictional timestamp or local wall-clock time.
+        return (datetime.now(timezone.utc) + timedelta(minutes=1)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    def test_new_message_with_no_signals_persists_message_only(self):
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "just chatting, no trades here",
+            reference_time="2026-07-13 09:00:00",
+        )
+
+        self.assertEqual(result["raw_message"].raw_text, "just chatting, no trades here")
+        self.assertEqual(result["trade_signals"], [])
+        self.assertEqual(result["duplicate_warnings"], [])
+        self.assertEqual(self._raw_message_count(), 1)
+        self.assertEqual(self._signal_count(), 0)
+
+    def test_new_message_with_one_signal_and_no_duplicate(self):
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            trade_signals=[
+                {
+                    "symbol": "SPY",
+                    "action": "BTO",
+                    "option_type": "call",
+                    "price": Decimal("3.25"),
+                    "expiration": "2026-12-18",
+                }
+            ],
+        )
+
+        self.assertEqual(len(result["trade_signals"]), 1)
+        self.assertEqual(result["trade_signals"][0].symbol, "SPY")
+        self.assertEqual(result["duplicate_warnings"], [None])
+
+    def test_signal_matching_prior_signal_within_window_still_persists_with_warning(self):
+        reference_time = self._reference_time()
+
+        self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25",
+            reference_time=reference_time,
+            external_trader_id="disc-1",
+            trade_signals=[
+                {
+                    "symbol": "SPY",
+                    "action": "BTO",
+                    "option_type": "call",
+                    "price": Decimal("3.25"),
+                    "expiration": "2026-12-18",
+                }
+            ],
+        )
+
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25 again",
+            reference_time=reference_time,
+            external_trader_id="disc-1",
+            trade_signals=[
+                {
+                    "symbol": "SPY",
+                    "action": "BTO",
+                    "option_type": "call",
+                    "price": Decimal("3.25"),
+                    "expiration": "2026-12-18",
+                }
+            ],
+        )
+
+        self.assertEqual(len(result["trade_signals"]), 1)
+        self.assertIsNotNone(result["duplicate_warnings"][0])
+        self.assertEqual(self._signal_count(), 2)
+
+    def test_multiple_signals_mixed_duplicate_and_non_duplicate(self):
+        reference_time = self._reference_time()
+
+        self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25",
+            reference_time=reference_time,
+            external_trader_id="disc-1",
+            trade_signals=[
+                {
+                    "symbol": "SPY",
+                    "action": "BTO",
+                    "option_type": "call",
+                    "price": Decimal("3.25"),
+                    "expiration": "2026-12-18",
+                }
+            ],
+        )
+
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25 and BTO QQQ 400p @1.10",
+            reference_time=reference_time,
+            external_trader_id="disc-1",
+            trade_signals=[
+                {
+                    "symbol": "SPY",
+                    "action": "BTO",
+                    "option_type": "call",
+                    "price": Decimal("3.25"),
+                    "expiration": "2026-12-18",
+                },
+                {
+                    "symbol": "QQQ",
+                    "action": "BTO",
+                    "option_type": "put",
+                    "price": Decimal("1.10"),
+                    "expiration": "2026-12-18",
+                },
+            ],
+        )
+
+        self.assertEqual(len(result["trade_signals"]), 2)
+        self.assertIsNotNone(result["duplicate_warnings"][0])
+        self.assertIsNone(result["duplicate_warnings"][1])
+
+    def test_two_identical_signals_in_same_message_second_flags_first(self):
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25 x2",
+            reference_time=self._reference_time(),
+            trade_signals=[
+                {"symbol": "SPY", "action": "BTO", "price": Decimal("3.25")},
+                {"symbol": "SPY", "action": "BTO", "price": Decimal("3.25")},
+            ],
+        )
+
+        self.assertEqual(len(result["trade_signals"]), 2)
+        self.assertIsNone(result["duplicate_warnings"][0])
+        self.assertIsNotNone(result["duplicate_warnings"][1])
+
+    def test_external_trader_id_reuses_existing_trader(self):
+        first = self.service.ingest_message(
+            "discord",
+            "alice",
+            "first message",
+            reference_time="2026-07-13 09:00:00",
+            external_trader_id="disc-123",
+        )
+        second = self.service.ingest_message(
+            "discord",
+            "alice",
+            "second message",
+            reference_time="2026-07-13 09:01:00",
+            external_trader_id="disc-123",
+        )
+
+        self.assertEqual(first["trader"].id, second["trader"].id)
+        self.assertEqual(self._trader_count(), 1)
+
+    def test_no_external_trader_id_always_creates_new_trader(self):
+        first = self.service.ingest_message(
+            "discord",
+            "alice",
+            "first message",
+            reference_time="2026-07-13 09:00:00",
+        )
+        second = self.service.ingest_message(
+            "discord",
+            "alice",
+            "second message",
+            reference_time="2026-07-13 09:01:00",
+        )
+
+        self.assertNotEqual(first["trader"].id, second["trader"].id)
+        self.assertEqual(self._trader_count(), 2)
+
+    def test_created_signals_reference_correct_raw_message_and_trader(self):
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+        )
+
+        signal = result["trade_signals"][0]
+        self.assertEqual(signal.raw_message_id, result["raw_message"].id)
+        self.assertEqual(signal.trader_id, result["trader"].id)
+
+    def test_metadata_round_trips(self):
+        result = self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            metadata={"channel_id": "123", "guild_id": "456"},
+        )
+
+        self.assertEqual(
+            result["raw_message"].metadata,
+            {"channel_id": "123", "guild_id": "456"},
+        )
+
+    def test_empty_source_name_raises_and_writes_nothing(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_message(
+                "   ",
+                "alice",
+                "BTO SPY 500c",
+                reference_time="2026-07-13 09:00:00",
+            )
+
+        self.assertEqual(self._raw_message_count(), 0)
+
+    def test_empty_trader_name_raises_and_writes_nothing(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_message(
+                "discord",
+                "   ",
+                "BTO SPY 500c",
+                reference_time="2026-07-13 09:00:00",
+            )
+
+        self.assertEqual(self._raw_message_count(), 0)
+        self.assertEqual(self._trader_count(), 0)
+
+    def test_missing_reference_time_raises(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c",
+                reference_time=None,
+                trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+            )
+
+    def test_malformed_reference_time_raises(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c",
+                reference_time="not-a-timestamp",
+                trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+            )
+
+    def test_invalid_price_type_on_signal_raises(self):
+        with self.assertRaises(TypeError):
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c",
+                reference_time="2026-07-13 09:00:00",
+                trade_signals=[{"symbol": "SPY", "action": "BTO", "price": 3.25}],
+            )
+
+    def test_signal_missing_symbol_raises(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c",
+                reference_time="2026-07-13 09:00:00",
+                trade_signals=[{"action": "BTO"}],
+            )
+
+    def test_duplicate_external_message_id_raises_integrity_error(self):
+        self.service.ingest_message(
+            "discord",
+            "alice",
+            "BTO SPY 500c",
+            reference_time="2026-07-13 09:00:00",
+            external_message_id="msg-1",
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c, edited",
+                reference_time="2026-07-13 09:05:00",
+                external_message_id="msg-1",
+            )
+
+    def test_does_not_commit(self):
+        other_connection = get_connection(self.config)
+        try:
+            self.service.ingest_message(
+                "discord",
+                "alice",
+                "BTO SPY 500c",
+                reference_time="2026-07-13 09:00:00",
+                trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+            )
+
+            row = other_connection.execute(
+                "SELECT COUNT(*) FROM raw_messages"
+            ).fetchone()
+            self.assertEqual(row[0], 0)
+        finally:
+            other_connection.close()
 
 
 if __name__ == "__main__":

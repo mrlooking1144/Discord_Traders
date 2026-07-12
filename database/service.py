@@ -16,9 +16,14 @@ from decimal import Decimal
 
 from database.models import TradeSignal
 from database.repository import (
+    create_raw_message,
+    create_trade_signal,
     create_trade_signal_edit,
+    create_trader,
+    get_or_create_source,
     get_trade_signal_by_id,
     get_trade_signals_matching,
+    get_trader_by_external_id,
     update_trade_signal as _repository_update_trade_signal,
     validate_trade_signal_update_fields,
 )
@@ -167,3 +172,143 @@ class TradeService:
         return _repository_update_trade_signal(
             self.conn, trade_signal_id, **changed_fields
         )
+
+    def ingest_message(
+        self,
+        source_name: str,
+        trader_name: str,
+        raw_text: str,
+        reference_time: str,
+        external_trader_id: str | None = None,
+        external_message_id: str | None = None,
+        metadata: dict | None = None,
+        received_at: str | None = None,
+        trade_signals: list[dict] | None = None,
+    ) -> dict:
+        """Ingest a new message and its parsed trade signals.
+
+        The single public entry point for persisting a new message: resolves
+        the source and trader, inserts the raw message, then inserts each
+        parsed trade signal, checking each for a possible duplicate via
+        check_duplicate_signal() first. Persistence follows this strictly
+        linear order: source, then trader, then raw message, then (for each
+        parsed signal) duplicate check followed by insert.
+
+        Trader identity (per docs/DATABASE_DESIGN_V1.md Section 3): if
+        external_trader_id is given, an existing trader is reused when one
+        already exists for (source_id, external_trader_id); otherwise a new
+        trader is created. If external_trader_id is not given, a new trader
+        row is always created - display names are never used to match an
+        existing trader, since they are not a unique identity.
+
+        Duplicate raw messages (source_id, external_id) are not pre-checked:
+        the database's own UNIQUE constraint enforces this, and
+        sqlite3.IntegrityError propagates naturally on collision. Editing an
+        already-ingested Discord message is out of scope for this method -
+        raw_messages.raw_text is write-once, and only new-message ingestion
+        is handled here.
+
+        As with the other TradeService methods, this never commits or rolls
+        back the connection; the caller owns the transaction.
+
+        Args:
+            source_name: Source type name (e.g. 'discord'); looked up or
+                created.
+            trader_name: Display name/handle as seen in the source.
+            raw_text: The original message, verbatim.
+            reference_time: The timestamp to check each parsed signal's
+                duplicate window against, in the same format as
+                trade_signals.created_at ("YYYY-MM-DD HH:MM:SS"). Always
+                supplied by the caller; never read from wall-clock now().
+            external_trader_id: Stable source-provided trader ID, when
+                available.
+            external_message_id: Source-provided message ID, when available.
+            metadata: Opaque JSON-serializable metadata, or None.
+            received_at: ISO8601 timestamp of when the source sent the
+                message.
+            trade_signals: Zero or more dicts of parsed trade signal fields
+                (symbol, action, option_type, price, expiration,
+                position_size). raw_message_id and trader_id are filled in
+                by this method, not the caller.
+
+        Returns:
+            A dict with keys "source" (Source), "trader" (Trader),
+            "raw_message" (RawMessage), "trade_signals" (list[TradeSignal],
+            in the same order as the trade_signals argument), and
+            "duplicate_warnings" (list[str | None], one entry per created
+            trade signal, from check_duplicate_signal()).
+
+        Raises:
+            ValueError: If source_name or trader_name is empty or
+                whitespace-only; if reference_time is missing or malformed;
+                or if any parsed signal is missing a required field
+                (symbol, action).
+            TypeError: If price on any parsed signal is supplied and is not
+                a Decimal.
+            sqlite3.IntegrityError: If external_message_id collides with an
+                already-ingested message for this source, or
+                external_trader_id collides in a race.
+        """
+        source = get_or_create_source(self.conn, source_name)
+
+        if external_trader_id is not None:
+            trader = get_trader_by_external_id(
+                self.conn, source.id, external_trader_id
+            )
+            if trader is None:
+                trader = create_trader(
+                    self.conn, source.id, trader_name, external_trader_id
+                )
+        else:
+            trader = create_trader(self.conn, source.id, trader_name, None)
+
+        raw_message = create_raw_message(
+            self.conn,
+            source.id,
+            raw_text,
+            external_message_id,
+            metadata,
+            received_at,
+        )
+
+        created_signals: list[TradeSignal] = []
+        duplicate_warnings: list[str | None] = []
+
+        for signal_fields in trade_signals or []:
+            symbol = signal_fields.get("symbol")
+            action = signal_fields.get("action")
+            option_type = signal_fields.get("option_type")
+            price = signal_fields.get("price")
+            expiration = signal_fields.get("expiration")
+            position_size = signal_fields.get("position_size")
+
+            warning = self.check_duplicate_signal(
+                trader.id,
+                symbol,
+                action,
+                option_type,
+                price,
+                expiration,
+                reference_time,
+            )
+            signal = create_trade_signal(
+                self.conn,
+                raw_message.id,
+                trader.id,
+                symbol,
+                action,
+                option_type,
+                price,
+                expiration,
+                position_size,
+            )
+            created_signals.append(signal)
+            duplicate_warnings.append(warning)
+
+        return {
+            "source": source,
+            "trader": trader,
+            "raw_message": raw_message,
+            "trade_signals": created_signals,
+            "duplicate_warnings": duplicate_warnings,
+        }

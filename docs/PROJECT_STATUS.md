@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2C.2
+Milestone 2C.3
 
 # Completed
 - Project structure
@@ -45,16 +45,22 @@ Milestone 2C.2
 - Milestone 2C.1: app/parser.py implemented and validated (see docs/HANDOFFS/2C.1_parser_module.md; commit 3a2408ede8170155aced6d7b5a150f6a1804c62e)
   - `parse_message()`; source-independent, pure function, no database/UI/TradeService dependency
   - 191/191 tests passing
+- Milestone 2C.2: app/app.py manual message entry UI implemented and validated (see docs/HANDOFFS/2C.2_manual_message_entry_ui.md; commit aa9917e3a102449697a76a68038324afa0320d19)
+  - Manual raw-message text entry, invokes `app.parser.parse_message()`, displays structured result or "nothing found" message
+  - `requirements.txt` added, pinning `streamlit==1.59.2`
+  - No database, repository, TradeService, or persistence work included
+  - 196/196 tests passing
 
 # Current Focus
-Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module) is now also implemented, tested, reviewed, and committed. Next up is Milestone 2C.2 (Manual Message Entry UI), to be planned and approved separately.
+Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module) and 2C.2 (Manual Message Entry UI) are now also implemented, tested, reviewed, and committed. Next up is Milestone 2C.3 (TradeService Integration), to be planned and approved separately.
 
 # Next Milestone
-Milestone 2C.2 — Manual Message Entry UI
+Milestone 2C.3 — TradeService Integration
 
 # Known Issues
 - Date/Time extraction not implemented
 - Save function not implemented
+- Manual entry UI does not persist parsed signals (deferred to Milestone 2C.3)
 
 # Documentation
 
@@ -68,7 +74,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2C.1 (Complete) — Milestone 2C.2 is next
+2C.2 (Complete) — Milestone 2C.3 is next
 
 Next Action:
-Plan and approve Milestone 2C.2 (Manual Message Entry UI)
+Plan and approve Milestone 2C.3 (TradeService Integration)

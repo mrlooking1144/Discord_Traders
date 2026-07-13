@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2B.6c Complete
+Milestone 2B.7 Complete
 
 # Completed
 - Project structure
@@ -39,12 +39,15 @@ Milestone 2B.6c Complete
 - Milestone 2B.6c: database/service.py ingest_message entry point implemented and validated (see docs/HANDOFFS/2B.6c_trade_service_ingest_message.md; commit bb75326c53e09851465747a8bac58c506822456f)
   - `TradeService.ingest_message()`; no repository changes
   - 158/158 tests passing
+- Milestone 2B.7: Integration and transaction tests implemented and validated (see docs/HANDOFFS/2B.7_integration_transaction_tests.md; commit 44ffe33486ca7c71f27895a47fce547ba8b4fb80)
+  - `tests/test_integration_transactions.py`; no production code changes
+  - 163/163 tests passing
 
 # Current Focus
-Milestone 2B.6 (service.py) is complete: scaffold + duplicate detection (2B.6a), edit-on-update (2B.6b), and ingest_message (2B.6c) are all implemented. Preparing Milestone 2B.7 — integration and transaction tests.
+Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Next milestone (2C or later, e.g. UI wiring) is to be scoped and approved separately.
 
 # Next Milestone
-Milestone 2B.7 — Integration and transaction tests
+To be scoped (2C or later)
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -62,7 +65,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2B.6c (Complete)
+2B.7 (Complete) — Milestone 2B is complete
 
 Next Action:
-Implement Milestone 2B.7
+Scope and approve the next milestone (2C or later)

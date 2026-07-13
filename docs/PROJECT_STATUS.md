@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2C.3
+Milestone 2C.4
 
 # Completed
 - Project structure
@@ -50,17 +50,22 @@ Milestone 2C.3
   - `requirements.txt` added, pinning `streamlit==1.59.2`
   - No database, repository, TradeService, or persistence work included
   - 196/196 tests passing
+- Milestone 2C.3: TradeService Integration — COMPLETE (see docs/HANDOFFS/2C.3_trade_service_integration.md; commit dfdc8b5ca98564ff398de177cec3a78a585bb380 — "Implement TradeService UI integration")
+  - `app/app.py` wires the manual entry UI's parsed structured trade data to `TradeService.ingest_message()` via a fresh database connection created on each Submit click
+  - Required "Trader display name" and "Stable external trader ID" UI fields; source name fixed to `"manual"`
+  - Two-step Parse -> Review -> Submit workflow preserved, with `st.session_state`-based stale-preview protection
+  - No repository, schema, service, or parser changes
+  - 217/217 tests passing
 
 # Current Focus
-Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module) and 2C.2 (Manual Message Entry UI) are now also implemented, tested, reviewed, and committed. Next up is Milestone 2C.3 (TradeService Integration), to be planned and approved separately.
+Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module), 2C.2 (Manual Message Entry UI), and 2C.3 (TradeService Integration) are now also implemented, tested, reviewed, and committed. Next up is Milestone 2C.4 (Integration Tests), to be planned and approved separately.
 
 # Next Milestone
-Milestone 2C.3 — TradeService Integration
+Milestone 2C.4
 
 # Known Issues
 - Date/Time extraction not implemented
-- Save function not implemented
-- Manual entry UI does not persist parsed signals (deferred to Milestone 2C.3)
+- Manual entry UI persistence (Milestone 2C.3) has been validated only against mocked service/database doubles; end-to-end coverage against a real SQLite database is deferred to Milestone 2C.4
 
 # Documentation
 
@@ -74,7 +79,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2C.2 (Complete) — Milestone 2C.3 is next
+2C.3 (Complete) — Milestone 2C.4 is next
 
 Next Action:
-Plan and approve Milestone 2C.3 (TradeService Integration)
+Plan and approve Milestone 2C.4 (Integration Tests)

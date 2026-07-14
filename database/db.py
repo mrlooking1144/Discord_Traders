@@ -49,6 +49,7 @@ def initialize_database(config: DatabaseConfig) -> None:
         config: Database configuration providing the file path and busy
             timeout to use.
     """
+    Path(config.db_path).parent.mkdir(parents=True, exist_ok=True)
     connection = get_connection(config)
     try:
         schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")

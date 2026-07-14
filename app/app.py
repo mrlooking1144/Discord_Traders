@@ -18,11 +18,10 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from app.parser import parse_message
-from database.config import DatabaseConfig
+from database.config import DatabaseConfig, resolve_database_path
 from database.db import get_connection, initialize_database
 from database.service import TradeService
 
-_DB_PATH = "discord_traders.db"
 _SOURCE_NAME = "manual"
 _REFERENCE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -67,7 +66,7 @@ if "parsed_signals" in st.session_state:
         else:
             conn: sqlite3.Connection | None = None
             try:
-                config = DatabaseConfig(db_path=_DB_PATH)
+                config = DatabaseConfig(db_path=resolve_database_path())
                 initialize_database(config)
                 conn = get_connection(config)
 

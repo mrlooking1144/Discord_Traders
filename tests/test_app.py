@@ -10,6 +10,9 @@ through database.service.TradeService.ingest_message(). database.db.
 get_connection, database.db.initialize_database, and database.service.
 TradeService are patched as controlled test doubles throughout - no real
 SQLite database is touched here (reserved for Milestone 2C.4).
+
+Covers Milestone 2D.1: proving app.py passes the exact return value of
+database.config.resolve_database_path() into DatabaseConfig(db_path=...).
 """
 
 import json
@@ -483,6 +486,37 @@ class ManualEntryPersistenceTests(unittest.TestCase):
             self.assertEqual(kwargs["external_trader_id"], "disc-123")
             # The raw message itself must stay verbatim, never stripped.
             self.assertEqual(kwargs["raw_text"], _SAMPLE_MESSAGE)
+
+
+class DatabasePathResolutionWiringTests(unittest.TestCase):
+    """Covers Milestone 2D.1: app.py -> resolve_database_path() -> DatabaseConfig."""
+
+    def test_database_config_receives_resolved_path_from_resolve_database_path(self):
+        sentinel_path = r"C:\sentinel\DiscordTraders\discord_traders.db"
+        resolve_p = patch(
+            "database.config.resolve_database_path", return_value=sentinel_path
+        )
+        config_p = patch("database.config.DatabaseConfig")
+        init_p = patch("database.db.initialize_database")
+        conn_p = patch("database.db.get_connection", return_value=MagicMock())
+        service_p = patch("database.service.TradeService")
+
+        with resolve_p, config_p as mock_config_cls, init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.return_value = {
+                "trade_signals": [{"id": 1}],
+                "duplicate_warnings": [None],
+            }
+
+            at = AppTest.from_file("app/app.py")
+            at.run()
+            at.text_area[0].input(_SAMPLE_MESSAGE).run()
+            at.button[0].click().run()
+            at.text_input[0].input("alice").run()
+            at.text_input[1].input("disc-123").run()
+            at.button[1].click().run()
+
+            self.assertEqual(mock_config_cls.call_args.kwargs["db_path"], sentinel_path)
 
 
 if __name__ == "__main__":

@@ -56,16 +56,21 @@ Milestone 2C.4
   - Two-step Parse -> Review -> Submit workflow preserved, with `st.session_state`-based stale-preview protection
   - No repository, schema, service, or parser changes
   - 217/217 tests passing
+- Milestone 2C.4: Integration Tests implemented and validated (see docs/HANDOFFS/2C.4_integration_tests.md; commit 6d0bfd2db5f4dbed4605676390716b9af81f0795 — "Add manual entry integration tests")
+  - `tests/test_manual_entry_integration.py`; no production code changes
+  - 8 new real-SQLite integration tests exercising the complete manual-entry path (Parse -> review -> Submit -> `TradeService` -> `repository.py` -> real temporary SQLite database), each against a unique temporary database with real schema initialization
+  - Covers: full persisted-record and foreign-key verification across `sources`/`traders`/`raw_messages`/`trade_signals`; stable external trader identity reuse; advisory (non-blocking) duplicate warning with both signals persisted; malformed input creating no database rows; commit durability through a fresh connection; rollback removing all partial writes after a controlled mid-transaction failure; and protection against creating or modifying the repository-root `discord_traders.db`
+  - 225/225 tests passing
+  - Implementation commit `6d0bfd2` pushed to `origin/main`; this documentation update is the remaining step for the milestone
 
 # Current Focus
-Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module), 2C.2 (Manual Message Entry UI), and 2C.3 (TradeService Integration) are now also implemented, tested, reviewed, and committed. Next up is Milestone 2C.4 (Integration Tests), to be planned and approved separately.
+Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module), 2C.2 (Manual Message Entry UI), 2C.3 (TradeService Integration), and 2C.4 (Integration Tests) are now also implemented, tested, reviewed, and committed (implementation commit `6d0bfd2`, pushed to `origin/main`). Milestone 2C.4's documentation is prepared and awaiting review and a separate documentation commit; no further milestone is yet defined in the frozen roadmap beyond 2C.4, so the next milestone must be scoped and approved separately, consistent with how the 2B -> 2C transition was handled.
 
 # Next Milestone
-Milestone 2C.4
+Not yet defined in the frozen roadmap (`docs/IMPLEMENTATION_ROADMAP.md`'s Implementation Order ends at Milestone 2C.4). To be scoped and approved separately.
 
 # Known Issues
 - Date/Time extraction not implemented
-- Manual entry UI persistence (Milestone 2C.3) has been validated only against mocked service/database doubles; end-to-end coverage against a real SQLite database is deferred to Milestone 2C.4
 
 # Documentation
 
@@ -79,7 +84,7 @@ Current Phase:
 Implementation
 
 Current Milestone:
-2C.3 (Complete) — Milestone 2C.4 is next
+2C.4 (Implementation complete and pushed to origin/main at commit 6d0bfd2db5f4dbed4605676390716b9af81f0795; documentation commit pending)
 
 Next Action:
-Plan and approve Milestone 2C.4 (Integration Tests)
+Commit this documentation update separately from the implementation commit, then scope and approve the next milestone (not yet defined in the frozen roadmap)

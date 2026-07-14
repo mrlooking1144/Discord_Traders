@@ -2,7 +2,8 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2C.4
+Milestone 2D.1 — Runtime Configuration and Application Data Locations
+(approved for planning only; implementation has not started)
 
 # Completed
 - Project structure
@@ -61,13 +62,16 @@ Milestone 2C.4
   - 8 new real-SQLite integration tests exercising the complete manual-entry path (Parse -> review -> Submit -> `TradeService` -> `repository.py` -> real temporary SQLite database), each against a unique temporary database with real schema initialization
   - Covers: full persisted-record and foreign-key verification across `sources`/`traders`/`raw_messages`/`trade_signals`; stable external trader identity reuse; advisory (non-blocking) duplicate warning with both signals persisted; malformed input creating no database rows; commit durability through a fresh connection; rollback removing all partial writes after a controlled mid-transaction failure; and protection against creating or modifying the repository-root `discord_traders.db`
   - 225/225 tests passing
-  - Implementation commit `6d0bfd2` pushed to `origin/main`; this documentation update is the remaining step for the milestone
+  - Implementation commit `6d0bfd2` pushed to `origin/main`; documentation committed via commit `3be0c78` ("Update documentation for Milestone 2C.4"), also pushed to `origin/main` — Milestone 2C.4 is fully complete
+- Phase 2D roadmap scoping approved: `docs/IMPLEMENTATION_ROADMAP.md` extended with Phase 2D — Manual Version 1 Operational Readiness (Milestones 2D.1 through 2D.7) and a Phase 2E — Discord Ingestion future-scope heading, plus an updated Implementation Order listing 2D.1-2D.7 (commit `1ed88d3628823ce231f76d9ad9e4f5a46b953a64`, pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit)
+  - Documentation only — no production code, test, schema, or architecture changes
+  - 225/225 tests still passing
 
 # Current Focus
-Milestone 2B is complete: schema (2B.1), config (2B.2), db connection layer (2B.3), models (2B.4), repository.py (2B.5a-e), service.py (2B.6a-c), and integration/transaction tests (2B.7) are all implemented, tested, reviewed, and committed. Milestone 2C.1 (Parser Module), 2C.2 (Manual Message Entry UI), 2C.3 (TradeService Integration), and 2C.4 (Integration Tests) are now also implemented, tested, reviewed, and committed (implementation commit `6d0bfd2`, pushed to `origin/main`). Milestone 2C.4's documentation is prepared and awaiting review and a separate documentation commit; no further milestone is yet defined in the frozen roadmap beyond 2C.4, so the next milestone must be scoped and approved separately, consistent with how the 2B -> 2C transition was handled.
+Milestone 2C.4 remains fully complete (implementation commit `6d0bfd2`, documentation commit `3be0c78`, both pushed to `origin/main`). The roadmap extension adding Phase 2D — Manual Version 1 Operational Readiness has been approved and committed (`1ed88d3628823ce231f76d9ad9e4f5a46b953a64`); local `main` and `origin/main` are synchronized at that commit. Phase 2D is now the active approved phase, extending the roadmap through Milestone 2D.7. The current milestone is Milestone 2D.1 — Runtime Configuration and Application Data Locations, approved for planning only; implementation has not started. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, or parser changes are in scope for Milestone 2D.1.
 
 # Next Milestone
-Not yet defined in the frozen roadmap (`docs/IMPLEMENTATION_ROADMAP.md`'s Implementation Order ends at Milestone 2C.4). To be scoped and approved separately.
+Milestone 2D.1 — Runtime Configuration and Application Data Locations. Approved for planning only; implementation has not started. Per project rules, implementation begins only after a separate implementation-plan review and approval step. Milestone 2D.2 — Operational Logging and Error Handling follows per the approved roadmap (`docs/IMPLEMENTATION_ROADMAP.md`).
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -77,14 +81,23 @@ Not yet defined in the frozen roadmap (`docs/IMPLEMENTATION_ROADMAP.md`'s Implem
 Architecture:
 FROZEN
 
+Database Design:
+FROZEN (docs/DATABASE_DESIGN_V1.md unchanged)
+
 Implementation Roadmap:
-FROZEN
+Extended through Milestone 2D.7 (Phase 2D approved; commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64); Phase 2E (Discord Ingestion) recorded as future scope only, not yet scoped or approved for implementation
 
 Current Phase:
-Implementation
+Phase 2D — Manual Version 1 Operational Readiness
 
 Current Milestone:
-2C.4 (Implementation complete and pushed to origin/main at commit 6d0bfd2db5f4dbed4605676390716b9af81f0795; documentation commit pending)
+2D.1 — Runtime Configuration and Application Data Locations (approved for planning only; implementation has not started)
+
+Git Synchronization:
+Local main and origin/main synchronized at commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64
+
+Test Suite:
+225/225 tests passing
 
 Next Action:
-Commit this documentation update separately from the implementation commit, then scope and approve the next milestone (not yet defined in the frozen roadmap)
+Scope and approve the Milestone 2D.1 implementation plan, then implement, test, review, and commit per project rules

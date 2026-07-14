@@ -2,8 +2,8 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2D.1 — Runtime Configuration and Application Data Locations
-(approved for planning only; implementation has not started)
+Milestone 2D.2 — Operational Logging and Error Handling
+(not yet approved for implementation)
 
 # Completed
 - Project structure
@@ -66,12 +66,19 @@ Milestone 2D.1 — Runtime Configuration and Application Data Locations
 - Phase 2D roadmap scoping approved: `docs/IMPLEMENTATION_ROADMAP.md` extended with Phase 2D — Manual Version 1 Operational Readiness (Milestones 2D.1 through 2D.7) and a Phase 2E — Discord Ingestion future-scope heading, plus an updated Implementation Order listing 2D.1-2D.7 (commit `1ed88d3628823ce231f76d9ad9e4f5a46b953a64`, pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit)
   - Documentation only — no production code, test, schema, or architecture changes
   - 225/225 tests still passing
+- Milestone 2D.1: Runtime Configuration and Application Data Locations implemented, tested, reviewed, committed, and pushed (see docs/HANDOFFS/2D.1_runtime_configuration_and_application_data_locations.md; commit 648ff121fc1f91a044f963f155fa0ea97e3211d6 — "Implement runtime database path configuration")
+  - `database/config.py`: new `resolve_database_path()` — resolves a non-empty `DISCORD_TRADERS_DB_PATH` override (normalized via `Path(value).expanduser().resolve()`), else `%LOCALAPPDATA%\DiscordTraders\discord_traders.db`, else a `Path.home()\AppData\Local\DiscordTraders\discord_traders.db` fallback; `DatabaseConfig.db_path` remains required with no default
+  - `database/db.py`: `initialize_database()` now creates required parent directories via `Path(config.db_path).parent.mkdir(parents=True, exist_ok=True)` immediately before opening its connection; directory-creation failures propagate normally
+  - `app/app.py`: hardcoded `_DB_PATH` removed; `DatabaseConfig(db_path=resolve_database_path())` is the new call site; `TradeService.ingest_message()` remains the sole UI persistence entry point
+  - No schema, model, parser, repository, or service redesign; no logging, backup, recovery, review UI, correction workflow, packaging, or Discord work included
+  - 242/242 tests passing (225 pre-existing + 17 new across `tests/test_config.py`, `tests/test_db.py`, `tests/test_app.py`)
+  - Implementation commit `648ff12` pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit
 
 # Current Focus
-Milestone 2C.4 remains fully complete (implementation commit `6d0bfd2`, documentation commit `3be0c78`, both pushed to `origin/main`). The roadmap extension adding Phase 2D — Manual Version 1 Operational Readiness has been approved and committed (`1ed88d3628823ce231f76d9ad9e4f5a46b953a64`); local `main` and `origin/main` are synchronized at that commit. Phase 2D is now the active approved phase, extending the roadmap through Milestone 2D.7. The current milestone is Milestone 2D.1 — Runtime Configuration and Application Data Locations, approved for planning only; implementation has not started. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, or parser changes are in scope for Milestone 2D.1.
+Milestone 2D.1 — Runtime Configuration and Application Data Locations is fully implemented, tested, reviewed, committed (`648ff121fc1f91a044f963f155fa0ea97e3211d6`), and pushed to `origin/main`; local `main` and `origin/main` are synchronized at that commit. 242/242 tests passing. The current milestone is Milestone 2D.2 — Operational Logging and Error Handling, not yet approved for implementation. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, or parser changes occurred in Milestone 2D.1.
 
 # Next Milestone
-Milestone 2D.1 — Runtime Configuration and Application Data Locations. Approved for planning only; implementation has not started. Per project rules, implementation begins only after a separate implementation-plan review and approval step. Milestone 2D.2 — Operational Logging and Error Handling follows per the approved roadmap (`docs/IMPLEMENTATION_ROADMAP.md`).
+Milestone 2D.2 — Operational Logging and Error Handling. Not yet approved for implementation. Per project rules, implementation begins only after a separate implementation-plan review and approval step.
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -91,13 +98,13 @@ Current Phase:
 Phase 2D — Manual Version 1 Operational Readiness
 
 Current Milestone:
-2D.1 — Runtime Configuration and Application Data Locations (approved for planning only; implementation has not started)
+2D.2 — Operational Logging and Error Handling (not yet approved for implementation)
 
 Git Synchronization:
-Local main and origin/main synchronized at commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64
+Local main and origin/main synchronized at commit 648ff121fc1f91a044f963f155fa0ea97e3211d6
 
 Test Suite:
-225/225 tests passing
+242/242 tests passing
 
 Next Action:
-Scope and approve the Milestone 2D.1 implementation plan, then implement, test, review, and commit per project rules
+Scope and approve the Milestone 2D.2 implementation plan, then implement, test, review, and commit per project rules

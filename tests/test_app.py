@@ -13,9 +13,22 @@ SQLite database is touched here (reserved for Milestone 2C.4).
 
 Covers Milestone 2D.1: proving app.py passes the exact return value of
 database.config.resolve_database_path() into DatabaseConfig(db_path=...).
+
+Covers Milestone 2D.2: the safe UI error boundary (broadened exception
+handling, sanitized ERROR diagnostics, a distinct parser-failure message)
+and operational logging behavior (console-handler idempotency across
+Streamlit reruns, file-logging failures never blocking submission, and
+confirmation that raw message text, trader identifiers, parsed signal
+values, exception message text, and the database path never appear in
+any captured log record). database.db.initialize_database,
+database.db.get_connection, database.service.TradeService, and
+app.logging_config.configure_file_logging are patched as controlled test
+doubles throughout these tests - no real SQLite database and no real
+file logging are touched here.
 """
 
 import json
+import logging
 import sqlite3
 import unittest
 from datetime import datetime
@@ -23,7 +36,9 @@ from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 
+from app import logging_config
 from app.parser import parse_message
+from database.config import resolve_database_path
 
 _SAMPLE_MESSAGE = "BTO SPY 450C 7/19/2025 @3.25 10 contracts"
 
@@ -89,8 +104,22 @@ class ManualMessageEntryTests(unittest.TestCase):
         self.assertEqual(len(at.json), 0)
 
 
-class ManualEntryPersistenceTests(unittest.TestCase):
-    """Covers Milestone 2C.3: submit-to-database wiring."""
+class _SubmissionWorkflowTestCase(unittest.TestCase):
+    """Shared setUp and helpers for tests driving app.py's Submit
+    workflow with mocked database/TradeService layers.
+
+    Contains no test_* methods of its own, so it contributes no tests
+    when discovered - only its concrete subclasses (ManualEntryPersistenceTests,
+    SubmissionFailureLoggingTests) do.
+    """
+
+    def setUp(self):
+        # Milestone 2D.2: app.py now calls configure_file_logging() at the
+        # start of every Submit click. Patched here, once, for every
+        # subclass, so none of these tests attempt real file I/O.
+        file_log_patcher = patch("app.logging_config.configure_file_logging")
+        file_log_patcher.start()
+        self.addCleanup(file_log_patcher.stop)
 
     def _patches(self, mock_conn=None):
         """Return the three patches app.py's persistence path depends on."""
@@ -114,6 +143,10 @@ class ManualEntryPersistenceTests(unittest.TestCase):
         at.text_input[1].input(external_trader_id).run()
         at.button[1].click().run()
         return at
+
+
+class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
+    """Covers Milestone 2C.3: submit-to-database wiring."""
 
     def test_successful_submission_calls_ingest_message_once(self):
         mock_conn = MagicMock()
@@ -500,8 +533,9 @@ class DatabasePathResolutionWiringTests(unittest.TestCase):
         init_p = patch("database.db.initialize_database")
         conn_p = patch("database.db.get_connection", return_value=MagicMock())
         service_p = patch("database.service.TradeService")
+        file_log_p = patch("app.logging_config.configure_file_logging")
 
-        with resolve_p, config_p as mock_config_cls, init_p, conn_p, service_p as mock_service_cls:
+        with resolve_p, config_p as mock_config_cls, init_p, conn_p, service_p as mock_service_cls, file_log_p:
             mock_service = mock_service_cls.return_value
             mock_service.ingest_message.return_value = {
                 "trade_signals": [{"id": 1}],
@@ -517,6 +551,320 @@ class DatabasePathResolutionWiringTests(unittest.TestCase):
             at.button[1].click().run()
 
             self.assertEqual(mock_config_cls.call_args.kwargs["db_path"], sentinel_path)
+
+
+class ParserFailureLoggingTests(unittest.TestCase):
+    """Covers Milestone 2D.2: unexpected parser exceptions vs. a valid
+    empty parse result."""
+
+    def test_unexpected_parser_exception_shows_safe_message(self):
+        with patch(
+            "app.parser.parse_message", side_effect=RuntimeError("parser bug")
+        ):
+            at = AppTest.from_file("app/app.py")
+            at.run()
+            at.text_area[0].input(_SAMPLE_MESSAGE).run()
+            at.button[0].click().run()
+
+            self.assertEqual(len(at.exception), 0)
+            self.assertEqual(len(at.error), 1)
+            self.assertEqual(at.error[0].value, "Could not parse this message.")
+            self.assertEqual(len(at.warning), 0)
+            self.assertNotIn("parser bug", at.error[0].value)
+            self.assertNotIn("RuntimeError", at.error[0].value)
+
+    def test_unexpected_parser_exception_logs_sanitized_error(self):
+        with patch(
+            "app.parser.parse_message",
+            side_effect=RuntimeError("SENTINEL_PARSER_EXC_113"),
+        ):
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                at.run()
+                at.text_area[0].input(_SAMPLE_MESSAGE).run()
+                at.button[0].click().run()
+
+            joined = "\n".join(captured.output)
+            self.assertIn("message parsing failed", joined)
+            self.assertIn("RuntimeError", joined)
+            self.assertNotIn("SENTINEL_PARSER_EXC_113", joined)
+            self.assertTrue(
+                all(record.levelno < logging.CRITICAL for record in captured.records)
+            )
+
+    def test_valid_empty_parse_result_still_shows_nothing_found_message(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        at.text_area[0].input("just some random text").run()
+        at.button[0].click().run()
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(len(at.warning), 1)
+        self.assertEqual(
+            at.warning[0].value, "No trade signals found in this message."
+        )
+
+
+class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
+    """Covers Milestone 2D.2: sanitized ERROR diagnostics and safe UI
+    messages for every Submit-workflow failure category, and confirmation
+    that sensitive values never reach any log record."""
+
+    def test_database_init_failure_logs_sanitized_error(self):
+        init_p = patch(
+            "database.db.initialize_database",
+            side_effect=OSError("SENTINEL_INIT_EXC_221"),
+        )
+        conn_p = patch("database.db.get_connection", return_value=MagicMock())
+        service_p = patch("database.service.TradeService")
+        with init_p, conn_p, service_p:
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at)
+                self._submit(at)
+
+            self.assertEqual(
+                at.error[0].value, "Could not save the message to the database."
+            )
+            joined = "\n".join(captured.output)
+            self.assertIn("message submission failed", joined)
+            self.assertIn("OSError", joined)
+            self.assertNotIn("SENTINEL_INIT_EXC_221", joined)
+
+    def test_connection_failure_logs_sanitized_error(self):
+        init_p = patch("database.db.initialize_database")
+        conn_p = patch(
+            "database.db.get_connection",
+            side_effect=sqlite3.OperationalError("SENTINEL_CONN_EXC_332"),
+        )
+        service_p = patch("database.service.TradeService")
+        with init_p, conn_p, service_p:
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at)
+                self._submit(at)
+
+            self.assertEqual(
+                at.error[0].value, "Could not save the message to the database."
+            )
+            joined = "\n".join(captured.output)
+            self.assertIn("message submission failed", joined)
+            self.assertIn("OperationalError", joined)
+            self.assertNotIn("SENTINEL_CONN_EXC_332", joined)
+
+    def test_ingestion_failure_logs_sanitized_error(self):
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.side_effect = ValueError(
+                "SENTINEL_INGEST_EXC_443"
+            )
+
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at)
+                self._submit(at)
+
+            self.assertEqual(
+                at.error[0].value, "Could not save the message to the database."
+            )
+            joined = "\n".join(captured.output)
+            self.assertIn("message submission failed", joined)
+            self.assertIn("ValueError", joined)
+            self.assertNotIn("SENTINEL_INGEST_EXC_443", joined)
+
+    def test_unexpected_exception_caught_by_safety_net_logs_error_not_critical(self):
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.side_effect = RuntimeError(
+                "SENTINEL_UNEXPECTED_EXC_554"
+            )
+
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at)
+                self._submit(at)
+
+            self.assertEqual(
+                at.error[0].value, "Could not save the message to the database."
+            )
+            joined = "\n".join(captured.output)
+            self.assertIn("message submission failed", joined)
+            self.assertIn("RuntimeError", joined)
+            self.assertNotIn("SENTINEL_UNEXPECTED_EXC_554", joined)
+            self.assertTrue(
+                all(record.levelno < logging.CRITICAL for record in captured.records)
+            )
+
+    def test_duplicate_advisory_logged_as_warning_not_error(self):
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.return_value = {
+                "trade_signals": [{"id": 1}],
+                "duplicate_warnings": ["Possible duplicate: 1 matching trade signal(s)"],
+            }
+
+            with self.assertLogs("discord_traders", level="WARNING") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at)
+                self._submit(at)
+
+            self.assertEqual(len(at.error), 0)
+            self.assertTrue(
+                all(record.levelno < logging.ERROR for record in captured.records)
+            )
+            joined = "\n".join(captured.output)
+            self.assertIn("Duplicate advisory returned for 1 signal(s)", joined)
+
+    def test_successful_submission_logs_exclude_sensitive_values(self):
+        sentinel_raw_text = (
+            "BTO SPY 450C 7/19/2025 @3.25 SENTINEL_RAW_TOKEN_665"
+        )
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.return_value = {
+                "trade_signals": [{"id": 1}],
+                "duplicate_warnings": [None],
+            }
+
+            with self.assertLogs("discord_traders", level="INFO") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at, raw_text=sentinel_raw_text)
+                self._submit(
+                    at,
+                    trader_name="SENTINEL_TRADER_NAME_776",
+                    external_trader_id="SENTINEL_EXTERNAL_ID_887",
+                )
+
+            joined = "\n".join(captured.output)
+            self.assertNotIn("SENTINEL_RAW_TOKEN_665", joined)
+            self.assertNotIn("SENTINEL_TRADER_NAME_776", joined)
+            self.assertNotIn("SENTINEL_EXTERNAL_ID_887", joined)
+            self.assertNotIn(resolve_database_path(), joined)
+
+    def test_failed_submission_logs_exclude_sensitive_values_including_exception_message(
+        self,
+    ):
+        sentinel_raw_text = (
+            "BTO SPY 450C 7/19/2025 @3.25 SENTINEL_RAW_TOKEN_998"
+        )
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.side_effect = ValueError(
+                "SENTINEL_EXC_MSG_223"
+            )
+
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                self._run_to_review(at, raw_text=sentinel_raw_text)
+                self._submit(
+                    at,
+                    trader_name="SENTINEL_TRADER_NAME_334",
+                    external_trader_id="SENTINEL_EXTERNAL_ID_445",
+                )
+
+            joined = "\n".join(captured.output)
+            self.assertNotIn("SENTINEL_RAW_TOKEN_998", joined)
+            self.assertNotIn("SENTINEL_TRADER_NAME_334", joined)
+            self.assertNotIn("SENTINEL_EXTERNAL_ID_445", joined)
+            self.assertNotIn("SENTINEL_EXC_MSG_223", joined)
+
+    def test_review_state_remains_after_failed_submission(self):
+        mock_conn = MagicMock()
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.side_effect = ValueError("bad input")
+
+            at = AppTest.from_file("app/app.py")
+            self._run_to_review(at)
+            self._submit(at)
+
+            self.assertEqual(len(at.error), 1)
+            self.assertEqual(len(at.text_input), 2)
+
+    def test_connection_closed_after_oserror_class_failure(self):
+        mock_conn = MagicMock()
+        mock_conn.commit.side_effect = OSError("disk full")
+        init_p, conn_p, service_p = self._patches(mock_conn)
+        with init_p, conn_p, service_p as mock_service_cls:
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.return_value = {
+                "trade_signals": [{"id": 1}],
+                "duplicate_warnings": [None],
+            }
+
+            at = AppTest.from_file("app/app.py")
+            self._run_to_review(at)
+            self._submit(at)
+
+            mock_conn.rollback.assert_called_once()
+            mock_conn.close.assert_called_once()
+            self.assertEqual(
+                at.error[0].value, "Could not save the message to the database."
+            )
+
+
+class LoggingHandlerRerunTests(unittest.TestCase):
+    """Covers Milestone 2D.2: console-handler idempotency across the
+    repeated module re-execution Streamlit performs on every rerun."""
+
+    def test_streamlit_reruns_do_not_duplicate_console_handler(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        at.text_area[0].input(_SAMPLE_MESSAGE).run()
+        at.button[0].click().run()
+        at.text_area[0].input(_SAMPLE_MESSAGE + " again").run()
+        at.button[0].click().run()
+
+        logger = logging.getLogger("discord_traders")
+        console_handlers = [
+            handler
+            for handler in logger.handlers
+            if getattr(handler, logging_config._CONSOLE_HANDLER_MARKER, False)
+        ]
+        self.assertEqual(len(console_handlers), 1)
+
+
+class FileLoggingFailureSafetyTests(unittest.TestCase):
+    """Covers Milestone 2D.2: a file-logging configuration failure never
+    blocks the Submit workflow."""
+
+    def test_file_logging_resolution_failure_does_not_block_submission(self):
+        mock_conn = MagicMock()
+        with patch("database.db.initialize_database"), patch(
+            "database.db.get_connection", return_value=mock_conn
+        ), patch("database.service.TradeService") as mock_service_cls, patch(
+            "app.logging_config.resolve_log_path",
+            side_effect=RuntimeError("SENTINEL_LOG_PATH_EXC_556"),
+        ):
+            mock_service = mock_service_cls.return_value
+            mock_service.ingest_message.return_value = {
+                "trade_signals": [{"id": 1}],
+                "duplicate_warnings": [None],
+            }
+
+            at = AppTest.from_file("app/app.py")
+            at.run()
+            at.text_area[0].input(_SAMPLE_MESSAGE).run()
+            at.button[0].click().run()
+            at.text_input[0].input("alice").run()
+            at.text_input[1].input("disc-123").run()
+            at.button[1].click().run()
+
+            self.assertEqual(len(at.exception), 0)
+            self.assertEqual(len(at.error), 0)
+            success_values = [s.value for s in at.success]
+            self.assertTrue(any("Saved 1 trade signal" in v for v in success_values))
 
 
 if __name__ == "__main__":

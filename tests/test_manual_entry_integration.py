@@ -17,9 +17,23 @@ is test_mid_transaction_failure_rolls_back_leaving_no_partial_rows, which
 narrowly patches database.service.create_trade_signal to manufacture a
 controlled mid-transaction failure after earlier real writes have already
 occurred, in order to exercise app.py's real rollback path.
+
+Milestone 2D.2: app.py now calls app.logging_config.configure_file_logging()
+at the start of every Submit click, which - unmocked here, matching this
+file's real-I/O philosophy for everything else - performs real file-logging
+initialization. Each test overrides DISCORD_TRADERS_LOG_PATH to a path
+inside its own tempfile.TemporaryDirectory(), so that real initialization
+writes only inside a temporary directory removed by normal cleanup, never
+to the developer's actual LOCALAPPDATA. Because the discord_traders
+logger's file handler is otherwise a process-wide singleton (idempotent
+by design - see app/logging_config.py), any handler attached during a
+test is explicitly removed and closed before that test's temporary
+directory is cleaned up, so every test genuinely re-resolves its own
+override rather than reusing a handler left over from an earlier test.
 """
 
 import hashlib
+import logging
 import os
 import sqlite3
 import tempfile
@@ -30,6 +44,7 @@ from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
+from app import logging_config
 from database.config import DatabaseConfig as RealDatabaseConfig
 from database.db import get_connection, initialize_database
 from database.service import TradeService
@@ -73,9 +88,42 @@ class _ManualEntryIntegrationTestCase(unittest.TestCase):
         self._config_patch.start()
         self.addCleanup(self._config_patch.stop)
 
+        self._log_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._log_dir.cleanup)
+        self.log_path = str(Path(self._log_dir.name) / "logs" / "discord_traders.log")
+
+        # The discord_traders logger's file handler is a process-wide
+        # singleton, idempotent by design (app/logging_config.py). Remove
+        # any handler left attached by an earlier test before this test
+        # runs, so app.py's Submit-triggered configure_file_logging() call
+        # genuinely re-resolves DISCORD_TRADERS_LOG_PATH against this
+        # test's own temporary directory rather than reusing a handler
+        # already pointed elsewhere.
+        self._remove_file_log_handler()
+        self.addCleanup(self._remove_file_log_handler)
+
+        log_path_patch = patch.dict(
+            os.environ, {"DISCORD_TRADERS_LOG_PATH": self.log_path}, clear=False
+        )
+        log_path_patch.start()
+        self.addCleanup(log_path_patch.stop)
+
     def _config_factory(self, db_path=None, **kwargs):
         """Ignore the db_path app.py passes; always point at the temp file."""
         return RealDatabaseConfig(db_path=self.db_path)
+
+    def _remove_file_log_handler(self):
+        """Detach and close any discord_traders file handler.
+
+        Ensures each test starts and ends without a lingering file handler
+        pointed at a temporary directory that either hasn't been created
+        yet or is about to be removed by cleanup.
+        """
+        logger = logging.getLogger(logging_config._LOGGER_NAME)
+        for handler in list(logger.handlers):
+            if getattr(handler, logging_config._FILE_HANDLER_MARKER, False):
+                logger.removeHandler(handler)
+                handler.close()
 
     def _snapshot_prod_db(self):
         if not self._prod_db_path.exists():

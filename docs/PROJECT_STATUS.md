@@ -2,7 +2,7 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2D.2 — Operational Logging and Error Handling
+Milestone 2D.3 — Database Backup and Recovery
 (not yet approved for implementation)
 
 # Completed
@@ -73,12 +73,20 @@ Milestone 2D.2 — Operational Logging and Error Handling
   - No schema, model, parser, repository, or service redesign; no logging, backup, recovery, review UI, correction workflow, packaging, or Discord work included
   - 242/242 tests passing (225 pre-existing + 17 new across `tests/test_config.py`, `tests/test_db.py`, `tests/test_app.py`)
   - Implementation commit `648ff12` pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit
+- Milestone 2D.2: Operational Logging and Error Handling implemented, tested, reviewed, committed, and pushed (see docs/HANDOFFS/2D.2_operational_logging_and_error_handling.md; commit a0654e51af3f82ce8826107dad15bcc0f2944b35 — "Implement operational logging and error handling")
+  - `app/logging_config.py` (new): standard-library-only logging, a `discord_traders` logger tree, independently idempotent `configure_console_logging()`/`configure_file_logging()` (each identified by its own private marker attribute), `resolve_log_path()` (fully independent of `database.config.resolve_database_path()`/`DISCORD_TRADERS_DB_PATH`), `sanitized_traceback()`, and `log_operation_failure()`
+  - Console logging configured at application startup; file logging configured lazily at the start of the Submit workflow via a `RotatingFileHandler(maxBytes=1_000_000, backupCount=3, encoding="utf-8", mode="a", delay=True)`; file-logging failures never block submission and console logging remains available as fallback
+  - `app/app.py`: broadened Submit exception boundary (`ValueError`, `TypeError`, `sqlite3.Error`, `OSError`, plus a final `except Exception` safety net), both logged at ERROR with sanitized diagnostics, no CRITICAL introduced; a new parser-failure guard distinguishes an unexpected exception (`"Could not parse this message."`) from the unchanged valid empty-result message (`"No trade signals found in this message."`); the unchanged `"Could not save the message to the database."` message covers all Submit failures; duplicate advisories remain a normal result, logged only at WARNING; rollback, unconditional connection cleanup, preserved review state, and `TradeService.ingest_message()` as the sole persistence entry point are all unchanged
+  - Sanitized diagnostics exclude exception message text, absolute source paths, raw trade text, trader names, external trader IDs, parsed signal values, database/log paths, environment values, and SQL values
+  - No schema, model, parser, repository, service, database-config, or database-initialization redesign; no backup, recovery, review UI, correction workflow, packaging, Discord, telemetry, or third-party dependency work included
+  - 287/287 tests passing (242 pre-existing + 45 new across `tests/test_logging_config.py` and `tests/test_app.py`); tests use temporary log paths exclusively and do not write to the real LOCALAPPDATA log
+  - Implementation commit `a0654e5` pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit
 
 # Current Focus
-Milestone 2D.1 — Runtime Configuration and Application Data Locations is fully implemented, tested, reviewed, committed (`648ff121fc1f91a044f963f155fa0ea97e3211d6`), and pushed to `origin/main`; local `main` and `origin/main` are synchronized at that commit. 242/242 tests passing. The current milestone is Milestone 2D.2 — Operational Logging and Error Handling, not yet approved for implementation. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, or parser changes occurred in Milestone 2D.1.
+Milestone 2D.2 — Operational Logging and Error Handling is fully implemented, tested, reviewed, committed (`a0654e51af3f82ce8826107dad15bcc0f2944b35`), and pushed to `origin/main`; local `main` and `origin/main` are synchronized at that commit. 287/287 tests passing. The current milestone is Milestone 2D.3 — Database Backup and Recovery, not yet approved for implementation. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, parser, or database-configuration changes occurred in Milestone 2D.2.
 
 # Next Milestone
-Milestone 2D.2 — Operational Logging and Error Handling. Not yet approved for implementation. Per project rules, implementation begins only after a separate implementation-plan review and approval step.
+Milestone 2D.3 — Database Backup and Recovery. Not yet approved for implementation. Per project rules, implementation begins only after a separate implementation-plan review and approval step.
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -98,13 +106,13 @@ Current Phase:
 Phase 2D — Manual Version 1 Operational Readiness
 
 Current Milestone:
-2D.2 — Operational Logging and Error Handling (not yet approved for implementation)
+2D.3 — Database Backup and Recovery (not yet approved for implementation)
 
 Git Synchronization:
-Local main and origin/main synchronized at commit 648ff121fc1f91a044f963f155fa0ea97e3211d6
+Local main and origin/main synchronized at commit a0654e51af3f82ce8826107dad15bcc0f2944b35
 
 Test Suite:
-242/242 tests passing
+287/287 tests passing
 
 Next Action:
-Scope and approve the Milestone 2D.2 implementation plan, then implement, test, review, and commit per project rules
+Scope and approve the Milestone 2D.3 implementation plan, then implement, test, review, and commit per project rules

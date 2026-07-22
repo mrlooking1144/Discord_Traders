@@ -22,6 +22,7 @@ from database.repository import (
     create_trader,
     get_or_create_source,
     get_trade_signal_by_id,
+    get_trade_signals_for_review,
     get_trade_signals_matching,
     get_trader_by_external_id,
     update_trade_signal as _repository_update_trade_signal,
@@ -312,3 +313,54 @@ class TradeService:
             "trade_signals": created_signals,
             "duplicate_warnings": duplicate_warnings,
         }
+
+    def list_trade_signals_for_review(
+        self,
+        *,
+        source_name: str | None = None,
+        trader_name: str | None = None,
+        symbol: str | None = None,
+        date: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """List persisted trade signals for read-only review, newest first.
+
+        A thin, read-only delegation to
+        database.repository.get_trade_signals_for_review(): no business
+        rules are applied and no row is ever written. The only
+        normalization performed here is uppercasing a non-blank symbol
+        filter before delegating, so callers (the UI) do not need to
+        duplicate that normalization themselves; all other arguments and
+        the returned list are passed through unchanged.
+
+        Args:
+            source_name: Exact sources.name to filter by, or None/blank to
+                omit.
+            trader_name: Exact traders.name to filter by, or None/blank to
+                omit.
+            symbol: Ticker symbol to filter by; normalized to uppercase
+                when non-blank, or None/blank to omit.
+            date: Calendar date "YYYY-MM-DD" to filter
+                trade_signals.created_at by (inclusive start of day,
+                exclusive start of the following day), or None/blank to
+                omit.
+            limit: Maximum number of rows to return. Defaults to 100.
+
+        Returns:
+            The list of dicts returned by
+            database.repository.get_trade_signals_for_review(), unchanged.
+
+        Raises:
+            ValueError: If date is supplied and is not in "YYYY-MM-DD"
+                format.
+        """
+        normalized_symbol = symbol.upper() if symbol and symbol.strip() else symbol
+
+        return get_trade_signals_for_review(
+            self.conn,
+            source_name=source_name,
+            trader_name=trader_name,
+            symbol=normalized_symbol,
+            date=date,
+            limit=limit,
+        )

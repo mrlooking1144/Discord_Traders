@@ -29,9 +29,12 @@ file logging are touched here.
 
 import json
 import logging
+import os
 import sqlite3
+import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
@@ -931,6 +934,374 @@ class CreateBackupControlTests(unittest.TestCase):
         self.assertTrue(
             all(record.levelno < logging.CRITICAL for record in captured.records)
         )
+
+
+class WorkflowNavigationTests(unittest.TestCase):
+    """Covers Milestone 2D.4: sidebar-selected workflow navigation.
+
+    Uses a plain if/elif on st.sidebar.radio()'s value, not st.tabs(), so
+    only the selected workflow's code executes on a given rerun.
+    """
+
+    def test_sidebar_offers_both_workflows(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+
+        self.assertEqual(
+            at.sidebar.radio[0].options, ["Manual Message Entry", "Review Signals"]
+        )
+
+    def test_manual_message_entry_is_the_default_selection(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+
+        self.assertEqual(at.sidebar.radio[0].value, "Manual Message Entry")
+        self.assertIn("Parse Message", {b.label for b in at.button})
+
+    def test_create_backup_appears_only_in_manual_message_entry(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        self.assertIn("Create Backup", {b.label for b in at.button})
+
+        at = at.sidebar.radio[0].set_value("Review Signals").run()
+        self.assertNotIn("Create Backup", {b.label for b in at.button})
+
+    def test_manual_message_entry_does_not_invoke_review_method(self):
+        with patch("database.service.TradeService") as mock_service_cls:
+            at = AppTest.from_file("app/app.py")
+            at.run()
+
+            mock_service_cls.return_value.list_trade_signals_for_review.assert_not_called()
+
+    def test_review_signals_does_not_invoke_parser_ingest_or_backup(self):
+        with patch("app.parser.parse_message") as mock_parse, patch(
+            "database.service.TradeService"
+        ) as mock_service_cls, patch("database.backup.create_backup") as mock_backup:
+            mock_service_cls.return_value.list_trade_signals_for_review.return_value = []
+
+            at = AppTest.from_file("app/app.py")
+            at.run()
+            at.sidebar.radio[0].set_value("Review Signals").run()
+
+            mock_parse.assert_not_called()
+            mock_service_cls.return_value.ingest_message.assert_not_called()
+            mock_backup.assert_not_called()
+
+    def test_review_signals_renders_no_write_capable_buttons(self):
+        with patch("database.db.get_connection", return_value=MagicMock()), patch(
+            "database.service.TradeService"
+        ) as mock_service_cls:
+            mock_service_cls.return_value.list_trade_signals_for_review.return_value = []
+
+            with tempfile.TemporaryDirectory() as tmp:
+                db_path = Path(tmp) / "discord_traders.db"
+                db_path.write_bytes(b"")
+                with patch.dict(
+                    os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+                ):
+                    at = AppTest.from_file("app/app.py")
+                    at.run()
+                    at.sidebar.radio[0].set_value("Review Signals").run()
+
+            self.assertEqual(len(at.button), 0)
+
+
+class ReviewSignalsDatabaseNotFoundTests(unittest.TestCase):
+    """Covers Milestone 2D.4: the Review workflow never creates the
+    database. No patches on database.db are used here - the real
+    Path.exists() check and the real absence of get_connection()/
+    initialize_database() calls are exercised directly."""
+
+    def test_nonexistent_database_shows_fixed_message_and_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "nested" / "discord_traders.db"
+            self.assertFalse(db_path.exists())
+            self.assertFalse(db_path.parent.exists())
+
+            with patch.dict(
+                os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+            ):
+                at = AppTest.from_file("app/app.py")
+                at.run()
+                at.sidebar.radio[0].set_value("Review Signals").run()
+
+            self.assertEqual(len(at.info), 1)
+            self.assertEqual(at.info[0].value, "No trade signals found.")
+            self.assertEqual(len(at.error), 0)
+            self.assertFalse(db_path.exists())
+            self.assertFalse(db_path.parent.exists())
+
+
+class ReviewSignalsEmptyAndFailureTests(unittest.TestCase):
+    """Covers Milestone 2D.4: empty-result and query-failure states, once
+    the database file already exists. database.db.get_connection and
+    database.service.TradeService are patched so no real SQLite database
+    is touched here (reserved for tests/test_review_integration.py)."""
+
+    def _run_review(self, mock_service_cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "discord_traders.db"
+            db_path.write_bytes(b"")
+            with patch.dict(
+                os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+            ), patch("database.db.get_connection", return_value=MagicMock()):
+                at = AppTest.from_file("app/app.py")
+                at.run()
+                at = at.sidebar.radio[0].set_value("Review Signals").run()
+        return at
+
+    def test_empty_result_shows_fixed_message(self):
+        with patch("database.service.TradeService") as mock_service_cls:
+            mock_service_cls.return_value.list_trade_signals_for_review.return_value = []
+            at = self._run_review(mock_service_cls)
+
+        self.assertEqual(len(at.info), 1)
+        self.assertEqual(at.info[0].value, "No trade signals found.")
+        self.assertEqual(len(at.error), 0)
+
+    def test_query_failure_shows_fixed_message_and_logs_sanitized(self):
+        with patch("database.service.TradeService") as mock_service_cls:
+            mock_service_cls.return_value.list_trade_signals_for_review.side_effect = (
+                sqlite3.OperationalError("SENTINEL_REVIEW_EXC_442")
+            )
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = self._run_review(mock_service_cls)
+
+        self.assertEqual(len(at.error), 1)
+        self.assertEqual(at.error[0].value, "Could not load stored trade signals.")
+        self.assertEqual(len(at.info), 0)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("stored-signal review failed", joined)
+        self.assertIn("OperationalError", joined)
+        self.assertNotIn("SENTINEL_REVIEW_EXC_442", joined)
+        self.assertTrue(
+            all(record.levelno < logging.CRITICAL for record in captured.records)
+        )
+
+
+class ReviewSignalsDisplayTests(unittest.TestCase):
+    """Covers Milestone 2D.4: summary table, signal-ID selection, and the
+    read-only detail view. database.db.get_connection and
+    database.service.TradeService are patched for the lifetime of each
+    test (via setUp/addCleanup, not a `with` block scoped only to the
+    first .run()) because a later widget interaction (selecting a signal
+    ID) triggers Streamlit to re-execute app.py's entire module body, and
+    the patches must still be active for that second execution too."""
+
+    _SIGNALS = [
+        {
+            "id": 2,
+            "symbol": "AAPL",
+            "action": "STC",
+            "option_type": "put",
+            "price": "1.10",
+            "expiration": "2025-12-15",
+            "position_size": "5 contracts",
+            "created_at": "2026-07-15 11:00:00",
+            "updated_at": "2026-07-15 11:00:00",
+            "source_name": "discord",
+            "trader_name": "bob",
+            "external_trader_id": None,
+            "raw_text": "STC AAPL 190P 12/15/2025 @1.10",
+        },
+        {
+            "id": 1,
+            "symbol": "SPY",
+            "action": "BTO",
+            "option_type": "call",
+            "price": "3.25",
+            "expiration": "2026-12-18",
+            "position_size": "10 contracts",
+            "created_at": "2026-07-15 10:00:00",
+            "updated_at": "2026-07-15 10:00:00",
+            "source_name": "discord",
+            "trader_name": "alice",
+            "external_trader_id": "disc-alice",
+            "raw_text": "BTO SPY 450C 7/19/2025 @3.25 10 contracts",
+        },
+    ]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        db_path = Path(self._tmp.name) / "discord_traders.db"
+        db_path.write_bytes(b"")
+
+        env_patcher = patch.dict(
+            os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        conn_patcher = patch("database.db.get_connection", return_value=MagicMock())
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        service_patcher = patch("database.service.TradeService")
+        mock_service_cls = service_patcher.start()
+        self.addCleanup(service_patcher.stop)
+        mock_service_cls.return_value.list_trade_signals_for_review.return_value = (
+            self._SIGNALS
+        )
+
+    def _open_review(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        return at.sidebar.radio[0].set_value("Review Signals").run()
+
+    def test_summary_table_shows_expected_fields_newest_first(self):
+        at = self._open_review()
+
+        self.assertEqual(len(at.dataframe), 1)
+        df = at.dataframe[0].value
+        self.assertEqual(list(df["ID"]), [2, 1])
+        self.assertEqual(list(df["Symbol"]), ["AAPL", "SPY"])
+        self.assertEqual(list(df["Source"]), ["discord", "discord"])
+        self.assertEqual(list(df["Trader"]), ["bob", "alice"])
+        self.assertEqual(list(df["Price"]), ["1.10", "3.25"])
+
+    def test_raw_message_not_present_in_summary_table(self):
+        at = self._open_review()
+
+        df = at.dataframe[0].value
+        self.assertNotIn("raw_text", df.columns)
+        self.assertNotIn("Raw", " ".join(df.columns))
+
+    def test_signal_id_selectbox_offers_newest_first_ids(self):
+        at = self._open_review()
+
+        self.assertEqual(at.selectbox[0].options, ["2", "1"])
+
+    def test_selecting_a_signal_shows_correct_detail_including_raw_text(self):
+        at = self._open_review()
+
+        at = at.selectbox[0].set_value(1).run()
+
+        detail_text = "\n".join(element.value for element in at.markdown)
+        self.assertIn("Source: discord", detail_text)
+        self.assertIn("Trader: alice", detail_text)
+        self.assertIn("External trader ID: disc-alice", detail_text)
+        self.assertIn("Symbol: SPY", detail_text)
+        self.assertEqual(len(at.text_area), 1)
+        self.assertEqual(at.text_area[0].value, "BTO SPY 450C 7/19/2025 @3.25 10 contracts")
+        self.assertTrue(at.text_area[0].disabled)
+
+    def test_raw_message_only_appears_in_detail_view_not_elsewhere(self):
+        at = self._open_review()
+
+        df = at.dataframe[0].value
+        self.assertNotIn("BTO SPY 450C 7/19/2025 @3.25 10 contracts", df.to_string())
+
+        at = at.selectbox[0].set_value(1).run()
+        self.assertEqual(at.text_area[0].value, "BTO SPY 450C 7/19/2025 @3.25 10 contracts")
+
+    def test_nullable_external_trader_id_displays_safely(self):
+        at = self._open_review()
+
+        at = at.selectbox[0].set_value(2).run()
+
+        detail_text = "\n".join(element.value for element in at.markdown)
+        self.assertNotIn("External trader ID", detail_text)
+
+    def test_no_edit_correction_or_delete_controls_present(self):
+        at = self._open_review()
+
+        self.assertEqual(len(at.button), 0)
+        self.assertEqual(len(at.text_input), 3)  # source, trader, symbol filters only
+
+
+class ReviewSignalsDateFilterTests(unittest.TestCase):
+    """Covers Milestone 2D.4: the optional date filter's enable/disable
+    control and the exact "YYYY-MM-DD" value passed to
+    TradeService.list_trade_signals_for_review(). Patches (env var,
+    connection, TradeService, parser, backup) are started in setUp and
+    stopped via addCleanup so they remain active across every .run() call
+    in a test, including the checkbox-enable and date-selection reruns."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        db_path = Path(self._tmp.name) / "discord_traders.db"
+        db_path.write_bytes(b"")
+
+        env_patcher = patch.dict(
+            os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        conn_patcher = patch("database.db.get_connection", return_value=MagicMock())
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        service_patcher = patch("database.service.TradeService")
+        self.mock_service_cls = service_patcher.start()
+        self.addCleanup(service_patcher.stop)
+        self.mock_service_cls.return_value.list_trade_signals_for_review.return_value = []
+
+        parse_patcher = patch("app.parser.parse_message")
+        self.mock_parse = parse_patcher.start()
+        self.addCleanup(parse_patcher.stop)
+
+        backup_patcher = patch("database.backup.create_backup")
+        self.mock_backup = backup_patcher.start()
+        self.addCleanup(backup_patcher.stop)
+
+    def _open_review(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        return at.sidebar.radio[0].set_value("Review Signals").run()
+
+    def _last_call_kwargs(self):
+        return (
+            self.mock_service_cls.return_value.list_trade_signals_for_review.call_args.kwargs
+        )
+
+    def test_date_input_hidden_until_filter_by_date_is_enabled(self):
+        at = self._open_review()
+
+        self.assertEqual(len(at.checkbox), 1)
+        self.assertEqual(at.checkbox[0].label, "Filter by date")
+        self.assertFalse(at.checkbox[0].value)
+        self.assertEqual(len(at.date_input), 0)
+        self.assertIsNone(self._last_call_kwargs()["date"])
+
+        at = at.checkbox[0].set_value(True).run()
+
+        self.assertEqual(len(at.date_input), 1)
+
+    def test_selected_date_passed_to_service_as_exact_yyyy_mm_dd(self):
+        at = self._open_review()
+        at = at.checkbox[0].set_value(True).run()
+
+        at = at.date_input[0].set_value(date(2026, 7, 20)).run()
+
+        self.assertEqual(self._last_call_kwargs()["date"], "2026-07-20")
+
+    def test_combined_source_trader_symbol_filters_passed_alongside_date(self):
+        at = self._open_review()
+        at = at.text_input[0].input("discord").run()
+        at = at.text_input[1].input("alice").run()
+        at = at.text_input[2].input("spy").run()
+        at = at.checkbox[0].set_value(True).run()
+        at = at.date_input[0].set_value(date(2026, 7, 20)).run()
+
+        call_kwargs = self._last_call_kwargs()
+        self.assertEqual(call_kwargs["source_name"], "discord")
+        self.assertEqual(call_kwargs["trader_name"], "alice")
+        self.assertEqual(call_kwargs["symbol"], "spy")
+        self.assertEqual(call_kwargs["date"], "2026-07-20")
+
+    def test_no_parser_ingestion_backup_or_write_during_date_filter_interaction(self):
+        at = self._open_review()
+        at = at.checkbox[0].set_value(True).run()
+        at = at.date_input[0].set_value(date(2026, 7, 20)).run()
+
+        self.mock_parse.assert_not_called()
+        self.mock_service_cls.return_value.ingest_message.assert_not_called()
+        self.mock_backup.assert_not_called()
+        self.assertEqual(len(at.button), 0)
 
 
 if __name__ == "__main__":

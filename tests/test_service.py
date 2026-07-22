@@ -4,6 +4,8 @@ Covers Milestone 2B.6a: TradeService scaffold and the
 check_duplicate_signal advisory duplicate check.
 Covers Milestone 2B.6b: the edit-on-update rule.
 Covers Milestone 2B.6c: the ingest_message entry point.
+Covers Milestone 2D.4: list_trade_signals_for_review()'s thin delegation
+to database.repository.get_trade_signals_for_review().
 """
 
 import json
@@ -13,6 +15,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 from database import repository
 from database.config import DatabaseConfig
@@ -761,6 +764,135 @@ class TradeServiceIngestMessageTests(unittest.TestCase):
             self.assertEqual(row[0], 0)
         finally:
             other_connection.close()
+
+
+class TradeServiceListTradeSignalsForReviewTests(unittest.TestCase):
+    """Covers Milestone 2D.4: TradeService.list_trade_signals_for_review()."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+        self.service = TradeService(self.connection)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader.id,
+            "SPY",
+            "BTO",
+            "call",
+            Decimal("3.25"),
+            "2026-12-18",
+            "10 contracts",
+        )
+        self.connection.commit()
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def test_delegates_to_repository_function_with_given_arguments(self):
+        with patch(
+            "database.service.get_trade_signals_for_review",
+            return_value=["sentinel"],
+        ) as mock_get:
+            result = self.service.list_trade_signals_for_review(
+                source_name="discord",
+                trader_name="alice",
+                symbol="spy",
+                date="2026-07-15",
+                limit=5,
+            )
+
+        mock_get.assert_called_once_with(
+            self.connection,
+            source_name="discord",
+            trader_name="alice",
+            symbol="SPY",
+            date="2026-07-15",
+            limit=5,
+        )
+        self.assertEqual(result, ["sentinel"])
+
+    def test_result_is_returned_unchanged(self):
+        result = self.service.list_trade_signals_for_review()
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["symbol"], "SPY")
+        self.assertEqual(result[0]["source_name"], "discord")
+        self.assertEqual(result[0]["trader_name"], "alice")
+
+    def test_nonblank_symbol_is_uppercased_before_delegation(self):
+        result = self.service.list_trade_signals_for_review(symbol="spy")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["symbol"], "SPY")
+
+    def test_blank_symbol_is_not_uppercased_or_treated_as_a_filter(self):
+        with patch(
+            "database.service.get_trade_signals_for_review",
+            return_value=[],
+        ) as mock_get:
+            self.service.list_trade_signals_for_review(symbol="")
+
+        mock_get.assert_called_once_with(
+            self.connection,
+            source_name=None,
+            trader_name=None,
+            symbol="",
+            date=None,
+            limit=100,
+        )
+
+    def test_none_symbol_is_passed_through_as_none(self):
+        with patch(
+            "database.service.get_trade_signals_for_review",
+            return_value=[],
+        ) as mock_get:
+            self.service.list_trade_signals_for_review(symbol=None)
+
+        mock_get.assert_called_once_with(
+            self.connection,
+            source_name=None,
+            trader_name=None,
+            symbol=None,
+            date=None,
+            limit=100,
+        )
+
+    def test_default_limit_is_100(self):
+        with patch(
+            "database.service.get_trade_signals_for_review",
+            return_value=[],
+        ) as mock_get:
+            self.service.list_trade_signals_for_review()
+
+        self.assertEqual(mock_get.call_args.kwargs["limit"], 100)
+
+    def test_other_arguments_pass_through_unchanged(self):
+        with patch(
+            "database.service.get_trade_signals_for_review",
+            return_value=[],
+        ) as mock_get:
+            self.service.list_trade_signals_for_review(
+                source_name="telegram", trader_name="bob", date="2026-01-01"
+            )
+
+        mock_get.assert_called_once_with(
+            self.connection,
+            source_name="telegram",
+            trader_name="bob",
+            symbol=None,
+            date="2026-01-01",
+            limit=100,
+        )
 
 
 if __name__ == "__main__":

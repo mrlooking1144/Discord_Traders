@@ -11,10 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
 from database.models import RawMessage, Source, Trader, TradeSignal, TradeSignalEdit
+
+_REVIEW_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+_REVIEW_DATE_FORMAT = "%Y-%m-%d"
 
 
 def _validate_source_name(name: str) -> None:
@@ -777,3 +781,119 @@ def get_trade_signals_matching(
         ),
     ).fetchall()
     return [_row_to_trade_signal(row) for row in rows]
+
+
+def _date_range_bounds(date: str) -> tuple[str, str]:
+    """Compute inclusive-start/exclusive-end created_at bounds for a date.
+
+    Args:
+        date: A calendar date string, "YYYY-MM-DD".
+
+    Returns:
+        A (start, end) pair of "YYYY-MM-DD HH:MM:SS" strings: start is
+        date at 00:00:00 (inclusive), end is the following calendar day at
+        00:00:00 (exclusive).
+
+    Raises:
+        ValueError: If date is not in "YYYY-MM-DD" format.
+    """
+    try:
+        start = datetime.strptime(date, _REVIEW_DATE_FORMAT)
+    except ValueError as exc:
+        raise ValueError(f"date must match the format {_REVIEW_DATE_FORMAT!r}.") from exc
+
+    end = start + timedelta(days=1)
+    return start.strftime(_REVIEW_TIMESTAMP_FORMAT), end.strftime(_REVIEW_TIMESTAMP_FORMAT)
+
+
+def get_trade_signals_for_review(
+    conn: sqlite3.Connection,
+    *,
+    source_name: str | None = None,
+    trader_name: str | None = None,
+    symbol: str | None = None,
+    date: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """List persisted trade signals for read-only review, newest first.
+
+    Joins trade_signals with traders, raw_messages, and sources in a single
+    query to provide full display context. Every active filter is applied
+    in SQL before LIMIT; a blank or None filter omits its WHERE fragment
+    entirely rather than matching everything via a wildcard. This function
+    performs no writes and never modifies any row.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_name: Exact sources.name to filter by, or None/blank to omit.
+        trader_name: Exact traders.name to filter by, or None/blank to
+            omit.
+        symbol: Ticker symbol to filter by, matched case-insensitively
+            (both sides normalized to uppercase), or None/blank to omit.
+        date: Calendar date "YYYY-MM-DD" to filter trade_signals.created_at
+            by - inclusive start of that day, exclusive start of the
+            following day - or None/blank to omit. Never filters on
+            raw_messages.received_at.
+        limit: Maximum number of rows to return, applied in SQL via LIMIT.
+            Defaults to 100.
+
+    Returns:
+        A list of dicts, newest first (trade_signals.id descending), each
+        with keys: id, symbol, action, option_type, price, expiration,
+        position_size, created_at, updated_at, source_name, trader_name,
+        external_trader_id, raw_text. price is the exact stored decimal
+        string, never converted to float. Empty list if nothing matches.
+
+    Raises:
+        ValueError: If date is supplied and is not in "YYYY-MM-DD" format.
+    """
+    where_clauses: list[str] = []
+    params: list = []
+
+    if source_name and source_name.strip():
+        where_clauses.append("sources.name = ?")
+        params.append(source_name)
+
+    if trader_name and trader_name.strip():
+        where_clauses.append("traders.name = ?")
+        params.append(trader_name)
+
+    if symbol and symbol.strip():
+        where_clauses.append("UPPER(trade_signals.symbol) = UPPER(?)")
+        params.append(symbol)
+
+    if date and date.strip():
+        range_start, range_end = _date_range_bounds(date)
+        where_clauses.append("trade_signals.created_at >= ?")
+        where_clauses.append("trade_signals.created_at < ?")
+        params.append(range_start)
+        params.append(range_end)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    rows = conn.execute(
+        "SELECT "
+        "trade_signals.id AS id, "
+        "trade_signals.symbol AS symbol, "
+        "trade_signals.action AS action, "
+        "trade_signals.option_type AS option_type, "
+        "trade_signals.price AS price, "
+        "trade_signals.expiration AS expiration, "
+        "trade_signals.position_size AS position_size, "
+        "trade_signals.created_at AS created_at, "
+        "trade_signals.updated_at AS updated_at, "
+        "sources.name AS source_name, "
+        "traders.name AS trader_name, "
+        "traders.external_trader_id AS external_trader_id, "
+        "raw_messages.raw_text AS raw_text "
+        "FROM trade_signals "
+        "JOIN traders ON trade_signals.trader_id = traders.id "
+        "JOIN raw_messages ON trade_signals.raw_message_id = raw_messages.id "
+        "JOIN sources ON raw_messages.source_id = sources.id "
+        f"{where_sql} "
+        "ORDER BY trade_signals.id DESC "
+        "LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+
+    return [dict(row) for row in rows]

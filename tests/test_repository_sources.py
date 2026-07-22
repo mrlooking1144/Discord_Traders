@@ -29,6 +29,7 @@ from database.repository import (
     get_source_by_name,
     get_trade_signal_by_id,
     get_trade_signal_edits,
+    get_trade_signals_for_review,
     get_trade_signals_matching,
     get_trader_by_external_id,
     get_traders_by_name,
@@ -1512,6 +1513,326 @@ class TradeSignalsMatchingRepositoryTests(unittest.TestCase):
                 "2026-07-12 12:00:00",
                 "2026-07-12 12:05:00",
             )
+
+
+class TradeSignalsForReviewRepositoryTests(unittest.TestCase):
+    """Covers Milestone 2D.4: get_trade_signals_for_review()."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        self.discord_id = get_or_create_source(self.connection, "discord").id
+        self.telegram_id = get_or_create_source(self.connection, "telegram").id
+        self.alice = create_trader(
+            self.connection, self.discord_id, "alice", "disc-alice"
+        )
+        self.bob = create_trader(self.connection, self.telegram_id, "bob")
+        self.connection.commit()
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _create_signal(
+        self,
+        trader_id=None,
+        source_id=None,
+        symbol="SPY",
+        action="BTO",
+        option_type="call",
+        price=Decimal("3.25"),
+        expiration="2026-12-18",
+        position_size="10 contracts",
+        raw_text="BTO SPY 500c",
+        created_at=None,
+    ):
+        trader_id = trader_id if trader_id is not None else self.alice.id
+        source_id = source_id if source_id is not None else self.discord_id
+        raw_message = create_raw_message(self.connection, source_id, raw_text)
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader_id,
+            symbol,
+            action,
+            option_type,
+            price,
+            expiration,
+            position_size,
+        )
+        if created_at is not None:
+            self.connection.execute(
+                "UPDATE trade_signals SET created_at = ? WHERE id = ?",
+                (created_at, signal.id),
+            )
+        self.connection.commit()
+        return signal
+
+    def test_empty_database_returns_empty_list(self):
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertEqual(results, [])
+
+    def test_joined_result_contains_expected_fields(self):
+        self._create_signal(raw_text="BTO SPY 450C 7/19/2025 @3.25 10 contracts")
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertEqual(len(results), 1)
+        row = results[0]
+        self.assertEqual(
+            set(row),
+            {
+                "id",
+                "symbol",
+                "action",
+                "option_type",
+                "price",
+                "expiration",
+                "position_size",
+                "created_at",
+                "updated_at",
+                "source_name",
+                "trader_name",
+                "external_trader_id",
+                "raw_text",
+            },
+        )
+        self.assertEqual(row["symbol"], "SPY")
+        self.assertEqual(row["action"], "BTO")
+        self.assertEqual(row["option_type"], "call")
+        self.assertEqual(row["price"], "3.25")
+        self.assertEqual(row["expiration"], "2026-12-18")
+        self.assertEqual(row["position_size"], "10 contracts")
+        self.assertEqual(row["source_name"], "discord")
+        self.assertEqual(row["trader_name"], "alice")
+        self.assertEqual(row["external_trader_id"], "disc-alice")
+        self.assertEqual(row["raw_text"], "BTO SPY 450C 7/19/2025 @3.25 10 contracts")
+
+    def test_price_is_exact_string_never_float(self):
+        self._create_signal(price=Decimal("3.10"))
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertIsInstance(results[0]["price"], str)
+        self.assertEqual(results[0]["price"], "3.10")
+
+    def test_newest_first_ordering(self):
+        first = self._create_signal(symbol="AAA")
+        second = self._create_signal(symbol="BBB")
+        third = self._create_signal(symbol="CCC")
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertEqual([row["id"] for row in results], [third.id, second.id, first.id])
+
+    def test_default_limit_is_100(self):
+        for index in range(105):
+            self._create_signal(symbol=f"S{index}")
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertEqual(len(results), 100)
+
+    def test_custom_limit_is_honored(self):
+        for index in range(10):
+            self._create_signal(symbol=f"S{index}")
+
+        results = get_trade_signals_for_review(self.connection, limit=3)
+
+        self.assertEqual(len(results), 3)
+
+    def test_source_exact_filter(self):
+        self._create_signal(symbol="AAA", trader_id=self.alice.id, source_id=self.discord_id)
+        self._create_signal(symbol="BBB", trader_id=self.bob.id, source_id=self.telegram_id)
+
+        results = get_trade_signals_for_review(self.connection, source_name="telegram")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["symbol"], "BBB")
+
+    def test_trader_exact_filter(self):
+        self._create_signal(symbol="AAA", trader_id=self.alice.id, source_id=self.discord_id)
+        self._create_signal(symbol="BBB", trader_id=self.bob.id, source_id=self.telegram_id)
+
+        results = get_trade_signals_for_review(self.connection, trader_name="bob")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["symbol"], "BBB")
+
+    def test_symbol_filter_is_case_insensitive_exact_match(self):
+        self._create_signal(symbol="SPY")
+        self._create_signal(symbol="AAPL")
+
+        results = get_trade_signals_for_review(self.connection, symbol="spy")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["symbol"], "SPY")
+
+    def test_symbol_filter_does_not_match_substrings(self):
+        self._create_signal(symbol="SPY")
+        self._create_signal(symbol="SPYX")
+
+        results = get_trade_signals_for_review(self.connection, symbol="SPY")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["symbol"], "SPY")
+
+    def test_blank_filters_are_omitted(self):
+        self._create_signal(symbol="AAA")
+        self._create_signal(symbol="BBB")
+
+        results = get_trade_signals_for_review(
+            self.connection,
+            source_name="",
+            trader_name="   ",
+            symbol=None,
+            date="",
+        )
+
+        self.assertEqual(len(results), 2)
+
+    def test_date_filter_start_boundary_inclusive(self):
+        self._create_signal(symbol="AAA", created_at="2026-07-15 00:00:00")
+
+        results = get_trade_signals_for_review(self.connection, date="2026-07-15")
+
+        self.assertEqual(len(results), 1)
+
+    def test_date_filter_excludes_record_before_start_boundary(self):
+        self._create_signal(symbol="AAA", created_at="2026-07-14 23:59:59")
+
+        results = get_trade_signals_for_review(self.connection, date="2026-07-15")
+
+        self.assertEqual(results, [])
+
+    def test_date_filter_includes_record_just_before_next_day_boundary(self):
+        self._create_signal(symbol="AAA", created_at="2026-07-15 23:59:59")
+
+        results = get_trade_signals_for_review(self.connection, date="2026-07-15")
+
+        self.assertEqual(len(results), 1)
+
+    def test_date_filter_excludes_record_at_next_day_exclusive_boundary(self):
+        self._create_signal(symbol="AAA", created_at="2026-07-16 00:00:00")
+
+        results = get_trade_signals_for_review(self.connection, date="2026-07-15")
+
+        self.assertEqual(results, [])
+
+    def test_date_filter_uses_created_at_not_received_at(self):
+        raw_message = create_raw_message(
+            self.connection,
+            self.discord_id,
+            "BTO SPY 500c",
+            received_at="2026-01-01T00:00:00",
+        )
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            self.alice.id,
+            "AAA",
+            "BTO",
+        )
+        self.connection.execute(
+            "UPDATE trade_signals SET created_at = ? WHERE id = ?",
+            ("2026-07-15 12:00:00", signal.id),
+        )
+        self.connection.commit()
+
+        results = get_trade_signals_for_review(self.connection, date="2026-07-15")
+
+        self.assertEqual(len(results), 1)
+
+    def test_invalid_date_format_raises(self):
+        with self.assertRaises(ValueError):
+            get_trade_signals_for_review(self.connection, date="07/15/2026")
+
+    def test_combined_date_and_source_trader_symbol_filters(self):
+        self._create_signal(
+            symbol="SPY",
+            trader_id=self.alice.id,
+            source_id=self.discord_id,
+            created_at="2026-07-15 10:00:00",
+        )
+        # Different symbol, same day/source/trader.
+        self._create_signal(
+            symbol="AAPL",
+            trader_id=self.alice.id,
+            source_id=self.discord_id,
+            created_at="2026-07-15 11:00:00",
+        )
+        # Same symbol/source/trader, different day.
+        self._create_signal(
+            symbol="SPY",
+            trader_id=self.alice.id,
+            source_id=self.discord_id,
+            created_at="2026-07-16 10:00:00",
+        )
+        # Same symbol/day, different trader/source.
+        self._create_signal(
+            symbol="SPY",
+            trader_id=self.bob.id,
+            source_id=self.telegram_id,
+            created_at="2026-07-15 10:00:00",
+        )
+
+        results = get_trade_signals_for_review(
+            self.connection,
+            source_name="discord",
+            trader_name="alice",
+            symbol="spy",
+            date="2026-07-15",
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["symbol"], "SPY")
+        self.assertEqual(results[0]["source_name"], "discord")
+        self.assertEqual(results[0]["trader_name"], "alice")
+
+    def test_multiple_sources_and_traders_disambiguated(self):
+        self._create_signal(symbol="AAA", trader_id=self.alice.id, source_id=self.discord_id)
+        self._create_signal(symbol="BBB", trader_id=self.bob.id, source_id=self.telegram_id)
+
+        results = get_trade_signals_for_review(self.connection)
+
+        by_symbol = {row["symbol"]: row for row in results}
+        self.assertEqual(by_symbol["AAA"]["source_name"], "discord")
+        self.assertEqual(by_symbol["AAA"]["trader_name"], "alice")
+        self.assertEqual(by_symbol["BBB"]["source_name"], "telegram")
+        self.assertEqual(by_symbol["BBB"]["trader_name"], "bob")
+
+    def test_nullable_fields_surfaced_as_none(self):
+        self._create_signal(
+            option_type=None,
+            price=None,
+            expiration=None,
+            position_size=None,
+            trader_id=self.bob.id,
+            source_id=self.telegram_id,
+        )
+
+        results = get_trade_signals_for_review(self.connection)
+
+        row = results[0]
+        self.assertIsNone(row["option_type"])
+        self.assertIsNone(row["price"])
+        self.assertIsNone(row["expiration"])
+        self.assertIsNone(row["position_size"])
+        self.assertIsNone(row["external_trader_id"])
+
+    def test_no_duplicate_warning_field_present(self):
+        self._create_signal()
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertNotIn("duplicate_warning", results[0])
+        self.assertNotIn("duplicate_warnings", results[0])
 
 
 if __name__ == "__main__":

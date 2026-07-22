@@ -9,6 +9,7 @@ rolling back the transaction, exactly as with repository.py.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -22,6 +23,7 @@ from database.repository import (
     create_trader,
     get_or_create_source,
     get_trade_signal_by_id,
+    get_trade_signal_edits,
     get_trade_signals_for_review,
     get_trade_signals_matching,
     get_trader_by_external_id,
@@ -32,6 +34,58 @@ from database.repository import (
 DUPLICATE_WINDOW_MINUTES = 5
 
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# The exact, fixed set of fields a controlled correction (Milestone 2D.5)
+# may change - deliberately excludes raw_message_id/trader_id (identity,
+# not a "correction") and the structurally protected id/created_at/
+# updated_at, even though the more permissive repository-layer editable
+# set would otherwise accept raw_message_id/trader_id too.
+_CORRECTION_FIELDS = frozenset(
+    {"symbol", "action", "option_type", "price", "expiration", "position_size"}
+)
+
+
+class StaleTradeSignalError(Exception):
+    """Raised when a controlled correction's expected_current_values no
+    longer match the actual persisted values - another edit happened
+    since the caller loaded the signal. Raised before any audit snapshot
+    or update; the persisted row is left completely untouched."""
+
+
+class TradeSignalNotFoundError(ValueError):
+    """Raised when a controlled correction targets a trade_signal_id that
+    no longer exists. A ValueError subclass so it can still be caught
+    broadly as a ValueError, but is distinct from the plain ValueError
+    used for no-op/shape rejections and from the legacy (non-controlled)
+    update_trade_signal() path's own missing-signal ValueError, which is
+    unchanged."""
+
+
+class AuditHistoryError(Exception):
+    """Raised when a stored trade_signal_edits.previous_values value
+    cannot be decoded as JSON, or does not decode to a dict."""
+
+
+def _current_correction_values(signal: TradeSignal) -> dict:
+    """Build the canonical typed six-field correction snapshot from signal.
+
+    Args:
+        signal: The currently persisted TradeSignal to snapshot.
+
+    Returns:
+        A dict with exactly the _CORRECTION_FIELDS keys: symbol (str),
+        action (str), option_type (str | None), price (Decimal | None -
+        parsed from the stored decimal string, never a float),
+        expiration (str | None), position_size (str | None).
+    """
+    return {
+        "symbol": signal.symbol,
+        "action": signal.action,
+        "option_type": signal.option_type,
+        "price": Decimal(signal.price) if signal.price is not None else None,
+        "expiration": signal.expiration,
+        "position_size": signal.position_size,
+    }
 
 
 class TradeService:
@@ -129,44 +183,119 @@ class TradeService:
     def update_trade_signal(
         self,
         trade_signal_id: int,
+        expected_current_values: dict | None = None,
         **changed_fields,
     ) -> TradeSignal:
         """Update a trade signal, always preserving edit history.
 
         Enforces docs/DATABASE_DESIGN_V1.md Section 6: before any correction
         to trade_signals, a full-row JSON snapshot of the pre-edit values is
-        written to trade_signal_edits via database/repository.py. Field
-        validation is delegated to
-        repository.validate_trade_signal_update_fields(), the single source
-        of truth shared with repository.update_trade_signal(), so this
-        method cannot diverge from the repository layer on what counts as a
-        valid update.
+        written to trade_signal_edits via database/repository.py.
 
-        Execution order: validate changed_fields, fetch the existing row,
-        write the edit snapshot, then apply the update - in that order, so
-        no edit row is ever written for an update that will not happen.
+        Two modes, selected only by whether expected_current_values is
+        supplied:
+
+        Legacy mode (expected_current_values is None) - unchanged since
+        Milestone 2B.6b: changed_fields may be any non-empty, valid subset
+        of the repository layer's editable fields (raw_message_id,
+        trader_id, symbol, action, option_type, price, expiration,
+        position_size); field validation is delegated to
+        repository.validate_trade_signal_update_fields(), the single
+        source of truth shared with repository.update_trade_signal(); no
+        six-field shape requirement, no no-op check, no stale-conflict
+        check. Execution order: validate changed_fields, fetch the
+        existing row, write the edit snapshot, then apply the update.
+
+        Controlled correction mode (expected_current_values is not None) -
+        Milestone 2D.5: changed_fields must contain exactly the six
+        approved correction fields (symbol, action, option_type, price,
+        expiration, position_size) - never raw_message_id, trader_id, id,
+        created_at, or updated_at, even though the repository layer would
+        otherwise accept raw_message_id/trader_id. expected_current_values
+        must contain exactly the same six keys, typed as symbol: str,
+        action: str, option_type: str | None, price: Decimal | None,
+        expiration: str | None, position_size: str | None - never a float,
+        and never compared against an unparsed price string. Order:
+        validate changed_fields' key shape, validate
+        expected_current_values' key shape, run the shared repository
+        field validation, fetch the existing row (raising
+        TradeSignalNotFoundError if missing), build the canonical current-
+        value snapshot, compare expected_current_values to it (raising
+        StaleTradeSignalError on any mismatch), compare changed_fields to
+        it (raising ValueError if identical - a no-op), then - only after
+        every check passes - write exactly one audit snapshot and apply
+        the update. No stale, missing, invalid, or no-op correction ever
+        creates an audit row or changes updated_at.
 
         Args:
             trade_signal_id: Primary key of the trade signal to update.
-            **changed_fields: One or more of raw_message_id, trader_id,
-                symbol, action, option_type, price, expiration,
-                position_size. Optional fields may be explicitly set to
-                None.
+            expected_current_values: None for legacy sparse-update
+                behavior; the canonical typed six-field snapshot the
+                caller believes is still current, to enable controlled-
+                correction mode's stale-conflict and no-op protection.
+            **changed_fields: The fields to change - shape and content
+                requirements depend on the mode above.
 
         Returns:
             The updated TradeSignal.
 
         Raises:
-            ValueError: If changed_fields fails validation (see
-                repository.validate_trade_signal_update_fields), or if no
-                trade signal exists with trade_signal_id.
+            ValueError: Legacy mode - if changed_fields fails validation,
+                or if no trade signal exists with trade_signal_id.
+                Controlled mode - if changed_fields or
+                expected_current_values does not contain exactly the six
+                approved fields, if changed_fields fails the shared
+                repository validation, or if changed_fields is identical
+                to the current persisted values (a no-op).
+            TradeSignalNotFoundError: Controlled mode only - if no trade
+                signal exists with trade_signal_id. A ValueError subclass.
+            StaleTradeSignalError: Controlled mode only - if
+                expected_current_values no longer matches the actual
+                persisted values.
             TypeError: If price is supplied and is not a Decimal.
         """
+        if expected_current_values is None:
+            validate_trade_signal_update_fields(changed_fields)
+
+            existing = get_trade_signal_by_id(self.conn, trade_signal_id)
+            if existing is None:
+                raise ValueError(f"No trade signal exists with id {trade_signal_id}.")
+
+            create_trade_signal_edit(self.conn, trade_signal_id, asdict(existing))
+
+            return _repository_update_trade_signal(
+                self.conn, trade_signal_id, **changed_fields
+            )
+
+        if set(changed_fields) != _CORRECTION_FIELDS:
+            raise ValueError(
+                "A controlled correction must supply exactly the approved "
+                f"correction fields: {sorted(_CORRECTION_FIELDS)}."
+            )
+        if set(expected_current_values) != _CORRECTION_FIELDS:
+            raise ValueError(
+                "expected_current_values must supply exactly the approved "
+                f"correction fields: {sorted(_CORRECTION_FIELDS)}."
+            )
+
         validate_trade_signal_update_fields(changed_fields)
 
         existing = get_trade_signal_by_id(self.conn, trade_signal_id)
         if existing is None:
-            raise ValueError(f"No trade signal exists with id {trade_signal_id}.")
+            raise TradeSignalNotFoundError(
+                f"No trade signal exists with id {trade_signal_id}."
+            )
+
+        current_values = _current_correction_values(existing)
+
+        if expected_current_values != current_values:
+            raise StaleTradeSignalError(
+                "The trade signal's current values no longer match the "
+                "values expected for this correction."
+            )
+
+        if changed_fields == current_values:
+            raise ValueError("A correction must change at least one field.")
 
         create_trade_signal_edit(self.conn, trade_signal_id, asdict(existing))
 
@@ -364,3 +493,58 @@ class TradeService:
             date=date,
             limit=limit,
         )
+
+    def list_trade_signal_audit_history(self, trade_signal_id: int) -> list[dict]:
+        """List a trade signal's audit history for read-only display.
+
+        A thin, read-only delegation to
+        database.repository.get_trade_signal_edits(): decodes each row's
+        previous_values JSON (raising AuditHistoryError if it is not
+        valid JSON or does not decode to a dict), and returns only the
+        six previous editable-field values plus id and edited_at - never
+        the raw previous_values JSON text itself. price is preserved as
+        its exact stored string, never converted to float.
+
+        Args:
+            trade_signal_id: FK to trade_signals.id.
+
+        Returns:
+            A list of plain dicts, newest first, each with exactly: id,
+            edited_at, symbol, action, option_type, price, expiration,
+            position_size. Empty list if the signal has no edit history.
+
+        Raises:
+            AuditHistoryError: If a stored previous_values value is not
+                valid JSON, or does not decode to a dict.
+        """
+        edits = get_trade_signal_edits(self.conn, trade_signal_id)
+
+        history: list[dict] = []
+        for edit in edits:
+            try:
+                previous = json.loads(edit.previous_values)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise AuditHistoryError(
+                    f"Stored audit data for edit {edit.id} could not be decoded."
+                ) from exc
+
+            if not isinstance(previous, dict):
+                raise AuditHistoryError(
+                    f"Stored audit data for edit {edit.id} is not a JSON object."
+                )
+
+            history.append(
+                {
+                    "id": edit.id,
+                    "edited_at": edit.edited_at,
+                    "symbol": previous.get("symbol"),
+                    "action": previous.get("action"),
+                    "option_type": previous.get("option_type"),
+                    "price": previous.get("price"),
+                    "expiration": previous.get("expiration"),
+                    "position_size": previous.get("position_size"),
+                }
+            )
+
+        history.reverse()
+        return history

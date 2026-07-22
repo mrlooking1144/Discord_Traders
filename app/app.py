@@ -29,6 +29,20 @@ which tab is visually selected - only the selected workflow's code runs
 here. The Review workflow never calls initialize_database() and never
 opens a connection when the configured database file does not already
 exist, so merely viewing the review screen can never create the database.
+
+Milestone 2D.5: a "Correct Signal" control inside Review Signals, routed
+through database.service.TradeService.update_trade_signal()'s controlled-
+correction mode (expected_current_values), plus a read-only "Correction
+History" section via TradeService.list_trade_signal_audit_history(). Both
+share the same connection already opened for the review list/detail
+within this rerun - no extra connection is opened and the database is
+never initialized here. Only the six approved fields (symbol, action,
+option_type, price, expiration, position_size) are ever editable; action
+and option type use fixed select controls, not free text. Client-side
+syntactic validation (parsing price/expiration, requiring the
+confirmation checkbox) happens before the correction service call, not
+before any connection is opened, since one is already open for the
+review list at that point.
 """
 
 from __future__ import annotations
@@ -36,6 +50,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import streamlit as st
@@ -49,12 +64,29 @@ from app.parser import parse_message
 from database.backup import create_backup
 from database.config import DatabaseConfig, resolve_database_path
 from database.db import get_connection, initialize_database
-from database.service import TradeService
+from database.service import (
+    AuditHistoryError,
+    StaleTradeSignalError,
+    TradeService,
+    TradeSignalNotFoundError,
+)
 
 _SOURCE_NAME = "manual"
 _REFERENCE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _NOT_FOUND_MESSAGE = "No trade signals found."
 _LOAD_FAILURE_MESSAGE = "Could not load stored trade signals."
+_ACTION_CHOICES = ["BTO", "STC", "BTC", "STO", "BUY", "SELL"]
+_OPTION_TYPE_CHOICES = ["", "call", "put"]
+_CORRECTION_VALIDATION_MESSAGE = (
+    "Please enter a valid correction that changes at least one field."
+)
+_CORRECTION_CONFLICT_MESSAGE = (
+    "This trade signal changed or is no longer available. "
+    "Reload it before correcting."
+)
+_CORRECTION_FAILURE_MESSAGE = "Could not save the trade signal correction."
+_CORRECTION_SUCCESS_MESSAGE = "Trade signal correction saved."
+_AUDIT_HISTORY_FAILURE_MESSAGE = "Could not load correction history."
 
 logger = logging.getLogger("discord_traders.app")
 
@@ -244,10 +276,29 @@ elif workflow == "Review Signals":
                 )
 
                 signals_by_id = {signal["id"]: signal for signal in signals}
+
+                # Filter change removed the signal under correction from
+                # view entirely - exit correction mode for it.
+                if (
+                    "correction_signal_id" in st.session_state
+                    and st.session_state["correction_signal_id"] not in signals_by_id
+                ):
+                    st.session_state.pop("correction_signal_id", None)
+                    st.session_state.pop("correction_expected_values", None)
+
                 selected_id = st.selectbox(
                     "Select a signal ID for details", list(signals_by_id)
                 )
                 selected = signals_by_id[selected_id]
+
+                # Selecting a different signal exits correction mode for
+                # whatever signal was previously being corrected.
+                if (
+                    "correction_signal_id" in st.session_state
+                    and st.session_state["correction_signal_id"] != selected_id
+                ):
+                    st.session_state.pop("correction_signal_id", None)
+                    st.session_state.pop("correction_expected_values", None)
 
                 st.subheader(f"Signal {selected['id']} details")
                 st.write(f"Source: {selected['source_name']}")
@@ -265,6 +316,195 @@ elif workflow == "Review Signals":
                 st.text_area(
                     "Raw message", value=selected["raw_text"], height=200, disabled=True
                 )
+
+                # Two separate, freshly-re-read session_state checks (not a
+                # single cached boolean) - mirrors the existing Parse ->
+                # Submit pattern, so that clicking "Correct Signal" makes
+                # the form appear within this same rerun rather than
+                # requiring a second interaction.
+                if st.session_state.get("correction_signal_id") != selected["id"]:
+                    if st.button("Correct Signal"):
+                        st.session_state["correction_signal_id"] = selected["id"]
+                        st.session_state["correction_expected_values"] = {
+                            "symbol": selected["symbol"],
+                            "action": selected["action"],
+                            "option_type": selected["option_type"],
+                            "price": (
+                                Decimal(selected["price"])
+                                if selected["price"] is not None
+                                else None
+                            ),
+                            "expiration": selected["expiration"],
+                            "position_size": selected["position_size"],
+                        }
+
+                if st.session_state.get("correction_signal_id") == selected["id"]:
+                    st.subheader("Correct Signal")
+                    expected_values = st.session_state["correction_expected_values"]
+
+                    symbol_input = st.text_input(
+                        "Corrected symbol", value=expected_values["symbol"]
+                    )
+                    current_action = expected_values["action"]
+                    action_index = (
+                        _ACTION_CHOICES.index(current_action)
+                        if current_action in _ACTION_CHOICES
+                        else 0
+                    )
+                    action_input = st.selectbox(
+                        "Corrected action", _ACTION_CHOICES, index=action_index
+                    )
+                    current_option_type = expected_values["option_type"] or ""
+                    option_type_index = (
+                        _OPTION_TYPE_CHOICES.index(current_option_type)
+                        if current_option_type in _OPTION_TYPE_CHOICES
+                        else 0
+                    )
+                    option_type_input = st.selectbox(
+                        "Corrected option type",
+                        _OPTION_TYPE_CHOICES,
+                        index=option_type_index,
+                    )
+                    price_input = st.text_input(
+                        "Corrected price",
+                        value=(
+                            str(expected_values["price"])
+                            if expected_values["price"] is not None
+                            else ""
+                        ),
+                    )
+                    expiration_input = st.text_input(
+                        "Corrected expiration (YYYY-MM-DD)",
+                        value=expected_values["expiration"] or "",
+                    )
+                    position_size_input = st.text_input(
+                        "Corrected position size",
+                        value=expected_values["position_size"] or "",
+                    )
+                    confirm_correction = st.checkbox("I confirm this correction")
+
+                    save_clicked = st.button("Save Correction")
+                    cancel_clicked = st.button("Cancel")
+
+                    if cancel_clicked:
+                        st.session_state.pop("correction_signal_id", None)
+                        st.session_state.pop("correction_expected_values", None)
+
+                    if save_clicked:
+                        if not confirm_correction:
+                            st.error(_CORRECTION_VALIDATION_MESSAGE)
+                        else:
+                            normalized_symbol = symbol_input.strip().upper()
+                            normalized_option_type = (
+                                option_type_input.strip().lower() or None
+                            )
+                            normalized_position_size = (
+                                position_size_input.strip() or None
+                            )
+
+                            parse_failed = not normalized_symbol
+
+                            parsed_price = None
+                            price_text = price_input.strip()
+                            if price_text:
+                                try:
+                                    parsed_price = Decimal(price_text)
+                                except InvalidOperation:
+                                    parse_failed = True
+
+                            parsed_expiration = expiration_input.strip() or None
+                            if parsed_expiration is not None:
+                                try:
+                                    datetime.strptime(parsed_expiration, "%Y-%m-%d")
+                                except ValueError:
+                                    parse_failed = True
+
+                            if parse_failed:
+                                st.error(_CORRECTION_VALIDATION_MESSAGE)
+                            else:
+                                changed_fields = {
+                                    "symbol": normalized_symbol,
+                                    "action": action_input,
+                                    "option_type": normalized_option_type,
+                                    "price": parsed_price,
+                                    "expiration": parsed_expiration,
+                                    "position_size": normalized_position_size,
+                                }
+                                configure_file_logging()
+                                try:
+                                    service.update_trade_signal(
+                                        selected["id"],
+                                        expected_current_values=expected_values,
+                                        **changed_fields,
+                                    )
+                                    conn.commit()
+                                except (
+                                    StaleTradeSignalError,
+                                    TradeSignalNotFoundError,
+                                ) as exc:
+                                    conn.rollback()
+                                    log_operation_failure(
+                                        logger, "trade signal correction", exc
+                                    )
+                                    st.session_state.pop("correction_signal_id", None)
+                                    st.session_state.pop(
+                                        "correction_expected_values", None
+                                    )
+                                    st.error(_CORRECTION_CONFLICT_MESSAGE)
+                                except ValueError as exc:
+                                    conn.rollback()
+                                    log_operation_failure(
+                                        logger, "trade signal correction", exc
+                                    )
+                                    st.error(_CORRECTION_VALIDATION_MESSAGE)
+                                except (TypeError, sqlite3.Error, OSError) as exc:
+                                    conn.rollback()
+                                    log_operation_failure(
+                                        logger, "trade signal correction", exc
+                                    )
+                                    st.error(_CORRECTION_FAILURE_MESSAGE)
+                                except Exception as exc:
+                                    conn.rollback()
+                                    log_operation_failure(
+                                        logger, "trade signal correction", exc
+                                    )
+                                    st.error(_CORRECTION_FAILURE_MESSAGE)
+                                else:
+                                    logger.info("Trade signal correction committed")
+                                    st.session_state.pop("correction_signal_id", None)
+                                    st.session_state.pop(
+                                        "correction_expected_values", None
+                                    )
+                                    st.success(_CORRECTION_SUCCESS_MESSAGE)
+
+                st.subheader("Correction History")
+                try:
+                    audit_history = service.list_trade_signal_audit_history(
+                        selected["id"]
+                    )
+                except Exception as exc:
+                    log_operation_failure(logger, "correction history", exc)
+                    st.error(_AUDIT_HISTORY_FAILURE_MESSAGE)
+                else:
+                    if not audit_history:
+                        st.write("No corrections have been made to this signal.")
+                    else:
+                        st.dataframe(
+                            [
+                                {
+                                    "Audit ID": entry["id"],
+                                    "Edited At": entry["edited_at"],
+                                    "Previous Symbol": entry["symbol"],
+                                    "Previous Action": entry["action"],
+                                    "Previous Option Type": entry["option_type"] or "",
+                                    "Previous Price": entry["price"] or "",
+                                    "Previous Expiration": entry["expiration"] or "",
+                                    "Previous Position Size": entry["position_size"]
+                                    or "",
+                                }
+                                for entry in audit_history
+                            ]
+                        )
         finally:
             if conn is not None:
                 conn.close()

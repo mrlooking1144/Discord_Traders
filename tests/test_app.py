@@ -42,6 +42,7 @@ from streamlit.testing.v1 import AppTest
 from app import logging_config
 from app.parser import parse_message
 from database.config import resolve_database_path
+from database.service import AuditHistoryError, StaleTradeSignalError, TradeSignalNotFoundError
 
 _SAMPLE_MESSAGE = "BTO SPY 450C 7/19/2025 @3.25 10 contracts"
 
@@ -1144,6 +1145,12 @@ class ReviewSignalsDisplayTests(unittest.TestCase):
         mock_service_cls.return_value.list_trade_signals_for_review.return_value = (
             self._SIGNALS
         )
+        # Milestone 2D.5: the Review Signals branch also queries audit
+        # history for the selected signal; an empty history keeps this
+        # 2D.4-era fixture's dataframe-count assumptions (one dataframe:
+        # the summary table) unaffected by that unrelated addition.
+        mock_service_cls.return_value.list_trade_signal_audit_history.return_value = []
+        self.mock_service_cls = mock_service_cls
 
     def _open_review(self):
         at = AppTest.from_file("app/app.py")
@@ -1204,10 +1211,13 @@ class ReviewSignalsDisplayTests(unittest.TestCase):
         detail_text = "\n".join(element.value for element in at.markdown)
         self.assertNotIn("External trader ID", detail_text)
 
-    def test_no_edit_correction_or_delete_controls_present(self):
+    def test_no_delete_control_and_correction_gated_behind_correct_signal(self):
+        # Milestone 2D.5: "Correct Signal" is now an approved entry point
+        # into correction mode, but no delete control exists and no
+        # correction form (Save/Cancel, etc.) renders until it is clicked.
         at = self._open_review()
 
-        self.assertEqual(len(at.button), 0)
+        self.assertEqual({b.label for b in at.button}, {"Correct Signal"})
         self.assertEqual(len(at.text_input), 3)  # source, trader, symbol filters only
 
 
@@ -1302,6 +1312,429 @@ class ReviewSignalsDateFilterTests(unittest.TestCase):
         self.mock_service_cls.return_value.ingest_message.assert_not_called()
         self.mock_backup.assert_not_called()
         self.assertEqual(len(at.button), 0)
+
+
+class CorrectSignalWorkflowTests(unittest.TestCase):
+    """Covers Milestone 2D.5: the "Correct Signal" workflow inside Review
+    Signals. Patches (env var, connection, TradeService, parser, backup)
+    are started in setUp/stopped via addCleanup, so they remain active
+    across every .run() call in a test, including the multiple reruns a
+    correction/cancel/save interaction requires."""
+
+    _SIGNALS = [
+        {
+            "id": 2,
+            "symbol": "AAPL",
+            "action": "STC",
+            "option_type": "put",
+            "price": "1.10",
+            "expiration": "2025-12-15",
+            "position_size": "5 contracts",
+            "created_at": "2026-07-15 11:00:00",
+            "updated_at": "2026-07-15 11:00:00",
+            "source_name": "discord",
+            "trader_name": "bob",
+            "external_trader_id": None,
+            "raw_text": "STC AAPL 190P 12/15/2025 @1.10",
+        },
+        {
+            "id": 1,
+            "symbol": "SPY",
+            "action": "BTO",
+            "option_type": "call",
+            "price": "3.25",
+            "expiration": "2026-12-18",
+            "position_size": "10 contracts",
+            "created_at": "2026-07-15 10:00:00",
+            "updated_at": "2026-07-15 10:00:00",
+            "source_name": "discord",
+            "trader_name": "alice",
+            "external_trader_id": "disc-alice",
+            "raw_text": "BTO SPY 450C 7/19/2025 @3.25 10 contracts",
+        },
+    ]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        db_path = Path(self._tmp.name) / "discord_traders.db"
+        db_path.write_bytes(b"")
+
+        env_patcher = patch.dict(
+            os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        conn_patcher = patch("database.db.get_connection", return_value=MagicMock())
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        service_patcher = patch("database.service.TradeService")
+        self.mock_service_cls = service_patcher.start()
+        self.addCleanup(service_patcher.stop)
+        self.mock_service_cls.return_value.list_trade_signals_for_review.return_value = (
+            self._SIGNALS
+        )
+        self.mock_service_cls.return_value.list_trade_signal_audit_history.return_value = (
+            []
+        )
+
+        parse_patcher = patch("app.parser.parse_message")
+        self.mock_parse = parse_patcher.start()
+        self.addCleanup(parse_patcher.stop)
+
+        backup_patcher = patch("database.backup.create_backup")
+        self.mock_backup = backup_patcher.start()
+        self.addCleanup(backup_patcher.stop)
+
+        # Save Correction calls configure_file_logging(), exactly like
+        # Submit; patched out entirely (not just redirected via an env
+        # var) so no real file I/O of any kind is attempted here.
+        file_log_patcher = patch("app.logging_config.configure_file_logging")
+        file_log_patcher.start()
+        self.addCleanup(file_log_patcher.stop)
+
+    def _open_review(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+        return at.sidebar.radio[0].set_value("Review Signals").run()
+
+    def _enter_correction_mode(self, at, signal_id=1):
+        selectbox = next(
+            w for w in at.selectbox if w.label == "Select a signal ID for details"
+        )
+        if selectbox.value != signal_id:
+            at = selectbox.set_value(signal_id).run()
+        at = next(b for b in at.button if b.label == "Correct Signal").click().run()
+        return at
+
+    def test_correct_signal_button_present_only_when_signal_selected(self):
+        at = self._open_review()
+
+        self.assertIn("Correct Signal", {b.label for b in at.button})
+
+    def test_action_choices_exactly_approved(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        action_box = next(w for w in at.selectbox if w.label == "Corrected action")
+        self.assertEqual(
+            action_box.options, ["BTO", "STC", "BTC", "STO", "BUY", "SELL"]
+        )
+
+    def test_option_type_choices_exactly_approved(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        option_box = next(
+            w for w in at.selectbox if w.label == "Corrected option type"
+        )
+        self.assertEqual(option_box.options, ["", "call", "put"])
+
+    def test_current_values_prefilled(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        self.assertEqual(symbol_input.value, "SPY")
+        price_input = next(w for w in at.text_input if w.label == "Corrected price")
+        self.assertEqual(price_input.value, "3.25")
+        expiration_input = next(
+            w
+            for w in at.text_input
+            if w.label == "Corrected expiration (YYYY-MM-DD)"
+        )
+        self.assertEqual(expiration_input.value, "2026-12-18")
+        position_input = next(
+            w for w in at.text_input if w.label == "Corrected position size"
+        )
+        self.assertEqual(position_input.value, "10 contracts")
+        action_box = next(w for w in at.selectbox if w.label == "Corrected action")
+        self.assertEqual(action_box.value, "BTO")
+        option_box = next(
+            w for w in at.selectbox if w.label == "Corrected option type"
+        )
+        self.assertEqual(option_box.value, "call")
+
+    def test_immutable_fields_not_editable(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        labels = {w.label for w in at.text_input}
+        for forbidden in (
+            "raw_message_id",
+            "trader_id",
+            "id",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertNotIn(forbidden, labels)
+        # Exactly the 3 filters plus the 4 correction text inputs (symbol,
+        # price, expiration, position size) - action/option type are
+        # selectboxes, not text inputs.
+        self.assertEqual(len(at.text_input), 7)
+
+    def test_confirmation_required_before_save_has_effect(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.mock_service_cls.return_value.update_trade_signal.assert_not_called()
+        self.assertEqual(len(at.error), 1)
+        self.assertEqual(
+            at.error[0].value,
+            "Please enter a valid correction that changes at least one field.",
+        )
+
+    def test_malformed_price_does_not_call_update_trade_signal(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        price_input = next(w for w in at.text_input if w.label == "Corrected price")
+        at = price_input.input("not-a-number").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.mock_service_cls.return_value.update_trade_signal.assert_not_called()
+        self.assertEqual(
+            at.error[0].value,
+            "Please enter a valid correction that changes at least one field.",
+        )
+
+    def test_malformed_expiration_does_not_call_update_trade_signal(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        expiration_input = next(
+            w
+            for w in at.text_input
+            if w.label == "Corrected expiration (YYYY-MM-DD)"
+        )
+        at = expiration_input.input("not-a-date").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.mock_service_cls.return_value.update_trade_signal.assert_not_called()
+
+    def test_validation_failure_keeps_correction_mode_active(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertIn("Save Correction", {b.label for b in at.button})
+        self.assertIn("Cancel", {b.label for b in at.button})
+
+    def test_cancel_performs_no_write_and_clears_state(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        cancel_btn = next(b for b in at.button if b.label == "Cancel")
+        at = cancel_btn.click().run()
+
+        self.mock_service_cls.return_value.update_trade_signal.assert_not_called()
+
+        # Steady-state rerun (no new correction click) confirms the mode
+        # actually cleared, not just a transitional render artifact.
+        source_filter = next(
+            w for w in at.text_input if w.label == "Source (exact match)"
+        )
+        at = source_filter.input("").run()
+        self.assertIn("Correct Signal", {b.label for b in at.button})
+        self.assertNotIn("Save Correction", {b.label for b in at.button})
+
+    def test_selected_signal_change_clears_correction_state(self):
+        at = self._enter_correction_mode(self._open_review(), signal_id=1)
+
+        selectbox = next(
+            w for w in at.selectbox if w.label == "Select a signal ID for details"
+        )
+        at = selectbox.set_value(2).run()
+
+        self.assertNotIn("Save Correction", {b.label for b in at.button})
+        self.assertIn("Correct Signal", {b.label for b in at.button})
+
+    def test_filter_change_removing_selected_signal_clears_correction_state(self):
+        at = self._enter_correction_mode(self._open_review(), signal_id=1)
+
+        # Simulate the filtered result set narrowing to exclude signal 1.
+        self.mock_service_cls.return_value.list_trade_signals_for_review.return_value = [
+            self._SIGNALS[0]
+        ]
+        symbol_filter = next(w for w in at.text_input if w.label == "Symbol")
+        at = symbol_filter.input("AAPL").run()
+
+        self.assertNotIn("Save Correction", {b.label for b in at.button})
+
+    def test_stale_conflict_shows_fixed_message_and_clears_correction_state(self):
+        at = self._enter_correction_mode(self._open_review())
+        self.mock_service_cls.return_value.update_trade_signal.side_effect = (
+            StaleTradeSignalError("stale")
+        )
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(
+            at.error[0].value,
+            "This trade signal changed or is no longer available. "
+            "Reload it before correcting.",
+        )
+
+        source_filter = next(
+            w for w in at.text_input if w.label == "Source (exact match)"
+        )
+        at = source_filter.input("").run()
+        self.assertIn("Correct Signal", {b.label for b in at.button})
+
+    def test_not_found_conflict_uses_the_same_fixed_message(self):
+        at = self._enter_correction_mode(self._open_review())
+        self.mock_service_cls.return_value.update_trade_signal.side_effect = (
+            TradeSignalNotFoundError("missing")
+        )
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(
+            at.error[0].value,
+            "This trade signal changed or is no longer available. "
+            "Reload it before correcting.",
+        )
+
+    def test_valid_correction_commits_and_shows_success(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(at.success[0].value, "Trade signal correction saved.")
+        self.mock_service_cls.return_value.update_trade_signal.assert_called_once()
+        call = self.mock_service_cls.return_value.update_trade_signal.call_args
+        self.assertEqual(call.args[0], 1)
+        self.assertEqual(call.kwargs["symbol"], "QQQ")
+
+    def test_success_clears_correction_state(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        source_filter = next(
+            w for w in at.text_input if w.label == "Source (exact match)"
+        )
+        at = source_filter.input("").run()
+        self.assertIn("Correct Signal", {b.label for b in at.button})
+        self.assertNotIn("Save Correction", {b.label for b in at.button})
+
+    def test_persistence_failure_shows_fixed_message_and_logs_sanitized(self):
+        at = self._enter_correction_mode(self._open_review())
+        self.mock_service_cls.return_value.update_trade_signal.side_effect = (
+            sqlite3.OperationalError("SENTINEL_CORRECTION_EXC_771")
+        )
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+
+        with self.assertLogs("discord_traders", level="ERROR") as captured:
+            save_btn = next(b for b in at.button if b.label == "Save Correction")
+            at = save_btn.click().run()
+
+        self.assertEqual(at.error[0].value, "Could not save the trade signal correction.")
+        joined = "\n".join(captured.output)
+        self.assertIn("trade signal correction failed", joined)
+        self.assertIn("OperationalError", joined)
+        self.assertNotIn("SENTINEL_CORRECTION_EXC_771", joined)
+        self.assertTrue(
+            all(record.levelno < logging.CRITICAL for record in captured.records)
+        )
+
+    def test_audit_history_displayed_newest_first(self):
+        history = [
+            {
+                "id": 5,
+                "edited_at": "2026-07-16 09:00:00",
+                "symbol": "QQQ",
+                "action": "BTO",
+                "option_type": "call",
+                "price": "3.00",
+                "expiration": "2026-12-18",
+                "position_size": "10 contracts",
+            },
+            {
+                "id": 3,
+                "edited_at": "2026-07-15 09:00:00",
+                "symbol": "SPY",
+                "action": "BTO",
+                "option_type": "call",
+                "price": "3.25",
+                "expiration": "2026-12-18",
+                "position_size": "10 contracts",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trade_signal_audit_history.return_value = (
+            history
+        )
+
+        at = self._open_review()
+
+        self.assertEqual(len(at.dataframe), 2)
+        df = at.dataframe[1].value
+        self.assertEqual(list(df["Audit ID"]), [5, 3])
+
+    def test_audit_history_failure_shows_fixed_message_and_logs_sanitized(self):
+        self.mock_service_cls.return_value.list_trade_signal_audit_history.side_effect = (
+            AuditHistoryError("SENTINEL_AUDIT_EXC_882")
+        )
+
+        with self.assertLogs("discord_traders", level="ERROR") as captured:
+            at = self._open_review()
+
+        self.assertIn("Could not load correction history.", [e.value for e in at.error])
+        joined = "\n".join(captured.output)
+        self.assertNotIn("SENTINEL_AUDIT_EXC_882", joined)
+
+    def test_raw_message_remains_read_only_in_correction_mode(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        raw_text_area = next(w for w in at.text_area if w.label == "Raw message")
+        self.assertTrue(raw_text_area.disabled)
+
+    def test_no_delete_control_in_correction_mode(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        self.assertNotIn("Delete", {b.label for b in at.button})
+
+    def test_parser_ingestion_backup_never_execute_during_correction(self):
+        at = self._enter_correction_mode(self._open_review())
+
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("QQQ").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.mock_parse.assert_not_called()
+        self.mock_service_cls.return_value.ingest_message.assert_not_called()
+        self.mock_backup.assert_not_called()
 
 
 if __name__ == "__main__":

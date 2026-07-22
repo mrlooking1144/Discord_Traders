@@ -6,6 +6,9 @@ Covers Milestone 2B.6b: the edit-on-update rule.
 Covers Milestone 2B.6c: the ingest_message entry point.
 Covers Milestone 2D.4: list_trade_signals_for_review()'s thin delegation
 to database.repository.get_trade_signals_for_review().
+Covers Milestone 2D.5: update_trade_signal()'s backward-compatible
+controlled-correction mode (expected_current_values), and the new
+list_trade_signal_audit_history() read-only delegation.
 """
 
 import json
@@ -27,7 +30,13 @@ from database.repository import (
     get_or_create_source,
     get_trade_signal_edits,
 )
-from database.service import DUPLICATE_WINDOW_MINUTES, TradeService
+from database.service import (
+    DUPLICATE_WINDOW_MINUTES,
+    AuditHistoryError,
+    StaleTradeSignalError,
+    TradeService,
+    TradeSignalNotFoundError,
+)
 
 
 class TradeServiceCheckDuplicateSignalTests(unittest.TestCase):
@@ -893,6 +902,352 @@ class TradeServiceListTradeSignalsForReviewTests(unittest.TestCase):
             date="2026-01-01",
             limit=100,
         )
+
+
+class TradeServiceControlledCorrectionTests(unittest.TestCase):
+    """Covers Milestone 2D.5: update_trade_signal()'s controlled-
+    correction mode, selected only by passing expected_current_values."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader.id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+            expiration="2026-12-18",
+            position_size="10 contracts",
+        )
+        self.connection.commit()
+
+        self.trader_id = trader.id
+        self.raw_message_id = raw_message.id
+        self.signal_id = signal.id
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _edit_count(self):
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_signal_edits"
+        ).fetchone()
+        return row[0]
+
+    def _current_values(self):
+        return {
+            "symbol": "SPY",
+            "action": "BTO",
+            "option_type": "call",
+            "price": Decimal("3.25"),
+            "expiration": "2026-12-18",
+            "position_size": "10 contracts",
+        }
+
+    def _changed_values(self, **overrides):
+        values = self._current_values()
+        values.update(overrides)
+        return values
+
+    def test_legacy_mode_ignores_correction_rules_when_expected_current_values_omitted(self):
+        updated = self.service.update_trade_signal(self.signal_id, symbol="QQQ")
+        self.assertEqual(updated.symbol, "QQQ")
+
+        # Resubmitting an identical value succeeds in legacy mode - no
+        # no-op rule applies when expected_current_values is omitted.
+        again = self.service.update_trade_signal(self.signal_id, symbol="QQQ")
+        self.assertEqual(again.symbol, "QQQ")
+        self.assertEqual(self._edit_count(), 2)
+
+    def test_controlled_mode_rejects_missing_changed_field(self):
+        expected = self._current_values()
+        incomplete = self._changed_values(symbol="QQQ")
+        del incomplete["position_size"]
+
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=expected, **incomplete
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_controlled_mode_rejects_missing_expected_field(self):
+        expected = self._current_values()
+        del expected["expiration"]
+        changed = self._changed_values(symbol="QQQ")
+
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=expected, **changed
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_raw_message_id_rejected_in_controlled_mode(self):
+        expected = self._current_values()
+        changed = self._changed_values(symbol="QQQ")
+        del changed["position_size"]
+        changed["raw_message_id"] = self.raw_message_id
+
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=expected, **changed
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_trader_id_rejected_in_controlled_mode(self):
+        expected = self._current_values()
+        changed = self._changed_values(symbol="QQQ")
+        del changed["option_type"]
+        changed["trader_id"] = self.trader_id
+
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=expected, **changed
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_protected_fields_rejected_in_controlled_mode(self):
+        expected = self._current_values()
+        for protected_field, value in (
+            ("id", self.signal_id),
+            ("created_at", "2000-01-01 00:00:00"),
+            ("updated_at", "2000-01-01 00:00:00"),
+        ):
+            changed = self._changed_values(symbol="QQQ")
+            del changed["position_size"]
+            changed[protected_field] = value
+
+            with self.assertRaises(ValueError):
+                self.service.update_trade_signal(
+                    self.signal_id, expected_current_values=expected, **changed
+                )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_typed_decimal_and_none_values_compare_correctly(self):
+        expected = self._current_values()
+        changed = self._changed_values(
+            option_type=None, price=None, expiration=None, position_size=None
+        )
+
+        updated = self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected, **changed
+        )
+
+        self.assertIsNone(updated.option_type)
+        self.assertIsNone(updated.price)
+        self.assertIsNone(updated.expiration)
+        self.assertIsNone(updated.position_size)
+
+    def test_stale_check_wins_over_noop_check(self):
+        wrong_expected = self._changed_values(symbol="WRONG")
+        changed = self._current_values()  # identical to actual current values
+
+        with self.assertRaises(StaleTradeSignalError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=wrong_expected, **changed
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_stale_conflict_creates_no_audit_row_and_does_not_change_updated_at(self):
+        before = repository.get_trade_signal_by_id(self.connection, self.signal_id)
+        wrong_expected = self._changed_values(symbol="WRONG")
+        changed = self._changed_values(symbol="QQQ")
+
+        with self.assertRaises(StaleTradeSignalError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=wrong_expected, **changed
+            )
+
+        after = repository.get_trade_signal_by_id(self.connection, self.signal_id)
+        self.assertEqual(self._edit_count(), 0)
+        self.assertEqual(before.updated_at, after.updated_at)
+
+    def test_noop_correction_creates_no_audit_row_and_does_not_change_updated_at(self):
+        before = repository.get_trade_signal_by_id(self.connection, self.signal_id)
+        expected = self._current_values()
+        changed = self._current_values()
+
+        with self.assertRaises(ValueError):
+            self.service.update_trade_signal(
+                self.signal_id, expected_current_values=expected, **changed
+            )
+
+        after = repository.get_trade_signal_by_id(self.connection, self.signal_id)
+        self.assertEqual(self._edit_count(), 0)
+        self.assertEqual(before.updated_at, after.updated_at)
+
+    def test_missing_signal_raises_not_found_error_in_controlled_mode(self):
+        expected = self._current_values()
+        changed = self._changed_values(symbol="QQQ")
+
+        with self.assertRaises(TradeSignalNotFoundError):
+            self.service.update_trade_signal(
+                999999, expected_current_values=expected, **changed
+            )
+        self.assertEqual(self._edit_count(), 0)
+
+    def test_legacy_missing_signal_raises_plain_value_error_not_the_subclass(self):
+        try:
+            self.service.update_trade_signal(999999, symbol="QQQ")
+            self.fail("expected ValueError")
+        except TradeSignalNotFoundError:
+            self.fail("legacy mode must not raise TradeSignalNotFoundError")
+        except ValueError:
+            pass
+
+    def test_successful_controlled_correction_writes_exactly_one_audit_row(self):
+        expected = self._current_values()
+        changed = self._changed_values(symbol="QQQ")
+
+        self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected, **changed
+        )
+
+        self.assertEqual(self._edit_count(), 1)
+
+    def test_price_never_converted_to_float(self):
+        expected = self._current_values()
+        changed = self._changed_values(price=Decimal("4.10"))
+
+        updated = self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected, **changed
+        )
+
+        self.assertIsInstance(updated.price, str)
+        self.assertEqual(updated.price, "4.10")
+
+        edits = get_trade_signal_edits(self.connection, self.signal_id)
+        snapshot = json.loads(edits[0].previous_values)
+        self.assertIsInstance(snapshot["price"], str)
+        self.assertEqual(snapshot["price"], "3.25")
+
+
+class TradeServiceAuditHistoryTests(unittest.TestCase):
+    """Covers Milestone 2D.5: list_trade_signal_audit_history()."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+        source_id = get_or_create_source(self.connection, "discord").id
+        trader = create_trader(self.connection, source_id, "alice")
+        raw_message = create_raw_message(self.connection, source_id, "BTO SPY 500c")
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader.id,
+            "SPY",
+            "BTO",
+            option_type="call",
+            price=Decimal("3.25"),
+            expiration="2026-12-18",
+            position_size="10 contracts",
+        )
+        self.connection.commit()
+
+        self.signal_id = signal.id
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _current_values(self):
+        return {
+            "symbol": "SPY",
+            "action": "BTO",
+            "option_type": "call",
+            "price": Decimal("3.25"),
+            "expiration": "2026-12-18",
+            "position_size": "10 contracts",
+        }
+
+    def test_empty_history_for_never_corrected_signal(self):
+        self.assertEqual(
+            self.service.list_trade_signal_audit_history(self.signal_id), []
+        )
+
+    def test_history_contains_exactly_approved_keys(self):
+        expected = self._current_values()
+        changed = dict(expected, symbol="QQQ")
+        self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected, **changed
+        )
+
+        history = self.service.list_trade_signal_audit_history(self.signal_id)
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(
+            set(history[0]),
+            {
+                "id",
+                "edited_at",
+                "symbol",
+                "action",
+                "option_type",
+                "price",
+                "expiration",
+                "position_size",
+            },
+        )
+        self.assertEqual(history[0]["symbol"], "SPY")
+        self.assertIsInstance(history[0]["price"], str)
+        self.assertEqual(history[0]["price"], "3.25")
+
+    def test_history_returned_newest_first(self):
+        expected1 = self._current_values()
+        self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected1, **dict(expected1, symbol="QQQ")
+        )
+        expected2 = dict(expected1, symbol="QQQ")
+        self.service.update_trade_signal(
+            self.signal_id, expected_current_values=expected2, **dict(expected2, symbol="IWM")
+        )
+
+        history = self.service.list_trade_signal_audit_history(self.signal_id)
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["symbol"], "QQQ")
+        self.assertEqual(history[1]["symbol"], "SPY")
+        self.assertGreater(history[0]["id"], history[1]["id"])
+
+    def test_malformed_audit_json_raises_audit_history_error(self):
+        self.connection.execute(
+            "INSERT INTO trade_signal_edits (trade_signal_id, previous_values) "
+            "VALUES (?, ?)",
+            (self.signal_id, "not valid json{"),
+        )
+        self.connection.commit()
+
+        with self.assertRaises(AuditHistoryError):
+            self.service.list_trade_signal_audit_history(self.signal_id)
+
+    def test_non_dict_audit_json_raises_audit_history_error(self):
+        self.connection.execute(
+            "INSERT INTO trade_signal_edits (trade_signal_id, previous_values) "
+            "VALUES (?, ?)",
+            (self.signal_id, json.dumps([1, 2, 3])),
+        )
+        self.connection.commit()
+
+        with self.assertRaises(AuditHistoryError):
+            self.service.list_trade_signal_audit_history(self.signal_id)
 
 
 if __name__ == "__main__":

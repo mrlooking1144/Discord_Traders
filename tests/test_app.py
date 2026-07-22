@@ -254,7 +254,9 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
             self._run_to_review(at, raw_text="just some random text")
 
             self.assertEqual(len(at.text_input), 0)
-            self.assertEqual(len(at.button), 1)
+            # Milestone 2D.3: "Create Backup" is always rendered, so only
+            # "Submit to Database" is absent when there is no preview.
+            self.assertEqual({b.label for b in at.button}, {"Parse Message", "Create Backup"})
             self.assertEqual(mock_service.ingest_message.call_count, 0)
 
     def test_missing_trader_fields_prevent_submission(self):
@@ -403,7 +405,9 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
             at.text_area[0].input("something else entirely").run()
 
             self.assertEqual(len(at.text_input), 0)
-            self.assertEqual(len(at.button), 1)
+            # Milestone 2D.3: "Create Backup" is always rendered, so only
+            # "Submit to Database" is absent when there is no preview.
+            self.assertEqual({b.label for b in at.button}, {"Parse Message", "Create Backup"})
             self.assertEqual(mock_service.ingest_message.call_count, 0)
 
     def test_failed_reparse_clears_previous_valid_preview(self):
@@ -865,6 +869,68 @@ class FileLoggingFailureSafetyTests(unittest.TestCase):
             self.assertEqual(len(at.error), 0)
             success_values = [s.value for s in at.success]
             self.assertTrue(any("Saved 1 trade signal" in v for v in success_values))
+
+
+class CreateBackupControlTests(unittest.TestCase):
+    """Covers Milestone 2D.3: the minimal "Create Backup" UI control.
+
+    database.backup.create_backup is patched throughout - no real SQLite
+    database or backup file is touched here (reserved for
+    tests/test_backup.py). No restore control exists in the UI.
+    """
+
+    def _click_create_backup(self, at):
+        backup_button = next(b for b in at.button if b.label == "Create Backup")
+        return backup_button.click().run()
+
+    def test_create_backup_button_renders(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+
+        self.assertIn("Create Backup", {b.label for b in at.button})
+
+    def test_no_restore_control_is_present(self):
+        at = AppTest.from_file("app/app.py")
+        at.run()
+
+        self.assertEqual(
+            {b.label for b in at.button}, {"Parse Message", "Create Backup"}
+        )
+
+    def test_successful_backup_shows_fixed_success_message(self):
+        with patch("app.logging_config.configure_file_logging"), patch(
+            "database.backup.create_backup", return_value="C:/sentinel/backups/x.db"
+        ):
+            at = AppTest.from_file("app/app.py")
+            at.run()
+            at = self._click_create_backup(at)
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(len(at.success), 1)
+        self.assertEqual(at.success[0].value, "Database backup created successfully.")
+        self.assertNotIn("sentinel", at.success[0].value)
+
+    def test_failed_backup_shows_fixed_message_and_logs_sanitized(self):
+        with patch("app.logging_config.configure_file_logging"), patch(
+            "database.backup.create_backup",
+            side_effect=OSError("SENTINEL_BACKUP_EXC_991"),
+        ):
+            with self.assertLogs("discord_traders", level="ERROR") as captured:
+                at = AppTest.from_file("app/app.py")
+                at.run()
+                at = self._click_create_backup(at)
+
+        self.assertEqual(len(at.success), 0)
+        self.assertEqual(len(at.error), 1)
+        self.assertEqual(at.error[0].value, "Could not create a database backup.")
+
+        joined = "\n".join(captured.output)
+        self.assertIn("database backup failed", joined)
+        self.assertIn("OSError", joined)
+        self.assertNotIn("SENTINEL_BACKUP_EXC_991", joined)
+        self.assertTrue(
+            all(record.levelno < logging.CRITICAL for record in captured.records)
+        )
 
 
 if __name__ == "__main__":

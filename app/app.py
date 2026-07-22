@@ -15,6 +15,10 @@ configured lazily at the start of the Submit workflow. Log messages are
 fixed and generic, or counts-only - never raw message text, trader
 identifiers, parsed signal values, database/log paths, or exception
 message text (see app/logging_config.py for the sanitization contract).
+
+Milestone 2D.3: a minimal "Create Backup" control invoking
+database.backup.create_backup(). Restore is CLI-only (see
+database/backup.py) and is never exposed here.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from app.logging_config import (
     log_operation_failure,
 )
 from app.parser import parse_message
+from database.backup import create_backup
 from database.config import DatabaseConfig, resolve_database_path
 from database.db import get_connection, initialize_database
 from database.service import TradeService
@@ -155,3 +160,14 @@ if "parsed_signals" in st.session_state:
             finally:
                 if conn is not None:
                     conn.close()
+
+if st.button("Create Backup"):
+    configure_file_logging()
+    try:
+        create_backup(resolve_database_path())
+    except Exception as exc:
+        log_operation_failure(logger, "database backup", exc)
+        st.error("Could not create a database backup.")
+    else:
+        logger.info("Database backup created")
+        st.success("Database backup created successfully.")

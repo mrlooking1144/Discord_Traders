@@ -353,8 +353,10 @@ class ManualEntryMalformedInputTests(_ManualEntryIntegrationTestCase):
 
         # No trader/external-ID fields render and no Submit button exists -
         # submission is structurally impossible, not merely validation-blocked.
+        # Milestone 2D.3: "Create Backup" is always rendered, so only
+        # "Submit to Database" is absent when there is no preview.
         self.assertEqual(len(at.text_input), 0)
-        self.assertEqual(len(at.button), 1)
+        self.assertEqual({b.label for b in at.button}, {"Parse Message", "Create Backup"})
 
         verify_connection = get_connection(self.config)
         try:

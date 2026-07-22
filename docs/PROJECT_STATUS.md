@@ -3,7 +3,7 @@ v0.1.0
 
 # Current Milestone
 Milestone 2D.3 — Database Backup and Recovery
-(not yet approved for implementation)
+(implementation committed locally, not yet pushed; documentation pending review and commit)
 
 # Completed
 - Project structure
@@ -81,12 +81,19 @@ Milestone 2D.3 — Database Backup and Recovery
   - No schema, model, parser, repository, service, database-config, or database-initialization redesign; no backup, recovery, review UI, correction workflow, packaging, Discord, telemetry, or third-party dependency work included
   - 287/287 tests passing (242 pre-existing + 45 new across `tests/test_logging_config.py` and `tests/test_app.py`); tests use temporary log paths exclusively and do not write to the real LOCALAPPDATA log
   - Implementation commit `a0654e5` pushed to `origin/main`; local `main` and `origin/main` synchronized at that commit
+- Milestone 2D.3: Database Backup and Recovery — implementation committed locally (see docs/HANDOFFS/2D.3_database_backup_and_recovery.md; commit eb41fff5da5d80818b1b462685d4f5549eac1d58 — "Implement database backup and recovery"). **Implementation only; documentation for this milestone is not yet committed, and the implementation commit has not yet been pushed to `origin/main`. Milestone 2D.3 is not considered fully complete until the documentation commit is reviewed, approved, and committed.**
+  - `database/backup.py` (new): `create_backup()` using `sqlite3.Connection.backup()` for a consistent, standalone backup regardless of the source's rollback-journal or WAL journal mode; writes to a temporary file, verifies with `PRAGMA integrity_check`, then publishes via atomic rename; `resolve_backup_dir()` (override `DISCORD_TRADERS_BACKUP_PATH`, else `%LOCALAPPDATA%\DiscordTraders\backups`, else `Path.home()` fallback); UTC timestamped filenames (`discord_traders_YYYYMMDD_HHMMSS_ffffff.db`) with collision refusal; retention keeps the latest 10 verified backups (oldest deleted first, only after a successful verified backup, non-fatal deletion failures); `list_backups()`
+  - `database/backup.py` restore (CLI-only, `python -m database.backup restore <path>`; never called from `app/app.py`): candidate validation (SQLite header, read-only open, integrity check, required-table/required-column schema compatibility) before any modification; a best-effort exclusive-access probe; a pre-restore safety backup (excluded from retention until post-restore validation succeeds); quarantine of any existing `-wal`/`-shm`/`-journal` sidecars, with a hard abort (production database and all sidecars left untouched) if a sidecar cannot be safely quarantined; atomic main-file replacement; post-restore integrity/schema validation with full recovery (original database and its quarantined sidecars restored) if validation fails
+  - `app/app.py`: one new unconditional "Create Backup" button calling `database.backup.create_backup()`, with the same try/except/log/fixed-message pattern as the existing Submit workflow; no restore control; `TradeService.ingest_message()` remains the sole UI persistence entry point
+  - No schema, repository, service, parser, review UI, correction workflow, packaging, or Discord redesign; `database/config.py`, `database/repository.py`, `database/service.py`, `database/schema.sql`, and `app/parser.py` are unchanged
+  - 328/328 tests passing (287 pre-existing + 41 new across `tests/test_backup.py` (37) and `tests/test_app.py` (4), plus a 2-line assertion update in `tests/test_manual_entry_integration.py` for the always-rendered "Create Backup" button)
+  - Implementation commit `eb41fff5da5d80818b1b462685d4f5549eac1d58` committed locally; **not yet pushed to `origin/main`**; local `main` is one commit ahead of `origin/main`
 
 # Current Focus
-Milestone 2D.2 — Operational Logging and Error Handling is fully implemented, tested, reviewed, committed (`a0654e51af3f82ce8826107dad15bcc0f2944b35`), and pushed to `origin/main`; local `main` and `origin/main` are synchronized at that commit. 287/287 tests passing. The current milestone is Milestone 2D.3 — Database Backup and Recovery, not yet approved for implementation. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, parser, or database-configuration changes occurred in Milestone 2D.2.
+Milestone 2D.3 — Database Backup and Recovery is implemented, tested, and reviewed, with its implementation committed locally as `eb41fff5da5d80818b1b462685d4f5549eac1d58` ("Implement database backup and recovery"). This commit has **not** been pushed to `origin/main`; local `main` is one commit ahead of `origin/main` (`bd9091dbc7d91d8c87332057dd72f48679a66be9`). Documentation for Milestone 2D.3 (this update and its handoff document) is currently uncommitted and awaiting ChatGPT review before it is committed and pushed. 328/328 tests passing. **Milestone 2D.4 must not begin until the Milestone 2D.3 documentation commit is reviewed, approved, committed, and pushed.** Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, service, parser, or database-configuration changes occurred in Milestone 2D.3.
 
 # Next Milestone
-Milestone 2D.3 — Database Backup and Recovery. Not yet approved for implementation. Per project rules, implementation begins only after a separate implementation-plan review and approval step.
+Milestone 2D.4 — Stored-Signal Review UI. Must not begin until Milestone 2D.3's documentation commit is reviewed, approved, committed, and pushed, and a separate implementation-plan review and approval step for 2D.4 has taken place, per project rules.
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -106,13 +113,13 @@ Current Phase:
 Phase 2D — Manual Version 1 Operational Readiness
 
 Current Milestone:
-2D.3 — Database Backup and Recovery (not yet approved for implementation)
+2D.3 — Database Backup and Recovery (implementation committed locally as eb41fff5da5d80818b1b462685d4f5549eac1d58; documentation pending review and commit; not yet pushed)
 
 Git Synchronization:
-Local main and origin/main synchronized at commit a0654e51af3f82ce8826107dad15bcc0f2944b35
+Local main is one commit ahead of origin/main. origin/main is at bd9091dbc7d91d8c87332057dd72f48679a66be9 (last-pushed commit, the Milestone 2D.2 documentation commit). Local main additionally includes commit eb41fff5da5d80818b1b462685d4f5549eac1d58 ("Implement database backup and recovery", Milestone 2D.3 implementation), not yet pushed.
 
 Test Suite:
-287/287 tests passing
+328/328 tests passing
 
 Next Action:
-Scope and approve the Milestone 2D.3 implementation plan, then implement, test, review, and commit per project rules
+ChatGPT review of the Milestone 2D.3 documentation diff (this file and docs/HANDOFFS/2D.3_database_backup_and_recovery.md). On approval, commit the documentation separately from the implementation commit, then push both to origin/main. Milestone 2D.4 — Stored-Signal Review UI must not begin until that review, commit, and push are complete.

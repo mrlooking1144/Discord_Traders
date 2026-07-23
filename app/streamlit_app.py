@@ -6,8 +6,8 @@ invoked, and the structured result is displayed for review.
 
 Milestone 2C.3: the reviewed parse result can be submitted to the database
 through database.service.TradeService.ingest_message() - the only
-persistence entry point this module calls. app/app.py never imports or
-calls database.repository directly.
+persistence entry point this module calls. app/streamlit_app.py never
+imports or calls database.repository directly.
 
 Milestone 2D.2: operational logging (app.logging_config) and a safe UI
 error boundary. Console logging is configured at startup; file logging is

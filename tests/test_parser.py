@@ -231,7 +231,7 @@ class ParseMessageSourceIndependenceTests(unittest.TestCase):
         # database, service, UI, or networking modules.
         for line in import_lines:
             self.assertNotIn("database", line)
-            self.assertNotIn("app.app", line)
+            self.assertNotIn("app.streamlit_app", line)
             self.assertNotIn("streamlit", line)
             self.assertNotIn("requests", line)
             self.assertNotIn("socket", line)

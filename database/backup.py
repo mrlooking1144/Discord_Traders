@@ -7,9 +7,9 @@ its journal mode is the default rollback journal or WAL, and regardless of
 whether a connection is currently open on the source.
 
 Restore (restore_backup()) is CLI-only and is never called from
-app/app.py. It requires the Streamlit application and every other user of
-the production database to be fully stopped first - see main()'s usage
-message. Restore is invoked as:
+app/streamlit_app.py. It requires the Streamlit application and every
+other user of the production database to be fully stopped first - see
+main()'s usage message. Restore is invoked as:
 
     python -m database.backup restore <backup_file_path>
 """
@@ -402,9 +402,9 @@ def restore_backup(
 ) -> str:
     """Restore the production database at db_path from candidate_path.
 
-    CLI-only; never called from app/app.py. Requires the Streamlit
-    application and every other user of the production database to already
-    be fully stopped before this is invoked.
+    CLI-only; never called from app/streamlit_app.py. Requires the
+    Streamlit application and every other user of the production database
+    to already be fully stopped before this is invoked.
 
     Order of operations:
         1. Validate the candidate (header, read-only open, integrity,

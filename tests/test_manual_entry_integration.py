@@ -1,13 +1,13 @@
 """Real-SQLite integration tests for Milestone 2C.4.
 
 Exercises the complete manual-entry path: pasted raw text -> the Streamlit
-UI (app/app.py) -> app.parser.parse_message() -> the reviewed structured
+UI (app/streamlit_app.py) -> app.parser.parse_message() -> the reviewed structured
 signal -> the "Submit to Database" action ->
 database.service.TradeService.ingest_message() -> database/repository.py ->
 a real temporary SQLite database initialized through
 database.db.initialize_database() and database/schema.sql.
 
-Only database.config.DatabaseConfig is patched, to redirect app.py's
+Only database.config.DatabaseConfig is patched, to redirect streamlit_app.py's
 hardcoded db path ("discord_traders.db") to a unique per-test temporary
 file. database.db.initialize_database, database.db.get_connection,
 database.service.TradeService, and database/repository.py are never
@@ -171,7 +171,7 @@ class _ManualEntryIntegrationTestCase(unittest.TestCase):
 
 class ManualEntryHappyPathPersistenceTests(_ManualEntryIntegrationTestCase):
     def test_full_manual_entry_persists_all_tables_with_correct_relationships(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at, raw_text=_SAMPLE_MESSAGE)
         self._submit(at, trader_name="  alice  ", external_trader_id="  disc-123  ")
 
@@ -221,7 +221,7 @@ class ManualEntryHappyPathPersistenceTests(_ManualEntryIntegrationTestCase):
 
 class ManualEntryStableTraderIdentityTests(_ManualEntryIntegrationTestCase):
     def test_same_external_trader_id_reuses_single_trader_row_across_two_messages(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at, raw_text="BTO SPY 450C 7/19/2025 @3.25")
         self._submit(at, trader_name="alice", external_trader_id="disc-shared")
 
@@ -245,7 +245,7 @@ class ManualEntryStableTraderIdentityTests(_ManualEntryIntegrationTestCase):
             verify_connection.close()
 
     def test_trader_display_name_not_updated_on_resubmission_with_different_name(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at, raw_text="BTO SPY 450C 7/19/2025 @3.25")
         self._submit(at, trader_name="alice", external_trader_id="disc-rename")
 
@@ -296,7 +296,7 @@ class ManualEntryDuplicateWarningTests(_ManualEntryIntegrationTestCase):
 
         # Real path under test: AppTest -> parser -> TradeService ->
         # repository -> real SQLite, matching the seeded signal exactly.
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at, raw_text="BTO SPY 500C 12/18/2026 @3.25")
         self._submit(at, trader_name="alice", external_trader_id="dup-trader-1")
 
@@ -346,7 +346,7 @@ class ManualEntryDuplicateWarningTests(_ManualEntryIntegrationTestCase):
 
 class ManualEntryMalformedInputTests(_ManualEntryIntegrationTestCase):
     def test_malformed_input_persists_no_rows_and_blocks_submission(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         at.text_area[0].input("just some random text, nothing parseable here").run()
         at.button[0].click().run()
@@ -370,7 +370,7 @@ class ManualEntryMalformedInputTests(_ManualEntryIntegrationTestCase):
 
 class ManualEntryTransactionTests(_ManualEntryIntegrationTestCase):
     def test_successful_submission_commits_and_is_durable_via_fresh_connection(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at)
         self._submit(at)
 
@@ -399,7 +399,7 @@ class ManualEntryTransactionTests(_ManualEntryIntegrationTestCase):
             "database.service.create_trade_signal",
             side_effect=sqlite3.OperationalError("simulated ingestion failure"),
         ):
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -418,7 +418,7 @@ class ManualEntryTransactionTests(_ManualEntryIntegrationTestCase):
 
 class ManualEntryProductionDatabaseProtectionTests(_ManualEntryIntegrationTestCase):
     def test_production_database_file_never_created_or_modified(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._run_to_review(at)
         self._submit(at)
 

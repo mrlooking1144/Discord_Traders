@@ -1,4 +1,4 @@
-"""UI/smoke tests for app/app.py.
+"""UI/smoke tests for app/streamlit_app.py.
 
 Covers Milestone 2C.2: manual raw-message entry, invoking the Milestone 2C.1
 parser, and displaying either the parsed structured result or a "nothing
@@ -49,7 +49,7 @@ _SAMPLE_MESSAGE = "BTO SPY 450C 7/19/2025 @3.25 10 contracts"
 
 class ManualMessageEntryTests(unittest.TestCase):
     def test_successful_parse_displays_structured_result(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         at.text_area[0].input("BTO SPY 450C 7/19/2025 @3.25 10 contracts").run()
@@ -68,7 +68,7 @@ class ManualMessageEntryTests(unittest.TestCase):
         self.assertEqual(len(at.warning), 0)
 
     def test_multiple_signals_each_displayed(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         at.text_area[0].input("BTO SPY 450C 7/19/2025 @3.25\nSTC AAPL 190P 12/15/2025 @1.10").run()
@@ -79,7 +79,7 @@ class ManualMessageEntryTests(unittest.TestCase):
         self.assertEqual(len(at.json), 2)
 
     def test_no_signal_displays_nothing_found_message(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         at.text_area[0].input("just some random text").run()
@@ -91,7 +91,7 @@ class ManualMessageEntryTests(unittest.TestCase):
         self.assertEqual(len(at.json), 0)
 
     def test_empty_input_displays_nothing_found_message(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         at.button[0].click().run()
@@ -100,7 +100,7 @@ class ManualMessageEntryTests(unittest.TestCase):
         self.assertIn("No trade signals found", at.warning[0].value)
 
     def test_no_run_before_button_click_shows_no_result(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(len(at.success), 0)
@@ -162,7 +162,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -178,7 +178,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -196,7 +196,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at, trader_name="alice", external_trader_id="disc-123")
 
@@ -221,7 +221,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -239,7 +239,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": ["Possible duplicate: 1 matching trade signal(s)"],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -254,7 +254,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at, raw_text="just some random text")
 
             self.assertEqual(len(at.text_input), 0)
@@ -268,7 +268,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             # Leave both trader fields blank.
             at.button[1].click().run()
@@ -283,7 +283,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
             mock_service = mock_service_cls.return_value
             mock_service.ingest_message.side_effect = ValueError("bad input")
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -305,7 +305,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -323,7 +323,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -339,7 +339,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "UNIQUE constraint failed"
             )
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -356,7 +356,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -377,7 +377,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -390,7 +390,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
             mock_service = mock_service_cls.return_value
             mock_service.ingest_message.side_effect = ValueError("bad input")
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -401,7 +401,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self.assertEqual(len(at.text_input), 2)
 
@@ -419,7 +419,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
         with init_p, conn_p, service_p as mock_service_cls:
             mock_service = mock_service_cls.return_value
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self.assertEqual(len(at.text_input), 2)
 
@@ -442,7 +442,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -464,7 +464,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -481,7 +481,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -500,7 +500,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -516,7 +516,7 @@ class ManualEntryPersistenceTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(
                 at, trader_name="  alice  ", external_trader_id="  disc-123  "
@@ -550,7 +550,7 @@ class DatabasePathResolutionWiringTests(unittest.TestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
             at.text_area[0].input(_SAMPLE_MESSAGE).run()
             at.button[0].click().run()
@@ -569,7 +569,7 @@ class ParserFailureLoggingTests(unittest.TestCase):
         with patch(
             "app.parser.parse_message", side_effect=RuntimeError("parser bug")
         ):
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
             at.text_area[0].input(_SAMPLE_MESSAGE).run()
             at.button[0].click().run()
@@ -587,7 +587,7 @@ class ParserFailureLoggingTests(unittest.TestCase):
             side_effect=RuntimeError("SENTINEL_PARSER_EXC_113"),
         ):
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 at.run()
                 at.text_area[0].input(_SAMPLE_MESSAGE).run()
                 at.button[0].click().run()
@@ -601,7 +601,7 @@ class ParserFailureLoggingTests(unittest.TestCase):
             )
 
     def test_valid_empty_parse_result_still_shows_nothing_found_message(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         at.text_area[0].input("just some random text").run()
         at.button[0].click().run()
@@ -627,7 +627,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
         service_p = patch("database.service.TradeService")
         with init_p, conn_p, service_p:
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at)
                 self._submit(at)
 
@@ -648,7 +648,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
         service_p = patch("database.service.TradeService")
         with init_p, conn_p, service_p:
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at)
                 self._submit(at)
 
@@ -670,7 +670,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             )
 
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at)
                 self._submit(at)
 
@@ -692,7 +692,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             )
 
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at)
                 self._submit(at)
 
@@ -718,7 +718,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             }
 
             with self.assertLogs("discord_traders", level="WARNING") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at)
                 self._submit(at)
 
@@ -743,7 +743,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             }
 
             with self.assertLogs("discord_traders", level="INFO") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at, raw_text=sentinel_raw_text)
                 self._submit(
                     at,
@@ -772,7 +772,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             )
 
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 self._run_to_review(at, raw_text=sentinel_raw_text)
                 self._submit(
                     at,
@@ -793,7 +793,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
             mock_service = mock_service_cls.return_value
             mock_service.ingest_message.side_effect = ValueError("bad input")
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -811,7 +811,7 @@ class SubmissionFailureLoggingTests(_SubmissionWorkflowTestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             self._run_to_review(at)
             self._submit(at)
 
@@ -827,7 +827,7 @@ class LoggingHandlerRerunTests(unittest.TestCase):
     repeated module re-execution Streamlit performs on every rerun."""
 
     def test_streamlit_reruns_do_not_duplicate_console_handler(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         at.text_area[0].input(_SAMPLE_MESSAGE).run()
         at.button[0].click().run()
@@ -861,7 +861,7 @@ class FileLoggingFailureSafetyTests(unittest.TestCase):
                 "duplicate_warnings": [None],
             }
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
             at.text_area[0].input(_SAMPLE_MESSAGE).run()
             at.button[0].click().run()
@@ -888,13 +888,13 @@ class CreateBackupControlTests(unittest.TestCase):
         return backup_button.click().run()
 
     def test_create_backup_button_renders(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertIn("Create Backup", {b.label for b in at.button})
 
     def test_no_restore_control_is_present(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(
@@ -905,7 +905,7 @@ class CreateBackupControlTests(unittest.TestCase):
         with patch("app.logging_config.configure_file_logging"), patch(
             "database.backup.create_backup", return_value="C:/sentinel/backups/x.db"
         ):
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
             at = self._click_create_backup(at)
 
@@ -920,7 +920,7 @@ class CreateBackupControlTests(unittest.TestCase):
             side_effect=OSError("SENTINEL_BACKUP_EXC_991"),
         ):
             with self.assertLogs("discord_traders", level="ERROR") as captured:
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 at.run()
                 at = self._click_create_backup(at)
 
@@ -945,7 +945,7 @@ class WorkflowNavigationTests(unittest.TestCase):
     """
 
     def test_sidebar_offers_both_workflows(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(
@@ -953,14 +953,14 @@ class WorkflowNavigationTests(unittest.TestCase):
         )
 
     def test_manual_message_entry_is_the_default_selection(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(at.sidebar.radio[0].value, "Manual Message Entry")
         self.assertIn("Parse Message", {b.label for b in at.button})
 
     def test_create_backup_appears_only_in_manual_message_entry(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         self.assertIn("Create Backup", {b.label for b in at.button})
 
@@ -969,7 +969,7 @@ class WorkflowNavigationTests(unittest.TestCase):
 
     def test_manual_message_entry_does_not_invoke_review_method(self):
         with patch("database.service.TradeService") as mock_service_cls:
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
 
             mock_service_cls.return_value.list_trade_signals_for_review.assert_not_called()
@@ -980,7 +980,7 @@ class WorkflowNavigationTests(unittest.TestCase):
         ) as mock_service_cls, patch("database.backup.create_backup") as mock_backup:
             mock_service_cls.return_value.list_trade_signals_for_review.return_value = []
 
-            at = AppTest.from_file("app/app.py")
+            at = AppTest.from_file("app/streamlit_app.py")
             at.run()
             at.sidebar.radio[0].set_value("Review Signals").run()
 
@@ -1000,7 +1000,7 @@ class WorkflowNavigationTests(unittest.TestCase):
                 with patch.dict(
                     os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
                 ):
-                    at = AppTest.from_file("app/app.py")
+                    at = AppTest.from_file("app/streamlit_app.py")
                     at.run()
                     at.sidebar.radio[0].set_value("Review Signals").run()
 
@@ -1022,7 +1022,7 @@ class ReviewSignalsDatabaseNotFoundTests(unittest.TestCase):
             with patch.dict(
                 os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
             ):
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 at.run()
                 at.sidebar.radio[0].set_value("Review Signals").run()
 
@@ -1046,7 +1046,7 @@ class ReviewSignalsEmptyAndFailureTests(unittest.TestCase):
             with patch.dict(
                 os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
             ), patch("database.db.get_connection", return_value=MagicMock()):
-                at = AppTest.from_file("app/app.py")
+                at = AppTest.from_file("app/streamlit_app.py")
                 at.run()
                 at = at.sidebar.radio[0].set_value("Review Signals").run()
         return at
@@ -1153,7 +1153,7 @@ class ReviewSignalsDisplayTests(unittest.TestCase):
         self.mock_service_cls = mock_service_cls
 
     def _open_review(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         return at.sidebar.radio[0].set_value("Review Signals").run()
 
@@ -1259,7 +1259,7 @@ class ReviewSignalsDateFilterTests(unittest.TestCase):
         self.addCleanup(backup_patcher.stop)
 
     def _open_review(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         return at.sidebar.radio[0].set_value("Review Signals").run()
 
@@ -1396,7 +1396,7 @@ class CorrectSignalWorkflowTests(unittest.TestCase):
         self.addCleanup(file_log_patcher.stop)
 
     def _open_review(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         return at.sidebar.radio[0].set_value("Review Signals").run()
 

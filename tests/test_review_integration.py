@@ -93,7 +93,7 @@ class _ReviewIntegrationTestCase(unittest.TestCase):
 
 class RealDatabaseReviewTests(_ReviewIntegrationTestCase):
     def test_ingest_then_review_shows_source_trader_signal_and_raw_message(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._ingest(at, _SAMPLE_MESSAGE, "alice", "disc-123")
         self.assertEqual(len(at.error), 0)
 
@@ -119,7 +119,7 @@ class RealDatabaseReviewTests(_ReviewIntegrationTestCase):
         self.assertEqual(at.text_area[0].value, _SAMPLE_MESSAGE)
 
     def test_filters_and_newest_first_ordering_against_real_sqlite(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._ingest(at, _SAMPLE_MESSAGE, "alice", "disc-123")
         self._ingest(at, _SECOND_MESSAGE, "bob", "disc-456")
         self.assertEqual(len(at.error), 0)
@@ -139,7 +139,7 @@ class RealDatabaseReviewTests(_ReviewIntegrationTestCase):
         self.assertEqual(df_filtered.iloc[0]["Trader"], "bob")
 
     def test_trader_filter_against_real_sqlite(self):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._ingest(at, _SAMPLE_MESSAGE, "alice", "disc-123")
         self._ingest(at, _SECOND_MESSAGE, "bob", "disc-456")
 
@@ -154,7 +154,7 @@ class RealDatabaseReviewTests(_ReviewIntegrationTestCase):
         self.assertFalse(self.db_path.exists())
         self.assertFalse(self.db_path.parent.exists())
 
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         at.run()
         at = self._open_review(at)
 

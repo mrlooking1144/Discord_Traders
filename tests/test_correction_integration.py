@@ -115,7 +115,7 @@ class UiCorrectionIntegrationTests(_CorrectionIntegrationTestCase):
     def _ingest_and_correct(
         self, action="STC", price="4.10", expiration="2026-12-19"
     ):
-        at = AppTest.from_file("app/app.py")
+        at = AppTest.from_file("app/streamlit_app.py")
         self._ingest(at, _SAMPLE_MESSAGE, "alice", "disc-123")
         self.assertEqual(len(at.error), 0)
 

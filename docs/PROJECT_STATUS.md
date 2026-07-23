@@ -2,8 +2,8 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2D.5 — Correction and Audit Workflow
-(implementation committed locally, not yet pushed; documentation pending review and commit)
+Milestone 2D.6 — Windows Startup and Packaging
+(implemented, tested, reviewed, committed, and pushed to origin/main — fully complete)
 
 # Completed
 - Project structure
@@ -107,13 +107,23 @@ Milestone 2D.5 — Correction and Audit Workflow
   - Logging reuses the existing sanitized `log_operation_failure()` contract exactly - no raw message/field values, trader/source names, audit JSON, paths, or exception text in any log record or user-facing message; no `CRITICAL` logging introduced
   - No schema, repository, model, parser, database-config, or database-connection changes; `database/repository.py`, `database/schema.sql`, `database/models.py`, `database/config.py`, `database/db.py`, `database/backup.py`, `app/parser.py`, and `tests/test_repository_sources.py` are all unchanged
   - 433/433 tests passing (380 pre-existing + 53 new: 19 in `tests/test_service.py`, 22 in `tests/test_app.py`, and 12 real-SQLite integration tests in the new `tests/test_correction_integration.py`); all UI/integration tests isolate real file logging (patched or redirected) and the real `%LOCALAPPDATA%\DiscordTraders` log directory was confirmed absent both before and after the full suite run
-  - Implementation commit `644fb7a792e437c35d28e281fa9e5ffff9d1bee3` committed locally; **not yet pushed to `origin/main`**; local `main` is one commit ahead of `origin/main`
+  - Implementation commit `644fb7a792e437c35d28e281fa9e5ffff9d1bee3` committed locally; documentation committed via commit `aafa3c50052c07798a86ad203a8a60b056c58391` ("Update documentation for Milestone 2D.5"), also pushed to `origin/main` — Milestone 2D.5 is fully complete
+- Milestone 2D.6: Windows Startup and Packaging implemented, tested, reviewed, committed, and pushed (see docs/HANDOFFS/2D.6_windows_startup_and_packaging.md; commit 46c77830793d42fb869f202e973e41cfd4dfd34d — "Implement Windows startup and packaging")
+  - `start.bat` (new): a repo-root, double-clickable Windows launcher requiring no VS Code, terminal, or Claude Code to be open; resolves its own directory via `%~dp0`; detects Python via the `py -3` launcher first, falling back to bare `python`; creates a repo-local `.venv` only if one does not already exist and never requires venv activation; installs `requirements.txt` only on first run or when `streamlit` is not yet importable in the existing venv, so later runs never reinstall unnecessarily; starts the app via `.venv\Scripts\python.exe -m streamlit run app/streamlit_app.py --server.showEmailPrompt=false`; every failure point (Python missing, venv-creation failure, dependency-install failure, Streamlit-startup failure) shows a clear on-screen message and pauses before exiting; a visible console window is an accepted V1 tradeoff
+  - `--server.showEmailPrompt=false` suppresses Streamlit's one-time-per-machine interactive "onboarding email" prompt, which would otherwise block startup indefinitely for a non-technical user with no attached stdin; no global user configuration file (`%USERPROFILE%\.streamlit\credentials.toml`) is ever created or modified; automatic browser opening is unchanged (no `--server.headless`)
+  - `app/app.py` renamed to `app/streamlit_app.py` (via `git mv`; content-identical apart from one self-referential docstring line) — a structural fix for a fully proven Streamlit import-collision bug: Streamlit's own bootstrap (`_fix_sys_path()`) inserts the target script's containing directory at `sys.path[0]`, and since the entry point was named `app/app.py`, that inserted directory (`app/`) itself contained a file named `app.py`, causing `from app.logging_config import ...` to resolve `app` to that file (not a package) instead of the real `app` package at the repo root, raising `ModuleNotFoundError: No module named 'app.logging_config'; 'app' is not a package`; root cause proven via direct inspection of Streamlit's installed source plus an empirical `importlib.util.find_spec('app')` reproduction before any fix was proposed; the rename eliminates the collision with no business-logic, database, parser, or service change
+  - `database/backup.py`, `tests/test_app.py`, `tests/test_correction_integration.py`, `tests/test_manual_entry_integration.py`, `tests/test_parser.py`, `tests/test_review_integration.py` updated only for the rename (docstring references and `AppTest.from_file("app/app.py")` calls -> `"app/streamlit_app.py"`; the parser import-independence guard string updated to match); no test logic changed
+  - `.gitignore` (new): single entry, `.venv/`, so the repo-local virtual environment is never committed; `README.md`: added a short non-technical "Starting the app (Windows)" section
+  - Real end-to-end verification performed (not just code review): `start.bat` executed for real multiple times across the milestone, confirming existing-venv reuse with no unnecessary reinstall, no email prompt, no `ModuleNotFoundError`, Streamlit reaching ready state, and `Local URL: http://localhost:8501` produced; every spawned process (launcher `cmd.exe`, venv `python.exe`, Streamlit's nested interpreter) confirmed terminated and port 8501 confirmed free after each run
+  - No schema, repository, model, parser, service, database-config, database-connection, or `requirements.txt` change; standalone/PyInstaller packaging was evaluated during planning and explicitly rejected for V1; auto-start on boot, an installer, code-signing, auto-update, and Phase 2E/Discord work are all explicitly out of scope for this milestone
+  - 433/433 tests passing (same 433 as Milestone 2D.5 — no new tests added; existing `AppTest.from_file(...)` calls and one existing assertion updated only for the rename, re-verified passing)
+  - Implementation commit `46c77830793d42fb869f202e973e41cfd4dfd34d` pushed to `origin/main` as a normal fast-forward (`aafa3c5..46c7783`); local `main` and `origin/main` synchronized at that commit, 0 ahead / 0 behind — Milestone 2D.6 is fully complete
 
 # Current Focus
-Milestone 2D.5 — Correction and Audit Workflow is implemented, tested, and reviewed, with its implementation committed locally as `644fb7a792e437c35d28e281fa9e5ffff9d1bee3` ("Implement correction and audit workflow"). This commit has **not** been pushed to `origin/main`; local `main` is one commit ahead of `origin/main` (`ce1e6c527ae3e33e5bd3b915c8e4dc49ecc77328`). Documentation for Milestone 2D.5 (this update and its handoff document) is currently uncommitted and awaiting ChatGPT review before it is committed and pushed. 433/433 tests passing. **Milestone 2D.6 must not begin until the Milestone 2D.5 documentation commit is reviewed, approved, committed, and pushed.** Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, model, parser, or database-configuration redesign occurred in Milestone 2D.5.
+Milestone 2D.6 — Windows Startup and Packaging is fully complete: implemented, tested, reviewed, committed as `46c77830793d42fb869f202e973e41cfd4dfd34d` ("Implement Windows startup and packaging"), and pushed to `origin/main` as a normal fast-forward. Local `main` and `origin/main` are synchronized at `46c77830793d42fb869f202e973e41cfd4dfd34d`, 0 ahead / 0 behind. 433/433 tests passing. Documentation for this milestone (this update and docs/HANDOFFS/2D.6_windows_startup_and_packaging.md) is prepared and pending its own review/commit/push, per the same separate-documentation-commit workflow used for every prior milestone. **Milestone 2D.7 — Release and User Acceptance Testing has not started** and requires its own separate implementation-plan review and approval step before any implementation work begins. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, model, parser, service, or database-configuration redesign occurred in Milestone 2D.6.
 
 # Next Milestone
-Milestone 2D.6 — Windows Startup and Packaging. Must not begin until Milestone 2D.5's documentation commit is reviewed, approved, committed, and pushed, and a separate implementation-plan review and approval step for 2D.6 has taken place, per project rules.
+Milestone 2D.7 — Release and User Acceptance Testing. Not yet started. Requires a separate implementation-plan review and approval step before it begins, per project rules. Scope per the roadmap: test startup on a genuinely clean environment, test restart and persistent data, test review and correction workflows, test backup and recovery, and prepare the v0.1 release checklist and controlled user-acceptance procedure.
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -133,13 +143,13 @@ Current Phase:
 Phase 2D — Manual Version 1 Operational Readiness
 
 Current Milestone:
-2D.5 — Correction and Audit Workflow (implementation committed locally as 644fb7a792e437c35d28e281fa9e5ffff9d1bee3; documentation pending review and commit; not yet pushed)
+2D.6 — Windows Startup and Packaging (implementation committed as 46c77830793d42fb869f202e973e41cfd4dfd34d; pushed to origin/main; fully complete)
 
 Git Synchronization:
-Local main is one commit ahead of origin/main. origin/main is at ce1e6c527ae3e33e5bd3b915c8e4dc49ecc77328 (last-pushed commit, the Milestone 2D.4 documentation commit). Local main additionally includes commit 644fb7a792e437c35d28e281fa9e5ffff9d1bee3 ("Implement correction and audit workflow", Milestone 2D.5 implementation), not yet pushed.
+Local main and origin/main are synchronized at 46c77830793d42fb869f202e973e41cfd4dfd34d (0 ahead / 0 behind). The 46c7783 implementation commit was pushed as a normal fast-forward (aafa3c5..46c7783).
 
 Test Suite:
 433/433 tests passing
 
 Next Action:
-ChatGPT review of the Milestone 2D.5 documentation diff (this file and docs/HANDOFFS/2D.5_correction_and_audit_workflow.md). On approval, commit the documentation separately from the implementation commit, then push both to origin/main. Milestone 2D.6 — Windows Startup and Packaging must not begin until that review, commit, and push are complete.
+ChatGPT review of the Milestone 2D.6 documentation diff (this file and docs/HANDOFFS/2D.6_windows_startup_and_packaging.md). On approval, commit the documentation separately from the implementation commit, then push it to origin/main. Milestone 2D.7 — Release and User Acceptance Testing must not begin until a separate implementation-plan review and approval step for 2D.7 has taken place, per project rules.

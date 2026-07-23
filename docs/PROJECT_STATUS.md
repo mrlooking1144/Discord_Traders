@@ -2,8 +2,8 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2D.6 — Windows Startup and Packaging
-(implemented, tested, reviewed, committed, and pushed to origin/main — fully complete)
+Milestone 2D.7 — Release and User Acceptance Testing
+(UAT execution complete; all items passed; no release-blocking defects; ready for explicit v0.1.0 release approval)
 
 # Completed
 - Project structure
@@ -118,12 +118,21 @@ Milestone 2D.6 — Windows Startup and Packaging
   - No schema, repository, model, parser, service, database-config, database-connection, or `requirements.txt` change; standalone/PyInstaller packaging was evaluated during planning and explicitly rejected for V1; auto-start on boot, an installer, code-signing, auto-update, and Phase 2E/Discord work are all explicitly out of scope for this milestone
   - 433/433 tests passing (same 433 as Milestone 2D.5 — no new tests added; existing `AppTest.from_file(...)` calls and one existing assertion updated only for the rename, re-verified passing)
   - Implementation commit `46c77830793d42fb869f202e973e41cfd4dfd34d` pushed to `origin/main` as a normal fast-forward (`aafa3c5..46c7783`); local `main` and `origin/main` synchronized at that commit, 0 ahead / 0 behind — Milestone 2D.6 is fully complete
+- Milestone 2D.7: Release and User Acceptance Testing — UAT execution complete (see docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt; preparation commit `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` — "Prepare release and UAT procedure"; no application code changed in this milestone)
+  - `docs/RELEASE_CHECKLIST.md` (new): reusable, version-agnostic release/UAT checklist covering Windows Sandbox setup, every test below, pass/fail criteria, release-blocking criteria, a defect table, Product Owner sign-off, and `v0.1.0` tagging gates; `sandbox/` (new): `prepare_release_candidate.ps1` (host-side, creates a detached `git worktree` checkout of the exact release-candidate commit with full failure/verification handling and cleanup instructions, never modifying the live development working tree or branch), `discord_traders_uat.wsb` (Windows Sandbox config mapping that worktree read-only), `sandbox_logon_setup.bat` (copies the read-only content into a writable Sandbox-local folder with correct robocopy exit-code handling)
+  - UAT executed against release-candidate commit `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` inside two Windows Sandbox sessions (Session A: Python-missing test only; Session B: full happy path, kept open continuously across all remaining steps), with every step personally performed and reported by the Product Owner
+  - All 13 UAT items passed: Session A Python-missing behavior; Session B first-run install and second-run venv reuse; database creation and restart persistence; valid and malformed message handling; duplicate advisory; review filters and read-only raw message; correction and audit history; stale/conflict protection; backup creation; disposable restore/recovery; invalid restore-candidate rejection; and logging/error-sanitization (log confirmed fully sanitized, no `CRITICAL` level)
+  - No release-blocking defects found; no structural defect occurred; no fix of any kind was required during UAT execution
+  - Windows Sandbox Sessions A and B both fully closed (all processes confirmed terminated); the release-candidate `git worktree` removed via `git worktree remove` + `git worktree prune`, confirmed no stale worktree administrative metadata remains; the live development working directory's branch and tracked files were never read from or modified by any of this milestone's Sandbox/worktree operations
+  - 433/433 tests passing (unchanged from Milestone 2D.6 — no application, database, or test code was modified in this milestone)
+  - Local `main` and `origin/main` synchronized at `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` (0 ahead / 0 behind) throughout and after UAT; no `v0.1.0` tag exists yet
+  - **Release status: ready for explicit Product Owner `v0.1.0` release approval** (a distinct, separate decision from the UAT-completion sign-off already recorded) — tagging has not occurred; **Phase 2E — Discord Ingestion has not started** and remains future scope; per the Product Owner's explicit instruction, project work stops after `v0.1.0` is released unless a new, separate, explicit approval is given later to begin Phase 2E
 
 # Current Focus
-Milestone 2D.6 — Windows Startup and Packaging is fully complete: implemented, tested, reviewed, committed as `46c77830793d42fb869f202e973e41cfd4dfd34d` ("Implement Windows startup and packaging"), and pushed to `origin/main` as a normal fast-forward. Local `main` and `origin/main` are synchronized at `46c77830793d42fb869f202e973e41cfd4dfd34d`, 0 ahead / 0 behind. 433/433 tests passing. Documentation for this milestone (this update and docs/HANDOFFS/2D.6_windows_startup_and_packaging.md) is prepared and pending its own review/commit/push, per the same separate-documentation-commit workflow used for every prior milestone. **Milestone 2D.7 — Release and User Acceptance Testing has not started** and requires its own separate implementation-plan review and approval step before any implementation work begins. Phase 2E — Discord Ingestion remains future scope and is not yet scoped or approved for implementation. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, model, parser, service, or database-configuration redesign occurred in Milestone 2D.6.
+Milestone 2D.7 — Release and User Acceptance Testing UAT execution is complete: all 13 UAT items passed, with no release-blocking defects found, against release-candidate commit `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` inside Windows Sandbox (Session A: Python-missing test; Session B: full happy path). 433/433 tests passing, unchanged. Local `main` and `origin/main` remain synchronized at `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`, 0 ahead / 0 behind. Documentation for this milestone (this update and docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt) is prepared and pending its own review/commit/push. **The release is now ready for explicit Product Owner `v0.1.0` release approval — a distinct, separate decision from the UAT-completion sign-off already recorded — after which the tag is created and pushed.** No `v0.1.0` tag exists yet. **Phase 2E — Discord Ingestion has not started** and remains future scope; per the Product Owner's explicit instruction, project work stops after `v0.1.0` is released unless a new, separate, explicit approval is given later to begin Phase 2E. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, model, parser, service, or database-configuration redesign occurred in Milestone 2D.7 — no application code was changed at all.
 
 # Next Milestone
-Milestone 2D.7 — Release and User Acceptance Testing. Not yet started. Requires a separate implementation-plan review and approval step before it begins, per project rules. Scope per the roadmap: test startup on a genuinely clean environment, test restart and persistent data, test review and correction workflows, test backup and recovery, and prepare the v0.1 release checklist and controlled user-acceptance procedure.
+None within Phase 2D — Milestone 2D.7 is the final milestone in Phase 2D. Next action is the explicit Product Owner `v0.1.0` release-approval and tagging step (outside any milestone's implementation scope), after which project work stops unless a new, separate, explicit approval is given to begin Phase 2E — Discord Ingestion.
 
 # Known Issues
 - Date/Time extraction not implemented
@@ -137,19 +146,19 @@ Database Design:
 FROZEN (docs/DATABASE_DESIGN_V1.md unchanged)
 
 Implementation Roadmap:
-Extended through Milestone 2D.7 (Phase 2D approved; commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64); Phase 2E (Discord Ingestion) recorded as future scope only, not yet scoped or approved for implementation
+Extended through Milestone 2D.7 (Phase 2D approved; commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64); Milestone 2D.7 is the final milestone under Phase 2D; Phase 2E (Discord Ingestion) recorded as future scope only, not yet scoped or approved for implementation
 
 Current Phase:
-Phase 2D — Manual Version 1 Operational Readiness
+Phase 2D — Manual Version 1 Operational Readiness (complete pending v0.1.0 release approval)
 
 Current Milestone:
-2D.6 — Windows Startup and Packaging (implementation committed as 46c77830793d42fb869f202e973e41cfd4dfd34d; pushed to origin/main; fully complete)
+2D.7 — Release and User Acceptance Testing (UAT execution complete via preparation commit 2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e; all 13 UAT items passed; no release-blocking defects; ready for explicit v0.1.0 release approval)
 
 Git Synchronization:
-Local main and origin/main are synchronized at 46c77830793d42fb869f202e973e41cfd4dfd34d (0 ahead / 0 behind). The 46c7783 implementation commit was pushed as a normal fast-forward (aafa3c5..46c7783).
+Local main and origin/main are synchronized at 2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e (0 ahead / 0 behind). No v0.1.0 tag exists yet.
 
 Test Suite:
 433/433 tests passing
 
 Next Action:
-ChatGPT review of the Milestone 2D.6 documentation diff (this file and docs/HANDOFFS/2D.6_windows_startup_and_packaging.md). On approval, commit the documentation separately from the implementation commit, then push it to origin/main. Milestone 2D.7 — Release and User Acceptance Testing must not begin until a separate implementation-plan review and approval step for 2D.7 has taken place, per project rules.
+ChatGPT review of the Milestone 2D.7 documentation diff (this file and docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt). On approval, commit the documentation, then push it to origin/main. Obtain the Product Owner's separate, explicit v0.1.0 release approval per docs/RELEASE_CHECKLIST.md Section 18, then create and push the v0.1.0 tag. After v0.1.0 is released, project work stops; Phase 2E — Discord Ingestion must not begin without a new, separate, explicit Product Owner approval.

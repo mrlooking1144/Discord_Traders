@@ -1,0 +1,315 @@
+# Milestone
+
+2D.7 — Release and User Acceptance Testing
+(`docs/RELEASE_CHECKLIST.md`, `sandbox/`; no application, database, or
+test files changed — this milestone is verification and documentation
+only)
+
+**Status: UAT execution complete. All items passed. No release-blocking
+defects found. `v0.1.0` has NOT been tagged yet — release is ready for a
+separate, explicit Product Owner release-approval step per
+`docs/RELEASE_CHECKLIST.md` Section 18's tagging gates.**
+
+# Summary
+
+Objective: verify, on a genuinely clean Windows environment, that the
+cumulative work of Phase 2D (Milestones 2D.1 through 2D.6) actually
+works end-to-end for a non-technical user — startup, first/second run,
+database persistence, the full manual-entry/review/correction/backup
+workflows, and safe error handling — and produce the release checklist,
+UAT procedure, and results needed to respons­ibly call the result
+`v0.1.0`. This milestone performed **no application code changes**; its
+only deliverables are the reusable `docs/RELEASE_CHECKLIST.md`, the
+`sandbox/` Windows Sandbox tooling (both committed in the preceding
+`2d39b93` preparation commit), and this execution-results handoff.
+
+## Release candidate under test
+
+**Commit**: `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` ("Prepare release
+and UAT procedure") — the tip of `main` at the start of UAT, with local
+`main` and `origin/main` synchronized at that commit throughout.
+
+## Windows Sandbox UAT environment
+
+Per `docs/RELEASE_CHECKLIST.md`: a separate, detached `git worktree`
+checkout of the exact release-candidate commit was created at
+`C:\DiscordTradersReleaseCandidate` via
+`sandbox\prepare_release_candidate.ps1 -CommitHash 2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`
+— verified to resolve to that exact commit, and confirmed **not** to
+read, modify, switch, or check out any branch in the live development
+working directory. `sandbox\discord_traders_uat.wsb` mapped that
+worktree **read-only** into Windows Sandbox; its logon script copied the
+read-only content into a writable, Sandbox-local folder at
+`C:\Users\WDAGUtilityAccount\Desktop\Discord_Traders_UAT`, from which
+`start.bat` was run for every test. No real production database or the
+live development repository was ever touched by any test.
+
+Two Sandbox sessions were used, exactly as planned:
+- **Session A** (fresh, no Python installed) — the Python-missing test only.
+- **Session B** (fresh, Python installed) — every remaining test,
+  performed sequentially within one continuous session so `.venv` and
+  database state persisted correctly between steps.
+
+All UAT steps were performed and directly observed by the **Product
+Owner**, not self-certified by the implementation engineer, per
+`docs/RELEASE_CHECKLIST.md` Section 17.
+
+# UAT Results
+
+Every item below is recorded exactly as reported by the Product Owner
+during live execution.
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Session A — Python-missing behavior | **PASS** — exact "Python was not found on this computer..." message appeared; console window paused instead of closing; no Python installed; no application startup attempted; no files modified |
+| 2 | Session B — first-run startup | **PASS** — Python 3.12.x verified; `.venv` created; `requirements.txt` installed successfully with no `ERROR:` message; Streamlit reached ready state; browser opened automatically; app loaded correctly at `http://localhost:8501` |
+| 3 | Session B — second-run `.venv` reuse | **PASS** — existing `.venv` reused; no "Creating virtual environment..." message; no dependency reinstall/pip output; Streamlit started; browser opened; app loaded at `http://localhost:8501`; no errors |
+| 4 | Database creation & restart persistence | **PASS** — no database existed before the first real write; valid SPY message (`BTO SPY 450C 7/19/2025 @3.25 10 contracts`) parsed correctly with matching structured preview; submission succeeded; signal appeared in Review Signals; `discord_traders.db` was created; after closing and restarting the app, the same signal remained present with identical values |
+| 5 | Malformed message | **PASS** — exact message `No trade signals found in this message.`; no database row created |
+| 6 | Duplicate advisory | **PASS** — non-blocking duplicate warning appeared for the repeated SPY signal; submission was not blocked; both SPY rows persisted as separate entries |
+| 7 | Review filters & read-only raw message | **PASS** — a second trader/symbol (`bob` / `AAPL`) added successfully; trader filters and symbol filters each returned the correct subset; date filtering behaved correctly; raw message detail view confirmed read-only |
+| 8 | Correction & audit-history | **PASS** — exact success message `Trade signal correction saved.`; updated values persisted correctly; exactly one new Correction History entry appeared, showing the correct previous (pre-correction) values |
+| 9 | Stale/conflict protection | **PASS** — exact conflict message `This trade signal changed or is no longer available. Reload it before correcting.`; the rejected attempt applied no correction; stored signal values remained unchanged; no additional audit-history entry was created |
+| 10 | Backup creation | **PASS** — exact success message `Database backup created successfully.`; a new timestamped backup file was created in `%LOCALAPPDATA%\DiscordTraders\backups`; the file was non-empty |
+| 11 | Disposable restore/recovery | **PASS** — run only inside Windows Sandbox against disposable Sandbox data; the Streamlit app was fully stopped before restore; exact success message `Restore completed successfully.`; after relaunch, all expected stored signals were present with correct values |
+| 12 | Invalid restore-candidate rejection | **PASS** — an invalid restore candidate was rejected with the exact message `Restore failed. See logs for details.`; the production database remained completely unchanged after the rejected attempt |
+| 13 | Logging & error-sanitization | **PASS** — a deliberate failure produced only the expected fixed, generic user-facing message, with no raw exception text shown; the corresponding log entry was fully sanitized, containing none of: raw Discord message text, trader names, source names, field values, database paths, backup paths, or raw exception message text; no `CRITICAL` log level appeared anywhere in the log |
+
+**All 13 UAT items passed. No release-blocking defects were found. No
+structural defect occurred, and no fix of any kind — narrowly scoped or
+otherwise — was needed during UAT execution.**
+
+# Final Regression Gate
+
+```
+python -m unittest discover -s tests
+Ran 433 tests in ~45-47s
+OK
+```
+
+**433/433 tests passing** — the same 433 tests as Milestones 2D.5/2D.6;
+no application, database, or test code was touched during this
+milestone, so this is a pure regression confirmation, not new coverage.
+
+Repository state confirmed clean throughout and after UAT: local `main`
+and `origin/main` synchronized at `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`
+(0 ahead / 0 behind); no file staged, modified, committed, pushed, or
+tagged during UAT execution; no `v0.1.0` tag exists.
+
+# Sandbox and Worktree Cleanup
+
+- **Session A**: closed completely after its result was recorded; all
+  Windows Sandbox processes (`WindowsSandboxRemoteSession`,
+  `WindowsSandboxServer`, `vmmemWindowsSandbox`) confirmed terminated.
+- **Session B**: closed completely after the final logging test result
+  was recorded; all Windows Sandbox processes confirmed terminated via
+  graceful shutdown.
+- **Release-candidate worktree**: removed via
+  `git worktree remove C:\DiscordTradersReleaseCandidate` followed by
+  `git worktree prune`. Confirmed: `C:\DiscordTradersReleaseCandidate`
+  no longer exists, `git worktree list` shows only the live development
+  repository, and `.git/worktrees/` contains no stale administrative
+  entries at all.
+- The live development working directory's branch, tracked files, and
+  history were never read from or modified by any part of this
+  milestone's Sandbox/worktree tooling.
+
+# Files Modified
+
+None. This milestone's only file changes are documentation, added here:
+
+- `docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt` (new,
+  this file) — UAT execution results.
+- `docs/PROJECT_STATUS.md` (modified) — status update.
+
+`docs/RELEASE_CHECKLIST.md` and every file under `sandbox/` were already
+committed and pushed in the preceding `2d39b93` ("Prepare release and
+UAT procedure") commit and are unchanged by this documentation update.
+No application code, database code, parser, service, schema, or test
+file was modified anywhere in Milestone 2D.7.
+
+# Review Status
+
+UAT was planned across several review rounds (clean-environment platform
+selection — Windows Sandbox; read-only mapped release candidate with a
+writable Sandbox-local copy; fix-during-UAT policy restricted to
+narrowly scoped, separately-approved release-blocking fixes only;
+structural defects to stop the milestone entirely; standalone reusable
+checklist document; strict `v0.1.0` tagging gates) and reviewed again
+after the Sandbox/checklist files were drafted, surfacing and correcting
+several real gaps (git-command failure handling, robocopy exit-code
+handling, missing "Add Python to PATH" instruction, a session-boundary
+inconsistency, a markdown formatting defect) before UAT execution began.
+Execution itself proceeded block-by-block, with the Product Owner
+personally performing and reporting every step and the implementation
+engineer confirming host-side state (Sandbox session liveness,
+repository cleanliness) between each block. This documentation is
+prepared for review; not yet committed.
+
+# Product Owner Sign-off
+
+Recorded per `docs/RELEASE_CHECKLIST.md` Section 17:
+
+```
+Release candidate commit:   2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e
+Checklist completed by:     Product Owner
+All steps passed:           [x] Yes
+All release-blocking
+  defects closed/retested:  [x] N/A (none found)
+```
+
+The final line of that sign-off block — **explicit Product Owner
+approval to proceed to `v0.1.0` tagging** — is a distinct, separate
+decision from the UAT-completion sign-off above, per Section 18's
+tagging gates, and has not yet been given. This handoff documents that
+UAT is complete and the release is **ready for that explicit approval**,
+not that tagging has been approved.
+
+# Git Commit
+
+No implementation commit accompanies this milestone — Milestone 2D.7
+made no application/Sandbox-tooling code changes. This handoff and the
+`docs/PROJECT_STATUS.md` update are the sole artifacts, to be committed
+together in a documentation-only commit (no `Co-Authored-By` line, per
+project rules), separate from any future tagging action.
+
+# Release Status
+
+**Ready for explicit `v0.1.0` release approval.** Per
+`docs/RELEASE_CHECKLIST.md` Section 18, the tag is created and pushed
+only after, in order: (1) every checklist item passes — **done**; (2)
+every release-blocking defect is closed and retested — **none were
+found**; (3) ChatGPT review of the full UAT results and documentation is
+complete — **pending, this review**; (4) the Product Owner gives
+**explicit** release approval, distinct from any per-step approval given
+during UAT — **not yet given**.
+
+**`v0.1.0` has not been tagged.** **Phase 2E — Discord Ingestion has not
+started** and remains future scope, not scoped or approved for
+implementation. Per the Product Owner's explicit instruction, **project
+work stops after `v0.1.0` is released** unless a new, separate, explicit
+approval is given later to begin Phase 2E.
+
+# Known Limitations
+
+- Clean-environment testing used Windows Sandbox rather than a fully
+  separate physical machine — an accepted, approved substitution
+  (Windows Sandbox was the required primary platform per the approved
+  plan, not a fallback).
+- UAT was performed once, by one Product Owner, against one Sandbox
+  environment; it does not constitute testing across multiple Windows
+  versions/configurations, which remains out of scope for V1.
+- Date/Time extraction from source messages remains unimplemented
+  (carried over from prior milestones, unrelated to this one).
+
+# Next Milestone
+
+None within Phase 2D — 2D.7 is the last milestone in Phase 2D. Next
+action is the explicit `v0.1.0` release-approval and tagging step
+(outside this milestone's scope), after which **project work stops**
+unless a new, separate, explicit Product Owner approval is given to
+begin Phase 2E — Discord Ingestion.
+
+# Notes
+
+## Confirmations
+
+- All 13 UAT items passed; no release-blocking defect was found; no
+  structural defect occurred; no fix of any kind was required during
+  UAT execution.
+- 433/433 automated tests passing, unchanged from Milestone 2D.6 — no
+  application, database, or test code was modified in this milestone.
+- Local `main` and `origin/main` remain synchronized at
+  `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` throughout.
+- No `v0.1.0` tag exists yet.
+- Windows Sandbox Sessions A and B are both fully closed; the
+  release-candidate worktree and all its administrative metadata have
+  been completely removed.
+- The live development working directory's branch and tracked files
+  were never read from or modified by any Sandbox/worktree operation in
+  this milestone.
+- All pre-existing untracked files (`CLAUDE.md`,
+  `docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/`,
+  `docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+  `docs/REVIEW_RULES.md`, `app/__pycache__/`, `database/__pycache__/`,
+  `tests/__pycache__/`) remained untracked and untouched throughout this
+  milestone's UAT execution and documentation.
+- Phase 2E — Discord Ingestion has not started and is not scoped or
+  approved for implementation.
+
+## Completed milestones through 2D.7
+
+- Milestone 2A — Version 1 database design (`docs/DATABASE_DESIGN_V1.md`)
+- Milestone 2B.1 — `database/schema.sql`
+- Milestone 2B.2 — `database/config.py`
+- Milestone 2B.3 — `database/db.py`
+- Milestone 2B.4 — `database/models.py`
+- Milestone 2B.5a-e — `database/repository.py` (sources, traders,
+  raw_messages, trade_signals, trade_signal_edits)
+- Milestone 2B.6a-c — `database/service.py` (`TradeService`: duplicate
+  detection, edit-on-update, `ingest_message`)
+- Milestone 2B.7 — Integration and transaction tests
+- Milestone 2C.1 — Parser module (`app/parser.py`)
+- Milestone 2C.2 — Manual message entry UI
+- Milestone 2C.3 — TradeService integration
+- Milestone 2C.4 — Integration tests
+- Milestone 2D.1 — Runtime configuration and application data locations
+- Milestone 2D.2 — Operational logging and error handling
+- Milestone 2D.3 — Database backup and recovery
+- Milestone 2D.4 — Stored-signal review UI
+- Milestone 2D.5 — Correction and audit workflow
+- Milestone 2D.6 — Windows startup and packaging
+  (`start.bat`, `app/streamlit_app.py` rename)
+- **Milestone 2D.7 — Release and User Acceptance Testing
+  (`docs/RELEASE_CHECKLIST.md`, `sandbox/`) — UAT execution complete,
+  all items passed, no release-blocking defects, ready for explicit
+  `v0.1.0` release approval.**
+
+## Current test count
+
+433/433 passing (`python -m unittest discover -s tests`).
+
+## Current Git synchronization state
+
+- Local `main`: `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`
+- `origin/main`: `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`
+- **Synchronized. 0 ahead / 0 behind.**
+
+## Architecture / design / roadmap status
+
+Unchanged and frozen throughout this milestone:
+- Architecture (`docs/DATABASE_DESIGN_V1.md`): FROZEN.
+- Database design: FROZEN.
+- Implementation Roadmap (`docs/IMPLEMENTATION_ROADMAP.md`): unchanged;
+  Milestone 2D.7 is the final milestone listed under Phase 2D.
+- No schema, repository, model, parser, service, or database-connection
+  redesign occurred at any point in this milestone.
+
+## Next-session instructions
+
+1. Review this handoff and the `docs/PROJECT_STATUS.md` update.
+2. If approved, stage and commit only these two documentation files, no
+   `Co-Authored-By` line, then push to `origin/main`.
+3. Obtain the Product Owner's separate, explicit `v0.1.0` release
+   approval (distinct from the UAT-completion sign-off already recorded
+   above), per `docs/RELEASE_CHECKLIST.md` Section 18.
+4. Only then create and push the `v0.1.0` tag on the exact reviewed
+   commit.
+5. After `v0.1.0` is released, stop project work. Do not begin Phase 2E
+   — Discord Ingestion without a new, separate, explicit Product Owner
+   approval at a later time.
+
+## Project rules (recorded for continuity)
+
+- One milestone implemented at a time; never combine or reorder
+  milestones.
+- Documentation (`docs/PROJECT_STATUS.md` + handoff) is committed
+  separately from any implementation/preparation commit, never bundled
+  into it.
+- ChatGPT reviews and approves before every commit — planning, then
+  implementation/preparation, then documentation each get their own
+  review/approval step.
+- No `Co-Authored-By` lines in any commit message for this project.
+- All handoff documents must be exported as `.txt` files when transferred
+  into a ChatGPT session (session-transfer format only; the canonical
+  copy in this repository remains `.md`).

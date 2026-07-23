@@ -4,7 +4,7 @@ Reusable, version-agnostic release procedure. This document is the
 **template and procedure** — the one-time results, defect log, and sign-off
 for a specific milestone/release are recorded separately in that
 milestone's handoff document (e.g.
-`docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.md` for the
+`docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt` for the
 `v0.1.0` release), never in this file.
 
 This checklist assumes the reader may be a **non-technical Product

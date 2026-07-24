@@ -34,9 +34,15 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     ingested_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_messages_source_external_id
-    ON raw_messages (source_id, external_id)
-    WHERE external_id IS NOT NULL;
+-- The original v0.1.0 idx_raw_messages_source_external_id index (source_id,
+-- external_id) was removed from this baseline by Recovery Milestone R1,
+-- per docs/DECISIONS/0001_recovery_message_storage_and_lifecycle_schema.md.
+-- Because this file is re-applied via executescript() on every
+-- initialize_database() call, leaving that CREATE INDEX IF NOT EXISTS
+-- statement here would silently recreate it forever, undoing
+-- database/migrations/0003_extend_raw_messages.sql's DROP INDEX every time
+-- the app restarts. The channel-scoped replacement indexes are created by
+-- that migration instead.
 
 CREATE INDEX IF NOT EXISTS idx_raw_messages_content_hash
     ON raw_messages (content_hash);

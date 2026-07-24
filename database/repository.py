@@ -15,7 +15,16 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from database.models import RawMessage, Source, Trader, TradeSignal, TradeSignalEdit
+from database.models import (
+    Channel,
+    ImportBatch,
+    MessageExtraction,
+    RawMessage,
+    Source,
+    Trader,
+    TradeSignal,
+    TradeSignalEdit,
+)
 
 _REVIEW_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _REVIEW_DATE_FORMAT = "%Y-%m-%d"
@@ -108,6 +117,7 @@ def _row_to_trader(row: sqlite3.Row) -> Trader:
         name=row["name"],
         external_trader_id=row["external_trader_id"],
         created_at=row["created_at"],
+        canonical_name=row["canonical_name"],
     )
 
 
@@ -119,6 +129,10 @@ def create_trader(
 ) -> Trader:
     """Insert a new trader row.
 
+    canonical_name is always computed automatically as name.strip().lower()
+    and stored alongside name, so newly created rows never need a separate
+    backfill. Duplicate (source_id, name) rows remain allowed, as today.
+
     Args:
         conn: An open sqlite3.Connection.
         source_id: FK to sources.id.
@@ -126,7 +140,8 @@ def create_trader(
         external_trader_id: Stable source-provided trader ID, when available.
 
     Returns:
-        The newly created Trader, including its generated id and created_at.
+        The newly created Trader, including its generated id, created_at,
+        and derived canonical_name.
 
     Raises:
         ValueError: If name is empty or whitespace-only.
@@ -135,14 +150,15 @@ def create_trader(
             for this source_id.
     """
     _validate_trader_name(name)
+    canonical_name = name.strip().lower()
 
     cursor = conn.execute(
-        "INSERT INTO traders (source_id, name, external_trader_id) "
-        "VALUES (?, ?, ?)",
-        (source_id, name, external_trader_id),
+        "INSERT INTO traders (source_id, name, external_trader_id, canonical_name) "
+        "VALUES (?, ?, ?, ?)",
+        (source_id, name, external_trader_id, canonical_name),
     )
     row = conn.execute(
-        "SELECT id, source_id, name, external_trader_id, created_at "
+        "SELECT id, source_id, name, external_trader_id, created_at, canonical_name "
         "FROM traders WHERE id = ?",
         (cursor.lastrowid,),
     ).fetchone()
@@ -166,7 +182,7 @@ def get_trader_by_external_id(
         source_id/external_trader_id pair.
     """
     row = conn.execute(
-        "SELECT id, source_id, name, external_trader_id, created_at "
+        "SELECT id, source_id, name, external_trader_id, created_at, canonical_name "
         "FROM traders WHERE source_id = ? AND external_trader_id = ?",
         (source_id, external_trader_id),
     ).fetchone()
@@ -194,9 +210,38 @@ def get_traders_by_name(
         All matching Traders, ordered by id. Empty list if none match.
     """
     rows = conn.execute(
-        "SELECT id, source_id, name, external_trader_id, created_at "
+        "SELECT id, source_id, name, external_trader_id, created_at, canonical_name "
         "FROM traders WHERE source_id = ? AND name = ? ORDER BY id",
         (source_id, name),
+    ).fetchall()
+    return [_row_to_trader(row) for row in rows]
+
+
+def get_traders_by_canonical_name(
+    conn: sqlite3.Connection,
+    source_id: int,
+    canonical_name: str,
+) -> list[Trader]:
+    """Look up all traders matching a source and exact canonical_name.
+
+    Case-insensitive identity resolution primitive (e.g. "Matae" and
+    "matae" share one canonical_name). Duplicate rows remain possible, so
+    this may return more than one Trader; wiring this into actual
+    find-or-create ingestion logic is out of scope here.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+        canonical_name: Exact canonical_name to search for (already
+            lowercased/trimmed by the caller).
+
+    Returns:
+        All matching Traders, ordered by id. Empty list if none match.
+    """
+    rows = conn.execute(
+        "SELECT id, source_id, name, external_trader_id, created_at, canonical_name "
+        "FROM traders WHERE source_id = ? AND canonical_name = ? ORDER BY id",
+        (source_id, canonical_name),
     ).fetchall()
     return [_row_to_trader(row) for row in rows]
 
@@ -233,7 +278,16 @@ def _row_to_raw_message(row: sqlite3.Row) -> RawMessage:
         metadata=metadata,
         received_at=row["received_at"],
         ingested_at=row["ingested_at"],
+        channel_id=row["channel_id"],
+        import_batch_id=row["import_batch_id"],
+        sequence_in_batch=row["sequence_in_batch"],
     )
+
+
+_RAW_MESSAGE_COLUMNS = (
+    "id, source_id, external_id, raw_text, content_hash, metadata, "
+    "received_at, ingested_at, channel_id, import_batch_id, sequence_in_batch"
+)
 
 
 def create_raw_message(
@@ -243,11 +297,16 @@ def create_raw_message(
     external_id: str | None = None,
     metadata: dict | None = None,
     received_at: str | None = None,
+    channel_id: int | None = None,
+    import_batch_id: int | None = None,
+    sequence_in_batch: int | None = None,
 ) -> RawMessage:
     """Insert a new raw message row.
 
     raw_text is stored exactly as supplied: no stripping, case changes,
-    Unicode normalization, or line-ending changes are performed.
+    Unicode normalization, or line-ending changes are performed. This is
+    the only way a raw message is ever written - there is no update path,
+    so raw_text can never be overwritten once persisted.
 
     Args:
         conn: An open sqlite3.Connection.
@@ -256,6 +315,12 @@ def create_raw_message(
         external_id: Source-provided message ID, when available.
         metadata: Opaque JSON-serializable metadata, or None.
         received_at: ISO8601 timestamp of when the source sent the message.
+        channel_id: FK to channels.id, when this message is scoped to a
+            specific source channel, or None.
+        import_batch_id: FK to import_batches.id, when this message was
+            segmented from a batch paste, or None.
+        sequence_in_batch: Position of this message within its import
+            batch, or None.
 
     Returns:
         The newly created RawMessage, including its generated id,
@@ -263,8 +328,12 @@ def create_raw_message(
 
     Raises:
         sqlite3.IntegrityError: If source_id does not reference an existing
-            source, or if external_id is not None and already exists for
-            this source_id.
+            source; if channel_id is None and external_id is not None and
+            already exists for this source_id among other channel_id-IS-NULL
+            rows; or if channel_id and external_id are both not None and
+            already exist together for this channel_id. The same
+            external_id MAY repeat across two different non-null
+            channel_ids.
         TypeError: If metadata is not JSON-serializable.
     """
     content_hash = _compute_content_hash(raw_text)
@@ -274,13 +343,23 @@ def create_raw_message(
 
     cursor = conn.execute(
         "INSERT INTO raw_messages "
-        "(source_id, external_id, raw_text, content_hash, metadata, received_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (source_id, external_id, raw_text, content_hash, serialized_metadata, received_at),
+        "(source_id, external_id, raw_text, content_hash, metadata, received_at, "
+        "channel_id, import_batch_id, sequence_in_batch) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            source_id,
+            external_id,
+            raw_text,
+            content_hash,
+            serialized_metadata,
+            received_at,
+            channel_id,
+            import_batch_id,
+            sequence_in_batch,
+        ),
     )
     row = conn.execute(
-        "SELECT id, source_id, external_id, raw_text, content_hash, metadata, "
-        "received_at, ingested_at FROM raw_messages WHERE id = ?",
+        f"SELECT {_RAW_MESSAGE_COLUMNS} FROM raw_messages WHERE id = ?",
         (cursor.lastrowid,),
     ).fetchone()
     return _row_to_raw_message(row)
@@ -303,10 +382,41 @@ def get_raw_message_by_external_id(
         source_id/external_id pair.
     """
     row = conn.execute(
-        "SELECT id, source_id, external_id, raw_text, content_hash, metadata, "
-        "received_at, ingested_at FROM raw_messages "
+        f"SELECT {_RAW_MESSAGE_COLUMNS} FROM raw_messages "
         "WHERE source_id = ? AND external_id = ?",
         (source_id, external_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_raw_message(row)
+
+
+def get_raw_message_by_channel_and_external_id(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    external_id: str,
+) -> RawMessage | None:
+    """Look up a raw message by channel and external message ID.
+
+    This is the "idempotent ingestion using channel ID plus message ID"
+    lookup: callers check this before inserting to recognize an
+    already-stored message (real or synthetic ID) without relying on a
+    thrown IntegrityError.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        channel_id: FK to channels.id.
+        external_id: Source-provided (or synthetic) message ID to search
+            for.
+
+    Returns:
+        The matching RawMessage, or None if no row exists for this
+        channel_id/external_id pair.
+    """
+    row = conn.execute(
+        f"SELECT {_RAW_MESSAGE_COLUMNS} FROM raw_messages "
+        "WHERE channel_id = ? AND external_id = ?",
+        (channel_id, external_id),
     ).fetchone()
     if row is None:
         return None
@@ -330,8 +440,7 @@ def get_raw_messages_by_content_hash(
         All matching RawMessages, ordered by id. Empty list if none match.
     """
     rows = conn.execute(
-        "SELECT id, source_id, external_id, raw_text, content_hash, metadata, "
-        "received_at, ingested_at FROM raw_messages "
+        f"SELECT {_RAW_MESSAGE_COLUMNS} FROM raw_messages "
         "WHERE content_hash = ? ORDER BY id",
         (content_hash,),
     ).fetchall()
@@ -430,7 +539,23 @@ def _row_to_trade_signal(row: sqlite3.Row) -> TradeSignal:
         position_size=row["position_size"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        strike=row["strike"],
+        expiration_raw=row["expiration_raw"],
+        event_type=row["event_type"],
+        qualifier=row["qualifier"],
+        stated_entry_price=row["stated_entry_price"],
+        stated_return_pct=row["stated_return_pct"],
+        notes=row["notes"],
+        extraction_id=row["extraction_id"],
     )
+
+
+_TRADE_SIGNAL_COLUMNS = (
+    "id, raw_message_id, trader_id, symbol, action, option_type, price, "
+    "expiration, position_size, created_at, updated_at, strike, "
+    "expiration_raw, event_type, qualifier, stated_entry_price, "
+    "stated_return_pct, notes, extraction_id"
+)
 
 
 def create_trade_signal(
@@ -443,6 +568,14 @@ def create_trade_signal(
     price: Decimal | None = None,
     expiration: str | None = None,
     position_size: str | None = None,
+    strike: Decimal | None = None,
+    expiration_raw: str | None = None,
+    event_type: str | None = None,
+    qualifier: str | None = None,
+    stated_entry_price: Decimal | None = None,
+    stated_return_pct: Decimal | None = None,
+    notes: str | None = None,
+    extraction_id: int | None = None,
 ) -> TradeSignal:
     """Insert a new trade signal row.
 
@@ -451,12 +584,26 @@ def create_trade_signal(
         raw_message_id: FK to raw_messages.id.
         trader_id: FK to traders.id.
         symbol: Ticker symbol.
-        action: Free-text trade action (e.g. BTO/STC), stored exactly as
-            supplied (not stripped, uppercased, or otherwise normalized).
+        action: Free-text trade action (e.g. BTO/STC, or BOUGHT/SOLD),
+            stored exactly as supplied (not stripped, uppercased, or
+            otherwise normalized, and never aliased to another verb).
         option_type: Free-text call/put, or None for non-option trades.
         price: A Decimal price, or None. Never a float or string.
         expiration: ISO8601 date string, or None.
         position_size: Raw wording of position size, or None.
+        strike: A Decimal strike price, or None. Never a float or string.
+        expiration_raw: Verbatim expiration token as it appeared in the
+            message, before year resolution, or None.
+        event_type: Derived lifecycle event kind, or None.
+        qualifier: Raw fraction text, "ALL OUT", or a bracket annotation,
+            or None.
+        stated_entry_price: A Decimal entry price as stated in the
+            message's own text, or None. Never a float or string.
+        stated_return_pct: A Decimal return percentage as stated in the
+            message's own text, or None. Never a float or string. Advisory
+            only.
+        notes: Free-text commentary from the message, or None.
+        extraction_id: FK to message_extractions.id, or None.
 
     Returns:
         The newly created TradeSignal, including its generated id,
@@ -465,17 +612,23 @@ def create_trade_signal(
     Raises:
         ValueError: If raw_message_id or trader_id is None, or if symbol or
             action is None, empty, or whitespace-only.
-        TypeError: If price is supplied and is not a Decimal.
-        sqlite3.IntegrityError: If raw_message_id or trader_id does not
-            reference an existing row.
+        TypeError: If price, strike, stated_entry_price, or
+            stated_return_pct is supplied and is not a Decimal.
+        sqlite3.IntegrityError: If raw_message_id, trader_id, or
+            extraction_id does not reference an existing row.
     """
     _validate_trade_signal_required_fields(raw_message_id, trader_id, symbol, action)
     price_text = _serialize_price(price)
+    strike_text = _serialize_price(strike)
+    stated_entry_price_text = _serialize_price(stated_entry_price)
+    stated_return_pct_text = _serialize_price(stated_return_pct)
 
     cursor = conn.execute(
         "INSERT INTO trade_signals "
         "(raw_message_id, trader_id, symbol, action, option_type, price, "
-        "expiration, position_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "expiration, position_size, strike, expiration_raw, event_type, "
+        "qualifier, stated_entry_price, stated_return_pct, notes, extraction_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             raw_message_id,
             trader_id,
@@ -485,12 +638,18 @@ def create_trade_signal(
             price_text,
             expiration,
             position_size,
+            strike_text,
+            expiration_raw,
+            event_type,
+            qualifier,
+            stated_entry_price_text,
+            stated_return_pct_text,
+            notes,
+            extraction_id,
         ),
     )
     row = conn.execute(
-        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
-        "price, expiration, position_size, created_at, updated_at "
-        "FROM trade_signals WHERE id = ?",
+        f"SELECT {_TRADE_SIGNAL_COLUMNS} FROM trade_signals WHERE id = ?",
         (cursor.lastrowid,),
     ).fetchone()
     return _row_to_trade_signal(row)
@@ -510,9 +669,7 @@ def get_trade_signal_by_id(
         The matching TradeSignal, or None if no row exists with this id.
     """
     row = conn.execute(
-        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
-        "price, expiration, position_size, created_at, updated_at "
-        "FROM trade_signals WHERE id = ?",
+        f"SELECT {_TRADE_SIGNAL_COLUMNS} FROM trade_signals WHERE id = ?",
         (trade_signal_id,),
     ).fetchone()
     if row is None:
@@ -762,8 +919,7 @@ def get_trade_signals_matching(
     price_text = _serialize_price(price)
 
     rows = conn.execute(
-        "SELECT id, raw_message_id, trader_id, symbol, action, option_type, "
-        "price, expiration, position_size, created_at, updated_at "
+        f"SELECT {_TRADE_SIGNAL_COLUMNS} "
         "FROM trade_signals "
         "WHERE trader_id = ? AND symbol = ? AND action = ? "
         "AND option_type IS ? AND price IS ? AND expiration IS ? "
@@ -897,3 +1053,374 @@ def get_trade_signals_for_review(
     ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+_UNSPECIFIED_CHANNEL_EXTERNAL_ID = "__unspecified__"
+
+
+def _row_to_channel(row: sqlite3.Row) -> Channel:
+    """Map a ``channels`` table row to a Channel model.
+
+    Args:
+        row: A row from the channels table, with all columns selected.
+
+    Returns:
+        The corresponding Channel.
+    """
+    return Channel(
+        id=row["id"],
+        source_id=row["source_id"],
+        external_channel_id=row["external_channel_id"],
+        name=row["name"],
+        created_at=row["created_at"],
+    )
+
+
+def create_channel(
+    conn: sqlite3.Connection,
+    source_id: int,
+    external_channel_id: str | None = None,
+    name: str | None = None,
+) -> Channel:
+    """Insert a new channel row.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+        external_channel_id: Stable source-provided channel ID, when
+            available.
+        name: Display name/slug for the channel, when available.
+
+    Returns:
+        The newly created Channel, including its generated id and
+        created_at.
+
+    Raises:
+        sqlite3.IntegrityError: If source_id does not reference an existing
+            source, or if external_channel_id is not None and already
+            exists for this source_id.
+    """
+    cursor = conn.execute(
+        "INSERT INTO channels (source_id, external_channel_id, name) VALUES (?, ?, ?)",
+        (source_id, external_channel_id, name),
+    )
+    row = conn.execute(
+        "SELECT id, source_id, external_channel_id, name, created_at "
+        "FROM channels WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_channel(row)
+
+
+def get_channel_by_external_id(
+    conn: sqlite3.Connection,
+    source_id: int,
+    external_channel_id: str,
+) -> Channel | None:
+    """Look up a channel by source and external channel ID.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+        external_channel_id: Source-provided channel ID to search for.
+
+    Returns:
+        The matching Channel, or None if no row exists for this
+        source_id/external_channel_id pair.
+    """
+    row = conn.execute(
+        "SELECT id, source_id, external_channel_id, name, created_at "
+        "FROM channels WHERE source_id = ? AND external_channel_id = ?",
+        (source_id, external_channel_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_channel(row)
+
+
+def get_or_create_channel(
+    conn: sqlite3.Connection,
+    source_id: int,
+    external_channel_id: str,
+    name: str | None = None,
+) -> Channel:
+    """Return the existing channel with this external ID, creating it if needed.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+        external_channel_id: Source-provided channel ID to look up or
+            create. Must not be None - use
+            get_or_create_unspecified_channel() for messages with no real
+            channel identifier.
+        name: Display name/slug to store if a new row is created. Ignored
+            if a matching channel already exists.
+
+    Returns:
+        The existing or newly created Channel.
+    """
+    existing = get_channel_by_external_id(conn, source_id, external_channel_id)
+    if existing is not None:
+        return existing
+    return create_channel(conn, source_id, external_channel_id, name)
+
+
+def get_or_create_unspecified_channel(conn: sqlite3.Connection, source_id: int) -> Channel:
+    """Return the sentinel "unspecified" channel for a source, creating it if needed.
+
+    Used for raw messages with no real channel identifier (e.g. today's
+    single-message manual entry), so channel-scoped queries (idempotency,
+    per-channel checkpoints) always have a channel to key on.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+
+    Returns:
+        The existing or newly created sentinel Channel for this source.
+    """
+    return get_or_create_channel(
+        conn, source_id, _UNSPECIFIED_CHANNEL_EXTERNAL_ID, name="unspecified"
+    )
+
+
+def _row_to_import_batch(row: sqlite3.Row) -> ImportBatch:
+    """Map an ``import_batches`` table row to an ImportBatch model.
+
+    Args:
+        row: A row from the import_batches table, with all columns selected.
+
+    Returns:
+        The corresponding ImportBatch.
+    """
+    return ImportBatch(
+        id=row["id"],
+        source_id=row["source_id"],
+        reference_date=row["reference_date"],
+        timezone=row["timezone"],
+        raw_input_text=row["raw_input_text"],
+        created_at=row["created_at"],
+    )
+
+
+def create_import_batch(
+    conn: sqlite3.Connection,
+    source_id: int,
+    reference_date: str,
+    timezone: str,
+    raw_input_text: str | None = None,
+) -> ImportBatch:
+    """Insert a new import batch row.
+
+    reference_date and timezone anchor the deterministic date/time
+    resolution rule for every message later segmented from this batch -
+    never the wall clock.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+        reference_date: Calendar date ("YYYY-MM-DD") for this batch.
+        timezone: Timezone name for this batch.
+        raw_input_text: The complete pasted batch text, before
+            segmentation, or None.
+
+    Returns:
+        The newly created ImportBatch, including its generated id and
+        created_at.
+
+    Raises:
+        ValueError: If reference_date or timezone is empty or
+            whitespace-only.
+        sqlite3.IntegrityError: If source_id does not reference an existing
+            source.
+    """
+    if not reference_date or not reference_date.strip():
+        raise ValueError("reference_date must not be empty or whitespace-only.")
+    if not timezone or not timezone.strip():
+        raise ValueError("timezone must not be empty or whitespace-only.")
+
+    cursor = conn.execute(
+        "INSERT INTO import_batches (source_id, reference_date, timezone, raw_input_text) "
+        "VALUES (?, ?, ?, ?)",
+        (source_id, reference_date, timezone, raw_input_text),
+    )
+    row = conn.execute(
+        "SELECT id, source_id, reference_date, timezone, raw_input_text, created_at "
+        "FROM import_batches WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_import_batch(row)
+
+
+def get_import_batch_by_id(
+    conn: sqlite3.Connection,
+    import_batch_id: int,
+) -> ImportBatch | None:
+    """Look up an import batch by id.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        import_batch_id: Primary key to look up.
+
+    Returns:
+        The matching ImportBatch, or None if no row exists with this id.
+    """
+    row = conn.execute(
+        "SELECT id, source_id, reference_date, timezone, raw_input_text, created_at "
+        "FROM import_batches WHERE id = ?",
+        (import_batch_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_import_batch(row)
+
+
+_MESSAGE_EXTRACTION_PARSE_STATUSES = frozenset(
+    {"parsed", "partially_parsed", "unrecognized", "failed"}
+)
+
+
+def _row_to_message_extraction(row: sqlite3.Row) -> MessageExtraction:
+    """Map a ``message_extractions`` table row to a MessageExtraction model.
+
+    Args:
+        row: A row from the message_extractions table, with all columns
+            selected.
+
+    Returns:
+        The corresponding MessageExtraction, with ambiguity_flags
+        deserialized from its stored JSON representation (or None if the
+        column is NULL).
+    """
+    ambiguity_flags = (
+        json.loads(row["ambiguity_flags"]) if row["ambiguity_flags"] is not None else None
+    )
+    return MessageExtraction(
+        id=row["id"],
+        raw_message_id=row["raw_message_id"],
+        parser_version=row["parser_version"],
+        parse_status=row["parse_status"],
+        confidence=row["confidence"],
+        ambiguity_flags=ambiguity_flags,
+        is_current=bool(row["is_current"]),
+        superseded_at=row["superseded_at"],
+        created_at=row["created_at"],
+    )
+
+
+def create_message_extraction(
+    conn: sqlite3.Connection,
+    raw_message_id: int,
+    parser_version: str,
+    parse_status: str,
+    confidence: float | None = None,
+    ambiguity_flags: list | None = None,
+) -> MessageExtraction:
+    """Insert a new message extraction row, marked as the current one.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_id: FK to raw_messages.id.
+        parser_version: Identifier of the extractor version that produced
+            this attempt.
+        parse_status: One of 'parsed', 'partially_parsed', 'unrecognized',
+            'failed'.
+        confidence: Extraction confidence in [0, 1], or None.
+        ambiguity_flags: List of JSON-serializable flag strings, or None.
+
+    Returns:
+        The newly created MessageExtraction, including its generated id
+        and created_at.
+
+    Raises:
+        ValueError: If parser_version is empty or whitespace-only, or if
+            parse_status is not one of the recognized values.
+        sqlite3.IntegrityError: If raw_message_id does not reference an
+            existing row, or if raw_message_id already has a current
+            (is_current=1) extraction - callers must call
+            supersede_extraction() on the existing current row first.
+    """
+    if not parser_version or not parser_version.strip():
+        raise ValueError("parser_version must not be empty or whitespace-only.")
+    if parse_status not in _MESSAGE_EXTRACTION_PARSE_STATUSES:
+        raise ValueError(
+            f"parse_status must be one of {sorted(_MESSAGE_EXTRACTION_PARSE_STATUSES)}."
+        )
+
+    serialized_flags = (
+        json.dumps(ambiguity_flags, sort_keys=True) if ambiguity_flags is not None else None
+    )
+
+    cursor = conn.execute(
+        "INSERT INTO message_extractions "
+        "(raw_message_id, parser_version, parse_status, confidence, ambiguity_flags, is_current) "
+        "VALUES (?, ?, ?, ?, ?, 1)",
+        (raw_message_id, parser_version, parse_status, confidence, serialized_flags),
+    )
+    row = conn.execute(
+        "SELECT id, raw_message_id, parser_version, parse_status, confidence, "
+        "ambiguity_flags, is_current, superseded_at, created_at "
+        "FROM message_extractions WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_message_extraction(row)
+
+
+def get_current_extraction(
+    conn: sqlite3.Connection,
+    raw_message_id: int,
+) -> MessageExtraction | None:
+    """Look up the current (non-superseded) extraction for a raw message.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_id: FK to raw_messages.id.
+
+    Returns:
+        The matching current MessageExtraction, or None if this raw
+        message has no current extraction.
+    """
+    row = conn.execute(
+        "SELECT id, raw_message_id, parser_version, parse_status, confidence, "
+        "ambiguity_flags, is_current, superseded_at, created_at "
+        "FROM message_extractions WHERE raw_message_id = ? AND is_current = 1",
+        (raw_message_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_message_extraction(row)
+
+
+def supersede_extraction(
+    conn: sqlite3.Connection,
+    extraction_id: int,
+) -> MessageExtraction | None:
+    """Mark an extraction row as no longer current.
+
+    Does not insert a replacement extraction and does not touch
+    raw_messages or trade_signals - orchestrating a full reprocess (marking
+    the old extraction superseded, creating a new one, and re-deriving
+    trade signals) is a later milestone's responsibility.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        extraction_id: Primary key of the extraction to supersede.
+
+    Returns:
+        The updated MessageExtraction, or None if no extraction exists
+        with this id.
+    """
+    conn.execute(
+        "UPDATE message_extractions SET is_current = 0, superseded_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?",
+        (extraction_id,),
+    )
+    row = conn.execute(
+        "SELECT id, raw_message_id, parser_version, parse_status, confidence, "
+        "ambiguity_flags, is_current, superseded_at, created_at "
+        "FROM message_extractions WHERE id = ?",
+        (extraction_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_message_extraction(row)

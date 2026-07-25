@@ -1,0 +1,310 @@
+# Milestone
+
+Recovery Milestone R3 - Extractor Grammar Extension
+(`app/parser.py` additive extension, plus tests; no schema, migration,
+adapter, service, repository, or UI changes)
+
+# Summary
+
+Objective: add a second, independent parsing entry point to
+`app/parser.py` - `extract_trade_event()` - that converts one Discord
+alert's already-segmented `cleaned_text` (as produced by Recovery
+Milestone R2's `app/discord_adapter.segment_discord_batch()`) into a
+single structured trade-event dict, classified into an approved trade
+lifecycle event type. This targets a different input shape than the
+existing `parse_message()` (one signal per independent line): one alert
+that may span several lines - an action line, a duplicated bare
+contract-restatement line, a bare fraction/"ALL OUT" confirmation line,
+a "$OLD -> $NEW (+NN%)" stated-return line, and free-text commentary.
+
+`extract_trade_event()` is fully source-agnostic: it never imports
+`app.discord_adapter` and is a pure function of the text it is given,
+consistent with this module's existing source-independence guarantee.
+It is versioned independently via the new `PARSER_VERSION = "v2"`
+module constant.
+
+## Baseline before R3
+
+Committed and pushed baseline immediately prior to R3:
+`d379183dfc1d48329228f2a45ed65b7aed683f0d`
+("Add Recovery Milestone R2: Discord adapter segmentation and noise
+stripping")
+
+## R3 implementation commit
+
+`1bdda6e464ac3745eb207e9e83203fbd393c10e2`
+("Add Recovery Milestone R3 extractor grammar extension")
+
+Local `main` and `origin/main` are synchronized at this commit
+(0 ahead / 0 behind) as of this handoff.
+
+# Files Modified
+
+Exactly four files, all in the R3 implementation commit:
+
+- `app/parser.py` (modified, +473 lines, 0 removed against the R2
+  baseline - the entire change is additive; `parse_message()` and its
+  private helpers are byte-for-byte unchanged)
+- `tests/discord_corpus_fixture.py` (new, +12 lines) - the real
+  68-message Discord corpus, moved out of
+  `tests/test_discord_adapter.py` into one shared fixture module so it
+  is never independently duplicated between R2's and R3's test suites
+- `tests/test_discord_adapter.py` (modified, +14/-8 lines) - the inline
+  `CORPUS` string constant replaced with
+  `from tests.discord_corpus_fixture import CORPUS`; docstring updated
+  to match; no test logic changed
+- `tests/test_extractor.py` (new, +662 lines) - the full R3 test suite
+
+`app/discord_adapter.py` and every other tracked file are unchanged by
+this milestone.
+
+## Corpus fixture move - identity verification
+
+Before committing, the moved `CORPUS` string was verified
+content-identical to its prior inline source: both the string extracted
+programmatically from HEAD's `tests/test_discord_adapter.py` and the
+new `tests/discord_corpus_fixture.py` copy are 9,555 characters, and a
+direct Python string equality check (`old_corpus == new_corpus`)
+returned `True`. No transcription, retyping, or normalization occurred
+during the move.
+
+## parse_message() unchanged
+
+Confirmed via `git diff <baseline> -- app/parser.py`: the diff against
+the R2 baseline contains zero removed or modified lines anywhere in the
+file - the entire R3 change is additive. `parse_message()`,
+`_parse_line()`, `_normalize_date()`, and the original module-level
+regex constants are byte-for-byte identical to the pre-R3 version.
+
+# Grammar and Semantics
+
+## Supported action verbs
+
+`extract_trade_event()` recognizes exactly these eight verbs
+(case-insensitive on input, preserved uppercase on output, never
+aliased to one another - e.g. `BUY` is never rewritten to `BTO`):
+
+    BOUGHT, SOLD, BTO, STC, BTC, STO, BUY, SELL
+
+## Opening vs. closing role
+
+Classification is by opening/closing role, not by surface "buy/sell"
+wording:
+
+- Opening actions (open a position): BTO, BUY, BOUGHT, STO
+  (STO opens a short position; the other three open a long position)
+- Closing actions (close a position): STC, SELL, SOLD, BTC
+  (BTC closes a short position; the other three close a long position)
+
+## Approved event types
+
+Exactly five event types are ever produced - no other event type exists
+and none may be invented without separate approval:
+
+    ENTRY, ADD, ROLL_UP, PARTIAL_EXIT, FULL_EXIT
+
+Classification rules for a non-contradictory alert:
+
+- Opening action + `[ADD]` annotation -> ADD
+- Opening action + `[ROLL UP]` annotation -> ROLL_UP
+- Opening action, no conflicting closing qualifier -> ENTRY
+- Closing action + `ALL OUT` qualifier -> FULL_EXIT
+- Closing action + a required fraction (1/2, 1/3, 1/4, 1/6, 1/8, 1/16)
+  -> PARTIAL_EXIT
+
+A stop-out (e.g. "HIT STOP") is a FULL_EXIT whose reason is preserved
+verbatim in the `notes` field - it is never treated as a separate event
+type such as a hypothetical "STOP_EXIT".
+
+## STO / BTC semantic correction
+
+An initial implementation placed STO in the same bucket as
+SOLD/STC/SELL/BTC for event-type purposes, which would have
+misclassified "STO ... ALL OUT" or "STO ... 1/2" as an exit - silently
+reporting a brand-new short position as though it were being closed.
+This was identified and corrected before commit:
+
+- STO now classifies via the same annotation-based *opening* rule as
+  BTO/BUY/BOUGHT (there is no approved separate short-entry event type,
+  so a short entry is represented the same way a long entry is).
+- BTC continues to classify via the same qualifier-based *closing* rule
+  as STC/SELL/SOLD, since BTC closes a short position - a closing/exit
+  event, regardless of its "buy" wording.
+
+## action_qualifier_conflict - contradictory opening + closing qualifier
+
+A further, narrower defect was then identified and corrected: an
+opening action combined with a closing-only qualifier (`ALL OUT` or a
+fraction) is semantically contradictory - e.g. "STO ... ALL OUT" cannot
+be an entry, since there is nothing open yet to be "all out" of - and
+no approved event type represents it. This is never guessed into
+ENTRY, ADD, ROLL_UP, PARTIAL_EXIT, or FULL_EXIT.
+
+Resolution:
+- `event_type` is `None` for any opening action (BTO/BUY/BOUGHT/STO)
+  combined with a closing-only qualifier found on the action line
+  itself (`ALL OUT` or a required fraction), whether or not a bracket
+  annotation is also present.
+- A new ambiguity flag, `FLAG_ACTION_QUALIFIER_CONFLICT`
+  (`"action_qualifier_conflict"`), is appended to `ambiguity_flags` so
+  the alert is preserved for manual review rather than silently
+  misclassified. No existing flag represented this condition
+  (`FLAG_QUALIFIER_MISSING` means *absence*, not *conflict*).
+- This is not treated as a parse failure: `action`, `symbol`, `price`,
+  `strike`, `option_type`, the raw qualifier, `notes`, and every other
+  extracted field are retained unchanged, and `parse_status` still
+  reaches `PARSE_STATUS_PARSED` when action/symbol/price were all
+  found - only `event_type` is withheld.
+- This rule applies uniformly to every opening verb, not only STO -
+  BTO/BUY/BOUGHT combined with `ALL OUT` or a fraction is equally
+  contradictory and produces the same `event_type=None` +
+  `FLAG_ACTION_QUALIFIER_CONFLICT` result.
+
+Internally, `_parse_action_line()` now tracks the raw closing qualifier
+(`close_qualifier`) independently of the merged, display-facing
+`qualifier` field, so a conflict is detectable even when an annotation
+is also present on the same line. This is a private-helper-only change;
+the public `extract_trade_event()` result schema
+(`_EXTRACTOR_RESULT_KEYS`) is unchanged.
+
+## Known non-blocking boundary
+
+The `action_qualifier_conflict` detection only inspects the action line
+itself. A hypothetical alert where a contradictory `ALL OUT`/fraction
+qualifier arrived on a *separate* line (rather than the action line)
+would not be caught by this rule, since
+`_is_bare_qualifier_confirmation_line()` treats such follow-up lines as
+duplicate confirmations to discard, not as classification input. No
+such shape exists anywhere in the current 68-message corpus or in the
+authorized R3 grammar, so this is recorded as a known boundary for
+future review, not a defect blocking R3.
+
+# Tests Executed
+
+Focused command:
+    python -m unittest tests.test_extractor tests.test_discord_adapter -v
+Result: 136 tests, OK (0 failures/errors)
+
+Full suite command:
+    python -m unittest discover -s tests -v
+Result: 628 tests, OK (0 failures/errors)
+
+Coverage highlights in `tests/test_extractor.py`:
+- Action recognition and non-aliasing for all eight supported verbs
+- Contract fields: call/put letter and word forms, decimal strikes,
+  price forms ($.91, $.40, $3, $0.68, always Decimal never float)
+- Required position fractions (1/2, 1/3, 1/4, 1/6, 1/8, 1/16) and
+  rejection of an unsupported fraction (e.g. 1/5)
+- ALL OUT qualifier and the "HIT STOP" note-not-separate-type case
+- Bracket annotations ([SMALL], [ADD], [ROLL UP], [B GRADE]) including
+  internal-space survival
+- Duplicate contract-restatement and bare qualifier confirmation lines
+  correctly suppressed (never double-counted)
+- Free-text notes capture and multi-line note ordering
+- Stated "$OLD -> $NEW (+NN%)" entry price / return percentage capture,
+  including the negative-return case and the missing-stated-return
+  ambiguity flag
+- parse_status transitions (PARSED / PARTIALLY_PARSED / UNRECOGNIZED)
+  and the never-raises guarantee (garbage input, None input)
+- Expiration: bare MM/DD preserved raw and flagged; explicit-year dates
+  resolved and not flagged
+- Source independence: `app/parser.py` contains no import of
+  `app.discord_adapter`
+- STO/BTC opening-vs-closing classification (dedicated
+  `ExtractTradeEventOpenCloseLifecycleTests`), including:
+  - STO + ALL OUT and STO + fraction both preserved as ambiguous
+    (`event_type is None`, `FLAG_ACTION_QUALIFIER_CONFLICT` present)
+  - BTO + ALL OUT and BOUGHT + ALL OUT and BUY + fraction likewise
+    preserved as ambiguous
+  - Normal STO (no closing qualifier) remains ENTRY; STO [ADD] remains
+    ADD; STO [ROLL UP] remains ROLL_UP
+  - BTC + ALL OUT remains FULL_EXIT; BTC + fraction remains
+    PARTIAL_EXIT; BTC never treated as an entry
+  - STC/SOLD exit behavior and BTO/BUY/BOUGHT entry behavior confirmed
+    unaffected by the STO/BTC and conflict-detection corrections
+  - Contradictory-case field preservation (action, symbol, strike,
+    option_type, price, qualifier, notes all intact) and parse_status
+    contract (still PARSED, `FLAG_QUALIFIER_MISSING` absent)
+- `FullCorpusExtractionAcceptanceTests`: the complete real 68-message
+  corpus run through the full adapter -> extractor pipeline, with a
+  hand-derived, cross-checked expected-value table asserting every
+  field for all 68 messages; every message reaches PARSE_STATUS_PARSED;
+  event-type distribution across the real corpus: 10 ENTRY, 1 ADD,
+  7 ROLL_UP, 36 PARTIAL_EXIT, 14 FULL_EXIT (68 total); exactly 2 of the
+  68 real alerts are flagged `FLAG_STATED_RETURN_MISSING` (messages 13
+  and 34, the only two lacking a price-arrow line)
+
+# Review Status
+
+Reviewed and corrected across three review passes before commit:
+1. Initial R3 implementation review identified the STO-treated-as-exit
+   defect (STO placed in the same set as SOLD/STC/BTC/SELL) - corrected
+   by splitting action verbs into opening/closing sets.
+2. Follow-up review identified that the fix was directionally correct
+   but incomplete: STO/BTO/BUY/BOUGHT combined with a closing-only
+   qualifier still silently fell through to ENTRY instead of being
+   preserved as ambiguous - corrected via `close_qualifier` tracking,
+   `event_type=None`, and the new `FLAG_ACTION_QUALIFIER_CONFLICT` flag,
+   applied uniformly to all four opening verbs.
+3. Final review confirmed: complete diff limited to the four approved
+   files; `app/discord_adapter.py` and all other tracked files
+   untouched; `parse_message()` byte-for-byte unchanged; corpus fixture
+   content-identical to its prior source; 136/136 focused and 628/628
+   full-suite tests passing; no R4 (lifecycle/database/service-layer)
+   work present.
+
+# Git Commit
+
+Implementation commit `1bdda6e464ac3745eb207e9e83203fbd393c10e2`
+("Add Recovery Milestone R3 extractor grammar extension") committed
+locally and pushed to `origin/main` as a normal fast-forward
+(`d379183..1bdda6e`). No Co-Authored-By trailer. No tag was created or
+moved as part of this milestone. Local `main` and `origin/main` are
+synchronized at this commit (0 ahead / 0 behind), confirmed via a fresh
+`git fetch origin` after the push.
+
+All 11 pre-existing untracked entries (`CLAUDE.md`,
+`docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/DECISION_TEMPLATE.md`,
+`docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and the `app/__pycache__/`,
+`database/__pycache__/`, `tests/__pycache__/` directories) were
+preserved untouched throughout implementation, review, correction,
+commit, and push.
+
+# Known Limitations
+
+- The real 68-message corpus contains no STO, BTC, or
+  action-qualifier-conflict alerts, so the STO/BTC classification and
+  the `action_qualifier_conflict` correction are validated only by
+  synthetic unit tests, not by the corpus acceptance suite.
+- See "Known non-blocking boundary" above: a contradictory qualifier
+  arriving on a line separate from the action line is not currently
+  detected. No such shape exists in the current corpus or authorized
+  grammar.
+- `docs/PROJECT_STATUS.md` was intentionally left unmodified by this
+  milestone - see Notes below.
+
+# Next Milestone
+
+Not yet approved/scoped. Recovery Milestone R4 has not started; no
+lifecycle-aggregation, database-integration, or UI work exists beyond
+this grammar-extraction milestone. Any R4 work requires its own
+separate design approval before implementation begins.
+
+# Notes
+
+`docs/PROJECT_STATUS.md` documents the pre-Recovery `2D.x` / `v0.1.0`
+milestone track and was frozen as of Milestone 2D.7 pending explicit
+Product Owner release approval. Neither Recovery Milestone R1
+(`c1c6281`) nor R2 (`d379183`) modified `docs/PROJECT_STATUS.md` or
+added a `docs/HANDOFFS/` entry - both landed as direct implementation
+commits without a companion status-file update, establishing the
+Recovery track's actual documentation practice to date. Consistent with
+that precedent, this handoff deliberately does not modify
+`docs/PROJECT_STATUS.md`; this file is the first `docs/HANDOFFS/` entry
+written for the Recovery (`R`) track. Whether/how the Recovery track
+should be folded into `docs/PROJECT_STATUS.md` going forward is a
+documentation-workflow question for the Product Owner / Technical
+Architect, not a decision made unilaterally here.

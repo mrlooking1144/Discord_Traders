@@ -1,0 +1,377 @@
+# Milestone
+
+Recovery Milestone R4 - Date and Time Resolution
+(new `app/datetime_resolution.py` module, plus tests, plus one direct
+dependency addition; no schema, migration, parser, adapter, service,
+repository, or UI changes)
+
+# Summary
+
+Objective: deterministic date/time resolution only, per the approved
+Recovery Milestone Plan (`serene-stargazing-shamir.md`) §11 - "R4 - Date/
+time resolution: reference_date/timezone plumbing, documented MM/DD-year
+rule, 'Today at HH:MM م' conversion." R4 resolves the verbatim, unresolved
+values produced by the earlier Recovery milestones: R3's
+`extract_trade_event()` `expiration_raw` (a bare M/D or MM/DD token with no
+year), and R2's `segment_discord_batch()` `SegmentedMessage` footer
+timestamp text/`footer_timestamp_kind`. Both are resolved into concrete
+values only when an explicit `reference_date` (and, for timestamps, an
+explicit IANA `timezone`) is supplied by the caller - the wall clock is
+never read anywhere in this milestone.
+
+R4 adds exactly one new module, `app/datetime_resolution.py`, exposing two
+pure, independent, never-raising public functions:
+
+- `resolve_expiration(expiration_raw, reference_date) -> ExpirationResolution`
+- `resolve_footer_timestamp(footer_timestamp_raw, footer_timestamp_kind, reference_date, timezone) -> TimestampResolution`
+
+Neither function imports `app.parser`, `app.discord_adapter`, or any
+`database`/service/repository/UI module. `footer_timestamp_kind` is
+accepted only by its string-value contract with `app.discord_adapter`'s
+four kind values (`relative_today`, `relative_yesterday`, `explicit_date`,
+`unrecognized`) - `app.discord_adapter` itself is never imported, so this
+module stays independently testable and introduces no new inter-module
+coupling.
+
+## Baseline before R4
+
+Committed and pushed baseline immediately prior to R4:
+`df7283892e960e33b9d56046c094cbb21e3fe464`
+("Add Recovery Milestone R3 handoff")
+
+## R4 implementation commit
+
+`1cfe1f9b46098e712c429a76c56bddce0aea5d88`
+("Add Recovery Milestone R4 date and time resolution")
+
+Local `main` and `origin/main` are synchronized at this commit
+(0 ahead / 0 behind) as of this handoff, confirmed via a fresh
+`git fetch origin` after the push.
+
+# Files Modified
+
+Exactly three files, all in the R4 implementation commit:
+
+- `app/datetime_resolution.py` (new, 598 lines) - `resolve_expiration()`,
+  `resolve_footer_timestamp()`, the `ExpirationResolution` and
+  `TimestampResolution` frozen dataclasses, and all nine R4 flags
+- `tests/test_datetime_resolution.py` (new, 541 lines) - the full R4 test
+  suite, 68 tests
+- `requirements.txt` (modified, +1 line) - adds `tzdata==2026.3` as a
+  direct dependency (see "Windows timezone-data dependency" below)
+
+`app/parser.py` (including `PARSER_VERSION`), `app/discord_adapter.py`,
+`app/streamlit_app.py`, `start.bat`, every file under `database/` (schema,
+migrations, models, db, repository, service, config, backup,
+logging_config), and every other tracked file are unchanged by this
+milestone.
+
+## Windows timezone-data dependency
+
+Python's `zoneinfo` module does not itself ship the IANA time zone
+database, and Windows provides no OS-level source for it. Verification
+during planning found `tzdata` already present in the development
+environment, but only transitively - via `streamlit` (declared in
+`requirements.txt`) depending on `pandas`, which in turn depends on
+`tzdata`. Relying on that chain was judged unreliable for a clean Windows
+install, since it depends entirely on `streamlit`/`pandas` continuing to
+declare `pandas`/`tzdata` as dependencies. `tzdata==2026.3` was therefore
+added to `requirements.txt` as an explicit, direct, exactly-pinned
+dependency, following the file's existing exact-pin convention
+(`streamlit==1.59.2`). `start.bat` was inspected and confirmed to already
+install `requirements.txt` correctly (`pip install -r requirements.txt`
+on first run / whenever `streamlit` is not yet importable in the venv) -
+no defect was found, so `start.bat` itself was not modified.
+
+# Result Contract
+
+## ExpirationResolution / TimestampResolution (frozen dataclasses)
+
+    ExpirationResolution:
+        expiration_raw: str | None          (original input, preserved exactly)
+        resolved_expiration: str | None     (ISO8601 "YYYY-MM-DD", or None)
+        ambiguity_flags: tuple[str, ...]    (empty only when resolved)
+
+    TimestampResolution:
+        footer_timestamp_raw: str | None    (original input, preserved exactly)
+        footer_timestamp_kind: str | None   (original input, preserved exactly)
+        resolved_timestamp: datetime | None (timezone-aware, or None)
+        ambiguity_flags: tuple[str, ...]    (empty only when resolved)
+
+Both dataclasses are `@dataclass(frozen=True)`, matching the existing
+`app/discord_adapter.SegmentedMessage` precedent for this pure-function
+layer, rather than the repository layer's dict-row convention (which does
+not apply here, since this module has no database boundary).
+
+## All nine R4 flags (exact string values)
+
+    FLAG_EXPIRATION_INVALID_FORMAT           = "expiration_invalid_format"
+    FLAG_EXPIRATION_UNSUPPORTED_FORMAT       = "expiration_unsupported_format"
+    FLAG_EXPIRATION_INVALID_CALENDAR_DATE    = "expiration_invalid_calendar_date"
+    FLAG_INVALID_REFERENCE_DATE              = "invalid_reference_date"
+    FLAG_INVALID_TIMEZONE                    = "invalid_timezone"
+    FLAG_FOOTER_TIMESTAMP_UNRECOGNIZED       = "footer_timestamp_unrecognized"
+    FLAG_INVALID_FOOTER_TIME                 = "invalid_footer_time"
+    FLAG_EXPLICIT_DATE_UNSUPPORTED_FORMAT    = "explicit_date_unsupported_format"
+    FLAG_DATETIME_RESOLUTION_INTERNAL_ERROR  = "datetime_resolution_internal_error"
+
+`FLAG_INVALID_REFERENCE_DATE` and `FLAG_DATETIME_RESOLUTION_INTERNAL_ERROR`
+are shared between both functions; the remaining seven are specific to
+either `resolve_expiration()` (three) or `resolve_footer_timestamp()`
+(four).
+
+## Never-raising behavior and internal-error isolation
+
+Both public functions wrap their entire body in one outer
+`except Exception`, distinct from the specific, anticipated
+`except ValueError` blocks used internally for calendar/datetime
+construction. The outer safety net is reserved exclusively for genuinely
+unexpected internal errors and returns `ambiguity_flags ==
+(FLAG_DATETIME_RESOLUTION_INTERNAL_ERROR,)` and `resolved_* = None` -
+never combined with, or substituted for, any input-defect flag - with the
+original raw input(s) always preserved unchanged, since the return value
+is built from the function's original parameters rather than any
+partially-computed local state. Neither function can raise under any
+input.
+
+## No wall-clock usage
+
+`reference_date` and `timezone` are always caller-supplied, explicit
+arguments. Neither function calls `datetime.now()`, `datetime.utcnow()`,
+`date.today()`, `time.time()`, or any equivalent - verified both by
+source inspection (no such call exists anywhere in
+`app/datetime_resolution.py`) and by dedicated tests that substitute
+`date`/`datetime` name bindings with subclasses whose `today()`/`now()`
+raise, then assert the normal expected result is still produced unchanged.
+
+# Expiration Resolution Rule
+
+`resolve_expiration()` accepts only a bare `M/D` or `MM/DD` token (no
+year) and an explicit, strictly-validated `reference_date`
+("YYYY-MM-DD"):
+
+1. The first candidate is built using `reference_date.year`.
+2. If that candidate is more than 30 days before `reference_date`, the
+   candidate is rebuilt using `reference_date.year + 1`.
+3. Otherwise (including exactly 30 days before, and including any
+   candidate on or after `reference_date`) `reference_date.year` is kept
+   unchanged.
+
+Corrected worked examples (verified against the implementation):
+
+    reference_date=2026-07-24, expiration_raw=6/24  -> 2026-06-24  (exactly 30 days before - no roll)
+    reference_date=2026-07-24, expiration_raw=6/23  -> 2027-06-23  (exactly 31 days before - rolls)
+    reference_date=2026-12-31, expiration_raw=1/05  -> 2027-01-05  (year-end rollover)
+    reference_date=2026-01-05, expiration_raw=12/20 -> 2026-12-20  (candidate after reference_date - stays in reference year)
+
+An invalid calendar date (impossible month/day, an invalid leap day, or a
+leap-day candidate whose rolled-forward year is not itself a leap year)
+returns `FLAG_EXPIRATION_INVALID_CALENDAR_DATE`. A year-bearing input
+(e.g. `"07/24/2026"`) is out of this function's supported grammar and
+returns `FLAG_EXPIRATION_UNSUPPORTED_FORMAT`. Malformed, blank, or `None`
+input returns `FLAG_EXPIRATION_INVALID_FORMAT`. An invalid
+`reference_date` returns `FLAG_INVALID_REFERENCE_DATE` and is checked
+before `expiration_raw` is evaluated at all. No valid input is silently
+rejected or guessed.
+
+# Footer Timestamp Resolution Rule
+
+`resolve_footer_timestamp()` accepts `footer_timestamp_kind` values
+`relative_today`, `relative_yesterday`, or `explicit_date`; any other
+value (including `None` and the literal string `"unrecognized"`) returns
+`FLAG_FOOTER_TIMESTAMP_UNRECOGNIZED`. `reference_date` is validated first
+(`FLAG_INVALID_REFERENCE_DATE` if invalid), then `timezone` is resolved
+via `zoneinfo.ZoneInfo` against a valid IANA name (`FLAG_INVALID_TIMEZONE`
+if not).
+
+- `relative_today`/`relative_yesterday`: `"Today"`/`"Yesterday"` matching
+  is case-insensitive, and the matched word must agree with the supplied
+  kind (a mismatch, e.g. kind=`relative_today` paired with text starting
+  `"Yesterday"`, returns `FLAG_INVALID_FOOTER_TIME`). `Yesterday` resolves
+  to `reference_date` minus one day via plain date subtraction, correctly
+  crossing month and year boundaries.
+- Meridiem: `ص` = AM, `م` = PM (the authoritative, corrected
+  interpretation of the source recovery plan's ambiguous phrasing,
+  `"meridiem (`م`/`ص` treated as `pm`/`am`)"`). English `AM`/`PM` is
+  matched case-insensitively. `12:00 AM` resolves to hour 0; `12:00 PM`
+  resolves to hour 12. When no meridiem suffix is present, the hour is
+  interpreted using a 24-hour clock (0-23). This applies both to relative
+  Today/Yesterday timestamps and to authorized explicit-date forms 4 and 5.
+  Hours and minutes are range-validated in every case
+  (`FLAG_INVALID_FOOTER_TIME` on any out-of-range value).
+- `resolved_timestamp` is always timezone-aware, constructed with the
+  caller-supplied `zoneinfo.ZoneInfo`.
+
+## Explicit-date grammar - exactly five authorized forms
+
+    1. M/D/YYYY H:MM AM|PM
+    2. M/D/YYYY, H:MM AM|PM
+    3. M/D/YY H:MM AM|PM
+    4. M/D/YYYY H:MM            (no meridiem, 24-hour clock)
+    5. M/D/YY H:MM              (no meridiem, 24-hour clock)
+
+Two-digit years are interpreted as `2000 + YY`, matching `app/parser.py`'s
+existing convention. Explicit-date meridiem is English-only (`AM`/`PM`,
+case-insensitive) - unlike the relative form, no explicit-date form
+authorizes `ص`/`م`.
+
+Each of the five forms is implemented as its own fully independent
+compiled regex (`_EXPLICIT_FORM_YEAR4_RE`, `_EXPLICIT_FORM_YEAR4_COMMA_RE`,
+`_EXPLICIT_FORM_YEAR2_RE`, `_EXPLICIT_FORM_YEAR4_NO_MERIDIEM_RE`,
+`_EXPLICIT_FORM_YEAR2_NO_MERIDIEM_RE`), tried in that order - not three
+independently-optional components (comma / year-length / meridiem)
+combined into one pattern. This deliberately excludes three combinations
+that an independently-optional-component regex would otherwise silently
+accept; each is confirmed to return `FLAG_EXPLICIT_DATE_UNSUPPORTED_FORMAT`:
+
+    M/D/YY, H:MM AM|PM   (two-digit year + comma + meridiem)
+    M/D/YYYY, H:MM       (four-digit year + comma + no meridiem)
+    M/D/YY, H:MM         (two-digit year + comma + no meridiem)
+
+An unsupported shape (matches none of the five forms) is distinguished
+from a supported shape carrying invalid values (e.g. `"13/40/2026 11:45
+PM"`, or an hour outside 1-12 with a meridiem present): the former returns
+`FLAG_EXPLICIT_DATE_UNSUPPORTED_FORMAT`, the latter returns
+`FLAG_INVALID_FOOTER_TIME`.
+
+# Tests Executed
+
+Focused command:
+    python -m unittest tests.test_datetime_resolution -v
+Result: 68 tests, OK (0 failures/errors)
+
+Full suite command:
+    python -m unittest discover -s tests -v
+Result: 696 tests, OK (0 failures/errors) = 628 pre-existing + 68 new
+
+All 628 pre-existing tests are preserved unmodified and passing; no
+existing test file was changed by this milestone.
+
+Coverage highlights in `tests/test_datetime_resolution.py`:
+- The four corrected worked examples for the 30/31-day rollover rule
+- Same-day, leap-year-valid, invalid-leap-day, leap-rollover-into-
+  non-leap-year, impossible-month/day, and year-bearing-unsupported
+  expiration cases
+- `None`/blank/malformed `expiration_raw` and `reference_date` inputs
+- `ص`/`م`/English-AM/English-PM/lowercase-Today/lowercase-Yesterday
+  meridiem and day-word cases; 12:00 AM and 12:00 PM; no-meridiem
+  24-hour parsing; Yesterday crossing month and year boundaries;
+  invalid hour/minute (including an hour-only-invalid case isolated
+  from a combined hour-and-minute-invalid case, added during review to
+  close a coverage gap - see "Review Status"); kind/text mismatch
+- All five authorized explicit-date forms, each with its own dedicated
+  test, plus dedicated negative tests for each of the three unauthorized
+  comma combinations, each asserting `resolved_timestamp is None`,
+  the exact `FLAG_EXPLICIT_DATE_UNSUPPORTED_FORMAT` flag, and both raw
+  inputs preserved
+- Invalid IANA timezone, unrecognized kind, and a valid-zone check
+  asserting the exact `ZoneInfo` key on the resolved result
+- Deterministic repeated-call equality for both functions
+- Dedicated "never reads the wall clock" tests (substituting `date`/
+  `datetime` name bindings with subclasses whose `today()`/`now()` raise)
+- Dedicated internal-error tests (mocking `_construct_calendar_date`/
+  `_construct_aware_datetime` to raise `RuntimeError`, a type not caught
+  by either function's own anticipated `except ValueError`) confirming
+  the exception never propagates, `resolved_* is None`,
+  `ambiguity_flags == (FLAG_DATETIME_RESOLUTION_INTERNAL_ERROR,)`
+  exactly, and both raw inputs are preserved - covering both the
+  relative and explicit-date dispatch branches separately
+
+# Review Status
+
+Reviewed and corrected across two review passes before commit:
+
+1. A full quality review of the initial implementation found one test
+   coverage gap: an "invalid hour, no meridiem" test used a fixture
+   ("25:99") whose invalid minute short-circuited validation before the
+   hour-range branch it was meant to test was ever reached. Corrected by
+   isolating a dedicated hour-only-invalid test with an independently
+   valid minute.
+2. The same review found the explicit-date regex combined comma,
+   year-length, and meridiem as three independently-optional components,
+   accepting 8 combinations against the 5 named in the approved
+   contract - a blocking defect, since the contract explicitly prohibited
+   silently adding other formats. Corrected by rewriting the grammar as
+   five separate, fully independent compiled regexes (see "Explicit-date
+   grammar" above), with three dedicated negative tests confirming the
+   previously-accepted, now-unauthorized combinations are rejected.
+   Fixed a related latent bug this refactor would otherwise have
+   introduced: extracting the meridiem group unconditionally would raise
+   `IndexError` on the two no-meridiem forms, which have no such named
+   group at all; corrected to a safe `groupdict().get()` lookup.
+
+Final review confirmed: complete diff limited to the three approved
+files; `app/parser.py`, `PARSER_VERSION`, `app/discord_adapter.py`,
+`start.bat`, and every `database/`/service/repository/schema/migrations/
+UI file untouched; `requirements.txt` contains exactly the two expected
+lines; 68/68 focused and 696/696 full-suite tests passing; no R5
+(ingestion, checkpoints, lifecycle linking, analytics, UI) work present.
+
+# Git Commit
+
+Implementation commit `1cfe1f9b46098e712c429a76c56bddce0aea5d88`
+("Add Recovery Milestone R4 date and time resolution") committed locally
+and pushed to `origin/main` as a normal fast-forward (`df72838..1cfe1f9`).
+No Co-Authored-By trailer; commit body is empty. No tag was created or
+moved as part of this milestone. Local `main` and `origin/main` are
+synchronized at this commit (0 ahead / 0 behind), confirmed via a fresh
+`git fetch origin` after the push.
+
+All 11 pre-existing untracked entries (`CLAUDE.md`,
+`docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/DECISION_TEMPLATE.md`,
+`docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and the `app/__pycache__/`,
+`database/__pycache__/`, `tests/__pycache__/` directories) were preserved
+untouched throughout planning, implementation, review, correction,
+commit, and push.
+
+# Known Limitations
+
+- The rollover threshold (30/31 days) and the leap-day-rollover-into-
+  non-leap-year edge case are validated only by synthetic unit tests, not
+  against the real 68-message corpus, which contains no such cases -
+  consistent with the same limitation R3 recorded for its own STO/BTC
+  synthetic-only coverage.
+- `resolve_footer_timestamp()`'s handling of `SegmentedMessage`'s rare
+  footer-missing fallback (`header_timestamp_raw`, which R2 never
+  classifies with a `footer_timestamp_kind`) remains explicitly out of
+  scope: calling with `footer_timestamp_kind=None` correctly yields
+  `FLAG_FOOTER_TIMESTAMP_UNRECOGNIZED`, but no dedicated test targets
+  that specific provenance, since it is not part of R4's authorized
+  contract and no such case exists in the real corpus.
+- `docs/PROJECT_STATUS.md` was intentionally left unmodified by this
+  milestone - see Notes below.
+
+# Next Milestone
+
+Not yet approved/scoped. Recovery Milestone R5 has not started; no
+idempotent-ingestion, `ingest_batch()`, reprocessing, or channel-
+checkpoint work exists beyond this date/time-resolution milestone. Any
+R5 work requires its own separate design approval before implementation
+begins.
+
+R4 alone does not make the recovered workflow user-ready: it produces two
+standalone, tested, pure resolution functions with no caller yet - it
+does not persist anything, does not wire into `TradeService`, and does
+not touch the UI. Per the approved recovery roadmap
+(`serene-stargazing-shamir.md` §11), R5 (idempotent ingestion,
+`ingest_batch()`, reprocessing, channel checkpoints), R6 (lifecycle
+linking - `trade_lifecycles`), R7 (trader performance analytics), R8
+(UI - batch import, checkpoint view, unresolved-message review, lifecycle
+review, trader performance dashboard), and R9 (docs/release prep, new
+version tag) all remain outstanding before a user can exercise the
+recovered pipeline manually end-to-end.
+
+# Notes
+
+Consistent with the Recovery track's established documentation practice
+(neither R1 nor R2 modified `docs/PROJECT_STATUS.md`; R3 was the first
+`docs/HANDOFFS/` entry and likewise left it untouched), this handoff
+deliberately does not modify `docs/PROJECT_STATUS.md`, which continues to
+document the pre-Recovery `2D.x`/`v0.1.0` milestone track, frozen as of
+Milestone 2D.7 pending explicit Product Owner release approval. Whether/
+how the Recovery track should be folded into `docs/PROJECT_STATUS.md`
+going forward remains a documentation-workflow question for the Product
+Owner / Technical Architect, not a decision made unilaterally here.

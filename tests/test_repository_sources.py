@@ -19,6 +19,7 @@ from database.db import get_connection, initialize_database
 from database.models import RawMessage, Source, Trader, TradeSignal, TradeSignalEdit
 from database import repository
 from database.repository import (
+    create_message_extraction,
     create_raw_message,
     create_trade_signal,
     create_trade_signal_edit,
@@ -33,6 +34,7 @@ from database.repository import (
     get_trade_signals_matching,
     get_trader_by_external_id,
     get_traders_by_name,
+    supersede_extraction,
     update_trade_signal,
 )
 
@@ -1833,6 +1835,96 @@ class TradeSignalsForReviewRepositoryTests(unittest.TestCase):
 
         self.assertNotIn("duplicate_warning", results[0])
         self.assertNotIn("duplicate_warnings", results[0])
+
+    # -----------------------------------------------------------------
+    # Recovery Milestone R5: current-vs-superseded extraction filtering.
+    # -----------------------------------------------------------------
+
+    def _create_signal_with_extraction(self, parse_status="parsed", symbol="SPY"):
+        raw_message = create_raw_message(self.connection, self.discord_id, "BTO SPY 500c")
+        extraction = create_message_extraction(
+            self.connection, raw_message.id, "v2", parse_status
+        )
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            self.alice.id,
+            symbol,
+            "BTO",
+            extraction_id=extraction.id,
+        )
+        self.connection.commit()
+        return raw_message, extraction, signal
+
+    def test_superseded_extraction_signal_excluded_by_default(self):
+        _, extraction, signal = self._create_signal_with_extraction()
+
+        supersede_extraction(self.connection, extraction.id)
+        self.connection.commit()
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertNotIn(signal.id, {row["id"] for row in results})
+
+    def test_current_extraction_signal_included(self):
+        _, _, signal = self._create_signal_with_extraction()
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertIn(signal.id, {row["id"] for row in results})
+
+    def test_legacy_extraction_id_null_signal_always_current(self):
+        # No extraction_id at all - the compatibility rule for every
+        # pre-R5/legacy-path (unmodified TradeService.ingest_message())
+        # row: nothing to be superseded by, so it is always current.
+        signal = self._create_signal()
+
+        results = get_trade_signals_for_review(self.connection)
+
+        self.assertIn(signal.id, {row["id"] for row in results})
+
+    def test_new_extraction_signal_visible_after_supersession(self):
+        raw_message, extraction, old_signal = self._create_signal_with_extraction()
+        supersede_extraction(self.connection, extraction.id)
+        new_extraction = create_message_extraction(
+            self.connection, raw_message.id, "v2", "parsed"
+        )
+        new_signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            self.alice.id,
+            "SPY",
+            "BTO",
+            extraction_id=new_extraction.id,
+        )
+        self.connection.commit()
+
+        results = get_trade_signals_for_review(self.connection)
+        ids = {row["id"] for row in results}
+
+        self.assertNotIn(old_signal.id, ids)
+        self.assertIn(new_signal.id, ids)
+
+    def test_join_does_not_duplicate_rows(self):
+        # message_extractions.id is that table's primary key, so the LEFT
+        # JOIN keyed on it can match at most one row per
+        # trade_signals.extraction_id - proven here directly, not just
+        # asserted structurally.
+        _, _, signal = self._create_signal_with_extraction()
+
+        results = get_trade_signals_for_review(self.connection)
+
+        matching = [row for row in results if row["id"] == signal.id]
+        self.assertEqual(len(matching), 1)
+
+    def test_superseded_signal_still_excluded_when_combined_with_filters(self):
+        _, extraction, signal = self._create_signal_with_extraction(symbol="AAPL")
+        supersede_extraction(self.connection, extraction.id)
+        self.connection.commit()
+
+        results = get_trade_signals_for_review(self.connection, symbol="AAPL")
+
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":

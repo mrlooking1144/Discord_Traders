@@ -11,32 +11,107 @@ controlled-correction mode (expected_current_values), and the new
 list_trade_signal_audit_history() read-only delegation.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import get_type_hints
 from unittest.mock import patch
 
+from app.discord_adapter import segment_discord_batch
 from database import repository
 from database.config import DatabaseConfig
 from database.db import get_connection, initialize_database
+from database.models import (
+    BatchIngestResult,
+    ChannelCheckpoint,
+    MessageIngestOutcome,
+    ReprocessBatchResult,
+    ReprocessOutcome,
+)
 from database.repository import (
     create_raw_message,
     create_trade_signal,
     create_trader,
+    get_current_extraction,
+    get_import_batch_by_id,
     get_or_create_source,
+    get_raw_message_by_id,
     get_trade_signal_edits,
+    get_traders_by_canonical_name,
 )
 from database.service import (
+    AMBIGUITY_FLAG_INVALID_NATIVE_TIMESTAMP,
+    AMBIGUITY_FLAG_TRADER_IDENTITY_AMBIGUOUS,
+    AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING,
     DUPLICATE_WINDOW_MINUTES,
     AuditHistoryError,
+    ReprocessingNotSupportedError,
     StaleTradeSignalError,
     TradeService,
     TradeSignalNotFoundError,
+    _resolve_external_id,
 )
+from tests.discord_corpus_fixture import CORPUS
+
+
+class _FailingConnection(sqlite3.Connection):
+    """Test-only sqlite3.Connection subclass that can inject a controlled
+    failure at BEGIN IMMEDIATE, COMMIT, rollback(), or a raw SQL ROLLBACK.
+
+    A live sqlite3.Connection instance's execute/commit/rollback methods
+    cannot be patched directly (they are read-only C-level attributes), so
+    this subclass - constructed via sqlite3.connect(..., factory=...) -
+    is the mechanism used to exercise TradeService._r5_write_transaction's
+    documented failure points. fail_on_rollback (the rollback() method) and
+    fail_on_rollback_sql (a raw SQL "ROLLBACK" statement, issued by
+    TradeService._cleanup_failed_r5_transaction()'s fallback) are
+    independently injectable, so both the "rollback() fails but the SQL
+    fallback succeeds" and "both fail" cleanup paths can be exercised.
+    """
+
+    fail_on_begin = False
+    fail_on_commit = False
+    fail_on_rollback = False
+    fail_on_rollback_sql = False
+    rollback_called = False
+    rollback_sql_called = False
+
+    def execute(self, sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE" and self.fail_on_begin:
+            raise sqlite3.OperationalError("simulated BEGIN IMMEDIATE failure")
+        if sql == "ROLLBACK":
+            self.rollback_sql_called = True
+            if self.fail_on_rollback_sql:
+                raise sqlite3.OperationalError("simulated SQL ROLLBACK failure")
+        return super().execute(sql, *args, **kwargs)
+
+    def commit(self):
+        if self.fail_on_commit:
+            raise sqlite3.OperationalError("simulated COMMIT failure")
+        return super().commit()
+
+    def rollback(self):
+        self.rollback_called = True
+        if self.fail_on_rollback:
+            raise sqlite3.OperationalError("simulated ROLLBACK failure")
+        return super().rollback()
+
+
+def _open_failing_connection(config: DatabaseConfig) -> _FailingConnection:
+    """Mirrors database.db.get_connection()'s setup, using _FailingConnection
+    as the connection factory. database/db.py itself is never modified."""
+    connection = sqlite3.connect(
+        config.db_path, timeout=config.busy_timeout_seconds, factory=_FailingConnection
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
 
 
 class TradeServiceCheckDuplicateSignalTests(unittest.TestCase):
@@ -1248,6 +1323,1565 @@ class TradeServiceAuditHistoryTests(unittest.TestCase):
 
         with self.assertRaises(AuditHistoryError):
             self.service.list_trade_signal_audit_history(self.signal_id)
+
+
+# =============================================================================
+# Recovery Milestone R5
+# =============================================================================
+
+
+class _R5ServiceTestCase(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _counts(self):
+        return {
+            table: self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "import_batches", "raw_messages", "message_extractions",
+                "trade_signals", "traders",
+            )
+        }
+
+
+class R5ResultDataclassFieldTests(unittest.TestCase):
+    """Item 1: exact fields/defaults of all five result dataclasses."""
+
+    def test_message_ingest_outcome_fields_and_defaults(self):
+        names = [f.name for f in fields(MessageIngestOutcome)]
+        self.assertEqual(
+            names,
+            [
+                "sequence_in_batch", "outcome", "channel_id", "raw_message_id",
+                "external_id", "parse_status", "trade_signal_ids",
+                "ambiguity_flags", "content_differs",
+            ],
+        )
+        outcome = MessageIngestOutcome(
+            sequence_in_batch=1, outcome="stored", channel_id=1, raw_message_id=1,
+            external_id="ext-1", parse_status="parsed",
+        )
+        self.assertEqual(outcome.trade_signal_ids, [])
+        self.assertEqual(outcome.ambiguity_flags, [])
+        self.assertIsNone(outcome.content_differs)
+
+    def test_message_ingest_outcome_default_lists_are_independent_per_instance(self):
+        first = MessageIngestOutcome(1, "stored", 1, 1, "e", "parsed")
+        second = MessageIngestOutcome(2, "stored", 1, 2, "f", "parsed")
+        first.trade_signal_ids.append(99)
+        self.assertEqual(second.trade_signal_ids, [])
+
+    def test_message_ingest_outcome_is_frozen(self):
+        outcome = MessageIngestOutcome(1, "stored", 1, 1, "e", "parsed")
+        with self.assertRaises(Exception):
+            outcome.outcome = "duplicate"
+
+    def test_batch_ingest_result_fields_and_defaults(self):
+        names = [f.name for f in fields(BatchIngestResult)]
+        self.assertEqual(
+            names,
+            [
+                "import_batch_id", "channel_id", "total_segmented", "stored_count",
+                "duplicate_count", "unrecognized_count", "failed_count", "messages",
+            ],
+        )
+        result = BatchIngestResult(
+            import_batch_id=None, channel_id=1, total_segmented=0, stored_count=0,
+            duplicate_count=0, unrecognized_count=0, failed_count=0,
+        )
+        self.assertEqual(result.messages, [])
+
+    def test_reprocess_outcome_fields_and_defaults(self):
+        names = [f.name for f in fields(ReprocessOutcome)]
+        self.assertEqual(
+            names,
+            [
+                "raw_message_id", "previous_extraction_id", "new_extraction_id",
+                "parse_status", "new_trade_signal_ids", "ambiguity_flags",
+            ],
+        )
+        outcome = ReprocessOutcome(1, None, 2, "parsed")
+        self.assertEqual(outcome.new_trade_signal_ids, [])
+        self.assertEqual(outcome.ambiguity_flags, [])
+
+    def test_reprocess_batch_result_fields_and_defaults(self):
+        names = [f.name for f in fields(ReprocessBatchResult)]
+        self.assertEqual(names, ["import_batch_id", "outcomes"])
+        result = ReprocessBatchResult(import_batch_id=1)
+        self.assertEqual(result.outcomes, [])
+
+    def test_channel_checkpoint_fields(self):
+        names = [f.name for f in fields(ChannelCheckpoint)]
+        self.assertEqual(
+            names,
+            [
+                "channel_id", "channel_external_id", "channel_name",
+                "latest_received_at", "latest_received_raw_message_id",
+                "latest_received_external_id", "last_ingested_raw_message_id",
+                "last_ingested_at", "last_import_batch_id",
+            ],
+        )
+
+    def test_message_ingest_outcome_precise_list_type_annotations(self):
+        hints = get_type_hints(MessageIngestOutcome)
+        self.assertEqual(hints["trade_signal_ids"], list[int])
+        self.assertEqual(hints["ambiguity_flags"], list[str])
+
+    def test_batch_ingest_result_messages_precise_type_annotation(self):
+        hints = get_type_hints(BatchIngestResult)
+        self.assertEqual(hints["messages"], list[MessageIngestOutcome])
+
+    def test_reprocess_outcome_precise_list_type_annotations(self):
+        hints = get_type_hints(ReprocessOutcome)
+        self.assertEqual(hints["new_trade_signal_ids"], list[int])
+        self.assertEqual(hints["ambiguity_flags"], list[str])
+
+    def test_reprocess_batch_result_outcomes_precise_type_annotation(self):
+        hints = get_type_hints(ReprocessBatchResult)
+        self.assertEqual(hints["outcomes"], list[ReprocessOutcome])
+
+
+class SyntheticIdContractTests(_R5ServiceTestCase):
+    """Item 2: approved synthetic-ID output."""
+
+    def test_approved_synthetic_id_format(self):
+        synthetic_id_input = "chan\x1ftrader\x1ftimestamp\x1fbody\x1f0"
+        expected = "synthetic:" + hashlib.sha256(
+            synthetic_id_input.encode("utf-8")
+        ).hexdigest()
+
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hello", cleaned_text="hello",
+            synthetic_id_input=synthetic_id_input,
+            reference_date="2026-07-24", timezone="UTC",
+        )
+
+        self.assertEqual(outcome.external_id, expected)
+        self.assertTrue(expected.startswith("synthetic:"))
+        digest = expected[len("synthetic:") :]
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        int(digest, 16)  # raises ValueError if not valid hexadecimal
+
+    def test_external_id_and_synthetic_id_input_mutually_exclusive(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hello", cleaned_text="hello",
+                external_id="real-1", synthetic_id_input="s1",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+    def test_neither_external_id_nor_synthetic_id_input_raises(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hello", cleaned_text="hello",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+
+class ResolveExternalIdValidationTests(_R5ServiceTestCase):
+    """Item 5: _resolve_external_id() must reject a blank real external_id
+    or a blank synthetic_id_input, not merely a None one - a nonblank
+    string is required whenever either argument is supplied."""
+
+    def _kwargs(self, **overrides):
+        kwargs = dict(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_empty_external_id_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(**self._kwargs(external_id=""))
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_whitespace_only_external_id_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(**self._kwargs(external_id="   "))
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_empty_synthetic_id_input_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(**self._kwargs(synthetic_id_input=""))
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_whitespace_only_synthetic_id_input_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(**self._kwargs(synthetic_id_input="   "))
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_direct_empty_external_id_raises(self):
+        with self.assertRaises(ValueError):
+            _resolve_external_id("", None)
+
+    def test_direct_whitespace_only_external_id_raises(self):
+        with self.assertRaises(ValueError):
+            _resolve_external_id("   ", None)
+
+    def test_direct_empty_synthetic_id_input_raises(self):
+        with self.assertRaises(ValueError):
+            _resolve_external_id(None, "")
+
+    def test_direct_whitespace_only_synthetic_id_input_raises(self):
+        with self.assertRaises(ValueError):
+            _resolve_external_id(None, "   ")
+
+    def test_valid_external_id_not_stripped_or_mutated(self):
+        outcome = self.service.ingest_channel_message(
+            **self._kwargs(external_id="  keep-exact  ")
+        )
+        self.assertEqual(outcome.external_id, "  keep-exact  ")
+
+
+class IngestChannelMessageValidationTests(_R5ServiceTestCase):
+    def test_blank_source_name_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="   ", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s1",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_blank_raw_text_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="   ", cleaned_text="hi", synthetic_id_input="s1",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_blank_cleaned_text_allowed_and_persists_as_unrecognized(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi there", cleaned_text="", synthetic_id_input="s1",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.outcome, "stored")
+        self.assertEqual(outcome.parse_status, "unrecognized")
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+    def test_invalid_reference_date_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s1",
+                reference_date="07/24/2026", timezone="UTC",
+            )
+
+    def test_invalid_timezone_rejected(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s1",
+                reference_date="2026-07-24", timezone="Not/AZone",
+            )
+
+
+class PublicPrivateApiBoundaryTests(_R5ServiceTestCase):
+    def test_public_signature_excludes_batch_linkage_and_internal_ids(self):
+        import inspect
+
+        signature = inspect.signature(TradeService.ingest_channel_message)
+        forbidden = {"import_batch_id", "sequence_in_batch", "source_id", "channel_id"}
+        self.assertEqual(forbidden & set(signature.parameters), set())
+
+    def test_private_helper_rejects_mismatched_batch_linkage(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_unspecified_channel(self.connection, source.id)
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.service._ingest_channel_message_no_commit(
+                source_id=source.id, channel_id=channel.id, source_name="discord",
+                trader_raw="alice", external_trader_id=None,
+                raw_text="hi", cleaned_text="hi", resolved_external_id="ext-1",
+                native_received_at=None, footer_timestamp_raw=None,
+                footer_timestamp_kind=None, reference_date="2026-07-24", timezone="UTC",
+                import_batch_id=1, sequence_in_batch=None,
+                header_timestamp_raw=None, channel_tags=None,
+                adapter_ambiguity_flags=None, metadata_extra=None,
+            )
+
+    def test_private_helper_rejects_nonexistent_import_batch(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_unspecified_channel(self.connection, source.id)
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.service._ingest_channel_message_no_commit(
+                source_id=source.id, channel_id=channel.id, source_name="discord",
+                trader_raw="alice", external_trader_id=None,
+                raw_text="hi", cleaned_text="hi", resolved_external_id="ext-1",
+                native_received_at=None, footer_timestamp_raw=None,
+                footer_timestamp_kind=None, reference_date="2026-07-24", timezone="UTC",
+                import_batch_id=999999, sequence_in_batch=1,
+                header_timestamp_raw=None, channel_tags=None,
+                adapter_ambiguity_flags=None, metadata_extra=None,
+            )
+
+    def test_private_helper_rejects_batch_from_different_source(self):
+        source_a = repository.get_or_create_source(self.connection, "discord")
+        source_b = repository.get_or_create_source(self.connection, "telegram")
+        channel = repository.get_or_create_unspecified_channel(self.connection, source_a.id)
+        self.connection.commit()
+        batch = repository.create_import_batch(
+            self.connection, source_b.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.service._ingest_channel_message_no_commit(
+                source_id=source_a.id, channel_id=channel.id, source_name="discord",
+                trader_raw="alice", external_trader_id=None,
+                raw_text="hi", cleaned_text="hi", resolved_external_id="ext-1",
+                native_received_at=None, footer_timestamp_raw=None,
+                footer_timestamp_kind=None, reference_date="2026-07-24", timezone="UTC",
+                import_batch_id=batch.id, sequence_in_batch=1,
+                header_timestamp_raw=None, channel_tags=None,
+                adapter_ambiguity_flags=None, metadata_extra=None,
+            )
+
+    def test_private_helper_rejects_non_positive_sequence_in_batch(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_unspecified_channel(self.connection, source.id)
+        self.connection.commit()
+        batch = repository.create_import_batch(
+            self.connection, source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.service._ingest_channel_message_no_commit(
+                source_id=source.id, channel_id=channel.id, source_name="discord",
+                trader_raw="alice", external_trader_id=None,
+                raw_text="hi", cleaned_text="hi", resolved_external_id="ext-1",
+                native_received_at=None, footer_timestamp_raw=None,
+                footer_timestamp_kind=None, reference_date="2026-07-24", timezone="UTC",
+                import_batch_id=batch.id, sequence_in_batch=0,
+                header_timestamp_raw=None, channel_tags=None,
+                adapter_ambiguity_flags=None, metadata_extra=None,
+            )
+
+
+class TraderIdentityClassificationTests(_R5ServiceTestCase):
+    def test_missing_trader_persists_without_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw=None,
+            raw_text="BOUGHT AVGO 07/24 380P $1.14",
+            cleaned_text="BOUGHT AVGO 07/24 380P $1.14",
+            synthetic_id_input="s-missing",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.outcome, "stored")
+        self.assertEqual(outcome.trade_signal_ids, [])
+        self.assertIn(AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING, outcome.ambiguity_flags)
+
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertIsNotNone(raw_message)
+        extraction = get_current_extraction(self.connection, outcome.raw_message_id)
+        self.assertIsNotNone(extraction)
+
+    def test_blank_trader_raw_treated_as_missing(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="   ",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-blank",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertIn(AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING, outcome.ambiguity_flags)
+
+    def test_ambiguous_trader_persists_without_guessing(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        create_trader(self.connection, source.id, "Matae")
+        create_trader(self.connection, source.id, "matae")
+        self.connection.commit()
+
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="MATAE",
+            raw_text="BOUGHT TSLA 7/24 312.5P $1.70",
+            cleaned_text="BOUGHT TSLA 7/24 312.5P $1.70",
+            synthetic_id_input="s-ambiguous",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.trade_signal_ids, [])
+        self.assertIn(AMBIGUITY_FLAG_TRADER_IDENTITY_AMBIGUOUS, outcome.ambiguity_flags)
+
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertIsNotNone(raw_message)
+        extraction = get_current_extraction(self.connection, outcome.raw_message_id)
+        self.assertIsNotNone(extraction)
+
+    def test_exactly_one_canonical_match_reused(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        existing = create_trader(self.connection, source.id, "Bdorts")
+        self.connection.commit()
+
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="bdorts",
+            raw_text="BOUGHT AVGO 07/24 380P $1.14",
+            cleaned_text="BOUGHT AVGO 07/24 380P $1.14",
+            synthetic_id_input="s-reuse",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(len(outcome.trade_signal_ids), 1)
+        signal = repository.get_trade_signal_by_id(self.connection, outcome.trade_signal_ids[0])
+        self.assertEqual(signal.trader_id, existing.id)
+
+    def test_zero_canonical_matches_creates_trader_with_original_casing(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="Sarang",
+            raw_text="BOUGHT QQQ 07/24 690C $1.28",
+            cleaned_text="BOUGHT QQQ 07/24 690C $1.28",
+            synthetic_id_input="s-create",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(len(outcome.trade_signal_ids), 1)
+        source = repository.get_or_create_source(self.connection, "discord")
+        matches = get_traders_by_canonical_name(self.connection, source.id, "sarang")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].name, "Sarang")
+
+    def test_external_trader_id_resolved_first(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        existing = create_trader(self.connection, source.id, "TC", "ext-tc-1")
+        self.connection.commit()
+
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None,
+            trader_raw="a different display name entirely",
+            external_trader_id="ext-tc-1",
+            raw_text="BOUGHT NVDA 07/24 207.5C $1.17",
+            cleaned_text="BOUGHT NVDA 07/24 207.5C $1.17",
+            synthetic_id_input="s-ext",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        signal = repository.get_trade_signal_by_id(self.connection, outcome.trade_signal_ids[0])
+        self.assertEqual(signal.trader_id, existing.id)
+
+    def test_no_trader_creation_for_duplicate_message(self):
+        self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="brand-new-trader",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-dup-trader",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        trader_count_after_first = self._counts()["traders"]
+
+        second = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="brand-new-trader",
+            raw_text="hi again", cleaned_text="hi again", synthetic_id_input="s-dup-trader",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        trader_count_after_second = self._counts()["traders"]
+
+        self.assertEqual(second.outcome, "duplicate")
+        self.assertEqual(trader_count_after_first, trader_count_after_second)
+
+    def test_external_trader_creation_deferred_until_after_duplicate_detection(self):
+        self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            external_trader_id="ext-defer-1",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-defer",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(self._counts()["traders"], 1)
+
+        # Re-ingesting the exact same message (same synthetic id) with a
+        # different, still-unseen external_trader_id must not create a
+        # second trader row, since the message is a duplicate.
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="someone-else",
+            external_trader_id="ext-defer-2",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-defer",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+
+        self.assertEqual(outcome.outcome, "duplicate")
+        self.assertEqual(self._counts()["traders"], 1)
+
+
+class SignalCreationGateTests(_R5ServiceTestCase):
+    def test_fully_parsed_with_unresolved_trader_creates_no_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw=None,
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-gate-1",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.parse_status, "parsed")
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+    def test_partially_parsed_missing_symbol_creates_no_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT 450C $3.25", cleaned_text="BOUGHT 450C $3.25",
+            synthetic_id_input="s-gate-2",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.parse_status, "partially_parsed")
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+    def test_partially_parsed_missing_price_with_resolved_trader_creates_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT SPY 450C", cleaned_text="BOUGHT SPY 450C",
+            synthetic_id_input="s-gate-3",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.parse_status, "partially_parsed")
+        self.assertEqual(len(outcome.trade_signal_ids), 1)
+
+    def test_all_three_present_creates_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-gate-4",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(len(outcome.trade_signal_ids), 1)
+
+    def test_unrecognized_creates_no_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="just chatting", cleaned_text="just chatting",
+            synthetic_id_input="s-gate-5",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.parse_status, "unrecognized")
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+
+class MetadataProvenanceTests(_R5ServiceTestCase):
+    def _full_counts(self):
+        counts = self._counts()
+        counts["sources"] = self.connection.execute(
+            "SELECT COUNT(*) FROM sources"
+        ).fetchone()[0]
+        counts["channels"] = self.connection.execute(
+            "SELECT COUNT(*) FROM channels"
+        ).fetchone()[0]
+        return counts
+
+    def test_reserved_key_rejected_in_metadata_extra(self):
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s-meta-1",
+                reference_date="2026-07-24", timezone="UTC",
+                metadata_extra={"_r5_provenance": {"anything": True}},
+            )
+        self.assertEqual(self._counts()["raw_messages"], 0)
+
+    def test_reserved_key_rejected_even_when_message_is_already_duplicate(self):
+        # Item 1: invalid metadata_extra must never be silently ignored
+        # just because the message turns out to be a duplicate - the
+        # validation must run before the duplicate lookup, not after it.
+        first = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-meta-dup-race",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        original = get_raw_message_by_id(self.connection, first.raw_message_id)
+        counts_before = self._full_counts()
+
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s-meta-dup-race",
+                reference_date="2026-07-24", timezone="UTC",
+                metadata_extra={"_r5_provenance": {"invalid": True}},
+            )
+
+        self.assertEqual(self._full_counts(), counts_before)
+        after = get_raw_message_by_id(self.connection, first.raw_message_id)
+        self.assertEqual(after, original)
+
+    def test_non_dict_metadata_extra_rejected(self):
+        counts_before = self._full_counts()
+
+        with self.assertRaises(ValueError):
+            self.service.ingest_channel_message(
+                source_name="discord", channel_external_id=None, trader_raw="alice",
+                raw_text="hi", cleaned_text="hi", synthetic_id_input="s-meta-nondict",
+                reference_date="2026-07-24", timezone="UTC",
+                metadata_extra=["not", "a", "dict"],
+            )
+
+        self.assertEqual(self._full_counts(), counts_before)
+
+    def test_metadata_extra_merges_alongside_reserved_block(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-meta-2",
+            reference_date="2026-07-24", timezone="UTC",
+            metadata_extra={"custom_key": "custom_value"},
+        )
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertEqual(raw_message.metadata["custom_key"], "custom_value")
+        self.assertIn("_r5_provenance", raw_message.metadata)
+
+    def test_provenance_contains_required_fields(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            external_trader_id="ext-prov-1",
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-meta-3",
+            footer_timestamp_raw="Today at 04:30 م", footer_timestamp_kind="relative_today",
+            header_timestamp_raw="04:30 م",
+            channel_tags=["analyst-tc"],
+            adapter_ambiguity_flags=["missing_footer"],
+            reference_date="2026-07-24", timezone="Asia/Riyadh",
+        )
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        provenance = raw_message.metadata["_r5_provenance"]
+
+        self.assertEqual(provenance["cleaned_text"], "BOUGHT SPY 450C $3.25")
+        self.assertEqual(provenance["reference_date"], "2026-07-24")
+        self.assertEqual(provenance["timezone"], "Asia/Riyadh")
+        self.assertEqual(provenance["footer_timestamp_raw"], "Today at 04:30 م")
+        self.assertEqual(provenance["footer_timestamp_kind"], "relative_today")
+        self.assertEqual(provenance["synthetic_id_input"], "s-meta-3")
+        self.assertEqual(provenance["trader_raw"], "alice")
+        self.assertEqual(provenance["external_trader_id"], "ext-prov-1")
+        self.assertIsNotNone(provenance["resolved_trader_id"])
+        self.assertEqual(provenance["header_timestamp_raw"], "04:30 م")
+        self.assertEqual(provenance["channel_tags"], ["analyst-tc"])
+        self.assertEqual(provenance["adapter_ambiguity_flags"], ["missing_footer"])
+
+
+class TimestampPrecedenceAndCanonicalizationTests(_R5ServiceTestCase):
+    def test_native_timestamp_takes_precedence_over_footer(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-ts-1",
+            reference_date="2026-07-24", timezone="Asia/Riyadh",
+            native_received_at="2026-07-24T20:30:00-04:00",
+            footer_timestamp_raw="Today at 04:30 م", footer_timestamp_kind="relative_today",
+        )
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertEqual(raw_message.received_at, "2026-07-25T00:30:00.000000+00:00")
+        self.assertNotIn(AMBIGUITY_FLAG_INVALID_NATIVE_TIMESTAMP, outcome.ambiguity_flags)
+
+    def test_invalid_native_timestamp_falls_back_to_footer(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-ts-2",
+            reference_date="2026-07-24", timezone="America/New_York",
+            native_received_at="not-a-timestamp",
+            footer_timestamp_raw="Today at 04:30 PM", footer_timestamp_kind="relative_today",
+        )
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertIsNotNone(raw_message.received_at)
+        self.assertIn(AMBIGUITY_FLAG_INVALID_NATIVE_TIMESTAMP, outcome.ambiguity_flags)
+
+    def test_naive_native_timestamp_rejected_not_guessed(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-ts-3",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T20:30:00",
+        )
+        self.assertIn(AMBIGUITY_FLAG_INVALID_NATIVE_TIMESTAMP, outcome.ambiguity_flags)
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertIsNone(raw_message.received_at)
+
+    def test_no_timestamp_info_at_all_is_not_flagged(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-ts-4",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertNotIn(AMBIGUITY_FLAG_INVALID_NATIVE_TIMESTAMP, outcome.ambiguity_flags)
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertIsNone(raw_message.received_at)
+
+    def test_utc_canonicalization_across_different_original_offsets(self):
+        first = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-tz", trader_raw="alice",
+            raw_text="first", cleaned_text="first", synthetic_id_input="s-ts-5",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T12:00:00+00:00",
+        )
+        second = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-tz", trader_raw="alice",
+            raw_text="second", cleaned_text="second", synthetic_id_input="s-ts-6",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T08:00:00-04:00",
+        )
+        rm1 = get_raw_message_by_id(self.connection, first.raw_message_id)
+        rm2 = get_raw_message_by_id(self.connection, second.raw_message_id)
+        self.assertEqual(rm1.received_at, rm2.received_at)
+        self.assertEqual(rm1.received_at, "2026-07-24T12:00:00.000000+00:00")
+
+    def test_footer_timestamp_also_canonicalized_to_utc(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-ts-footer",
+            reference_date="2026-07-24", timezone="Asia/Riyadh",
+            footer_timestamp_raw="Today at 04:30 م", footer_timestamp_kind="relative_today",
+        )
+        raw_message = get_raw_message_by_id(self.connection, outcome.raw_message_id)
+        self.assertEqual(raw_message.received_at, "2026-07-24T13:30:00.000000+00:00")
+
+    def test_chronological_checkpoint_orders_correctly_across_offsets(self):
+        earlier_in_utc = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-order", trader_raw="alice",
+            raw_text="earlier", cleaned_text="earlier", synthetic_id_input="s-ts-7",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T23:00:00+05:00",  # 18:00 UTC
+        )
+        later_in_utc = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-order", trader_raw="alice",
+            raw_text="later", cleaned_text="later", synthetic_id_input="s-ts-8",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T15:00:00-05:00",  # 20:00 UTC
+        )
+        checkpoints = self.service.get_channel_checkpoints()
+        checkpoint = next(c for c in checkpoints if c.channel_id == later_in_utc.channel_id)
+        self.assertEqual(
+            checkpoint.latest_received_raw_message_id, later_in_utc.raw_message_id
+        )
+
+
+class IngestBatchIdempotencyServiceTests(_R5ServiceTestCase):
+    def test_full_corpus_ingestion(self):
+        result = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-corpus",
+        )
+        self.assertEqual(result.total_segmented, 68)
+        self.assertEqual(result.stored_count, 68)
+        self.assertEqual(result.duplicate_count, 0)
+        self.assertIsNotNone(result.import_batch_id)
+
+    def test_full_duplicate_reimport_creates_no_import_batches_row(self):
+        self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-corpus-2",
+        )
+        batch_count_after_first = self._counts()["import_batches"]
+
+        result2 = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-corpus-2",
+        )
+        batch_count_after_second = self._counts()["import_batches"]
+
+        self.assertIsNone(result2.import_batch_id)
+        self.assertEqual(result2.duplicate_count, 68)
+        self.assertEqual(result2.stored_count, 0)
+        self.assertEqual(batch_count_after_first, batch_count_after_second)
+
+    def test_partial_duplicate_batch_links_only_new_messages(self):
+        self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-partial",
+        )
+
+        extra_message = (
+            "Bdorts\nAPP\n — 09:30 م\n"
+            "BOUGHT MSFT 07/24 500C $2.00 [SMALL]\n"
+            "Bdorts•Today at 09:30 م\n"
+        )
+        mixed_batch_text = CORPUS + extra_message
+
+        result = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=mixed_batch_text, channel_external_id="chan-partial",
+        )
+
+        self.assertIsNotNone(result.import_batch_id)
+        self.assertEqual(result.stored_count, 1)
+        self.assertEqual(result.duplicate_count, 68)
+
+        new_message_outcome = next(o for o in result.messages if o.outcome == "stored")
+        new_raw_message = get_raw_message_by_id(
+            self.connection, new_message_outcome.raw_message_id
+        )
+        self.assertEqual(new_raw_message.import_batch_id, result.import_batch_id)
+
+        for outcome in (o for o in result.messages if o.outcome == "duplicate"):
+            duplicate_raw_message = get_raw_message_by_id(
+                self.connection, outcome.raw_message_id
+            )
+            self.assertNotEqual(duplicate_raw_message.import_batch_id, result.import_batch_id)
+
+    def test_legitimate_identical_messages_remain_separate(self):
+        duplicate_pair = (
+            "Bdorts\nAPP\n — 04:30 PM\n"
+            "BOUGHT AVGO 07/24 380P $1.14 [SMALL]\n"
+            "Bdorts•Today at 04:30 PM\n"
+            "BOUGHT AVGO 07/24 380P $1.14 [SMALL]\n"
+            "Bdorts•Today at 04:30 PM\n"
+        )
+        result = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="UTC",
+            raw_batch_text=duplicate_pair, channel_external_id="chan-identical",
+        )
+        self.assertEqual(result.total_segmented, 2)
+        self.assertEqual(result.stored_count, 2)
+        self.assertEqual(result.duplicate_count, 0)
+        self.assertNotEqual(
+            result.messages[0].raw_message_id, result.messages[1].raw_message_id
+        )
+        self.assertNotEqual(result.messages[0].external_id, result.messages[1].external_id)
+
+    def test_empty_batch_validation_zero_writes(self):
+        counts_before = self._counts()
+        with self.assertRaises(ValueError):
+            self.service.ingest_batch(
+                source_name="discord", reference_date="2026-07-24", timezone="UTC",
+                raw_batch_text="   ",
+            )
+        self.assertEqual(self._counts(), counts_before)
+
+    def test_invalid_reference_date_zero_writes(self):
+        counts_before = self._counts()
+        with self.assertRaises(ValueError):
+            self.service.ingest_batch(
+                source_name="discord", reference_date="not-a-date", timezone="UTC",
+                raw_batch_text=CORPUS,
+            )
+        self.assertEqual(self._counts(), counts_before)
+
+    def test_invalid_timezone_zero_writes(self):
+        counts_before = self._counts()
+        with self.assertRaises(ValueError):
+            self.service.ingest_batch(
+                source_name="discord", reference_date="2026-07-24", timezone="Not/AZone",
+                raw_batch_text=CORPUS,
+            )
+        self.assertEqual(self._counts(), counts_before)
+
+    def test_blank_source_name_zero_writes(self):
+        counts_before = self._counts()
+        with self.assertRaises(ValueError):
+            self.service.ingest_batch(
+                source_name="   ", reference_date="2026-07-24", timezone="UTC",
+                raw_batch_text=CORPUS,
+            )
+        self.assertEqual(self._counts(), counts_before)
+
+
+class UniqueConstraintRaceServiceTests(_R5ServiceTestCase):
+    """Item 2/4: the confirmed-race duplicate path - create_raw_message()
+    raising sqlite3.IntegrityError, followed by a re-query that confirms a
+    genuinely already-stored row - must never leave a provisional trader
+    (or any other write made after the initial duplicate lookup) behind.
+    See TradeService._ingest_channel_message_no_commit's message-level
+    SAVEPOINT.
+
+    Each test simulates the race by patching
+    database.service.get_raw_message_by_channel_and_external_id so its
+    first `skip_count` calls return None (as if the row had not yet been
+    observed), then delegate to the real lookup - which finds whatever the
+    test actually pre-created once create_raw_message's own UNIQUE
+    constraint forces a re-query.
+    """
+
+    def _patch_lookup_with_delayed_race(self, skip_count):
+        real_lookup = repository.get_raw_message_by_channel_and_external_id
+        state = {"calls": 0}
+
+        def fake_lookup(conn, channel_id, external_id):
+            state["calls"] += 1
+            if state["calls"] <= skip_count:
+                return None
+            return real_lookup(conn, channel_id, external_id)
+
+        return patch(
+            "database.service.get_raw_message_by_channel_and_external_id",
+            side_effect=fake_lookup,
+        )
+
+    def test_confirmed_race_duplicate_direct_single_message_ingestion(self):
+        # trader_raw resolves to an EXISTING trader (via external_trader_id)
+        # so classification is "resolved" - isolating the raw_message race
+        # itself from any trader-creation concern.
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(self.connection, source.id, "chan-race-1")
+        repository.create_trader(self.connection, source.id, "alice", "ext-race-1")
+        existing = repository.create_raw_message(
+            self.connection, source.id, "already here",
+            external_id="ext-msg-race-1", channel_id=channel.id,
+        )
+        self.connection.commit()
+        trader_count_before = self._counts()["traders"]
+
+        with self._patch_lookup_with_delayed_race(skip_count=1):
+            outcome = self.service.ingest_channel_message(
+                source_name="discord", channel_external_id="chan-race-1",
+                trader_raw="alice", external_trader_id="ext-race-1",
+                raw_text="incoming, different text",
+                cleaned_text="incoming, different text",
+                external_id="ext-msg-race-1",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+        self.assertEqual(outcome.outcome, "duplicate")
+        self.assertEqual(outcome.raw_message_id, existing.id)
+        self.assertEqual(self._counts()["traders"], trader_count_before)
+        after = repository.get_raw_message_by_id(self.connection, existing.id)
+        self.assertEqual(after.raw_text, "already here")
+        self.assertEqual(after.content_hash, existing.content_hash)
+
+    def test_confirmed_race_duplicate_with_deferred_trader_creation(self):
+        # trader_raw is previously unseen, so classification is
+        # "needs_creation" - the provisional trader created inside the
+        # savepoint must be rolled back when the race is confirmed.
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(self.connection, source.id, "chan-race-2")
+        existing = repository.create_raw_message(
+            self.connection, source.id, "already here 2",
+            external_id="ext-msg-race-2", channel_id=channel.id,
+        )
+        self.connection.commit()
+        trader_count_before = self._counts()["traders"]
+
+        with self._patch_lookup_with_delayed_race(skip_count=1):
+            outcome = self.service.ingest_channel_message(
+                source_name="discord", channel_external_id="chan-race-2",
+                trader_raw="brand-new-racer",
+                raw_text="incoming 2", cleaned_text="incoming 2",
+                external_id="ext-msg-race-2",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+        self.assertEqual(outcome.outcome, "duplicate")
+        self.assertEqual(outcome.raw_message_id, existing.id)
+        self.assertEqual(self._counts()["traders"], trader_count_before)
+
+    def test_confirmed_race_duplicate_inside_batch(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(self.connection, source.id, "chan-race-batch")
+        self.connection.commit()
+
+        message_one = (
+            "Bdorts\nAPP\n — 09:30 م\n"
+            "BOUGHT MSFT 07/24 500C $2.00 [SMALL]\n"
+            "Bdorts•Today at 09:30 م\n"
+        )
+        message_two = (
+            "Bdorts\nAPP\n — 09:31 م\n"
+            "BOUGHT NFLX 07/24 600C $3.00 [SMALL]\n"
+            "Bdorts•Today at 09:31 م\n"
+        )
+        batch_text = message_one + message_two
+        segmented = segment_discord_batch(batch_text)
+        self.assertEqual(len(segmented), 2)
+        resolved_id_one = _resolve_external_id(None, segmented[0].synthetic_id_input)
+
+        existing = repository.create_raw_message(
+            self.connection, source.id, "already here batch",
+            external_id=resolved_id_one, channel_id=channel.id,
+        )
+        self.connection.commit()
+
+        # Message one's preflight check, its idempotency check inside the
+        # private helper, then message two's preflight check and its own
+        # idempotency check all need to run before message one's raced
+        # re-query - three prior calls to skip.
+        with self._patch_lookup_with_delayed_race(skip_count=3):
+            result = self.service.ingest_batch(
+                source_name="discord", reference_date="2026-07-24", timezone="UTC",
+                raw_batch_text=batch_text, channel_external_id="chan-race-batch",
+            )
+
+        self.assertIsNotNone(result.import_batch_id)
+        self.assertEqual(result.stored_count, 1)
+        self.assertEqual(result.duplicate_count, 1)
+        duplicate_outcome = next(o for o in result.messages if o.outcome == "duplicate")
+        self.assertEqual(duplicate_outcome.raw_message_id, existing.id)
+        stored_outcome = next(o for o in result.messages if o.outcome == "stored")
+        self.assertNotEqual(stored_outcome.raw_message_id, existing.id)
+
+    def test_race_empty_batch_cleanup(self):
+        # Every apparent new message in the batch becomes a confirmed
+        # duplicate via the race - the otherwise-orphaned import_batches
+        # row must be removed and no provisional trader may remain.
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(self.connection, source.id, "chan-race-empty")
+        self.connection.commit()
+
+        message_text = (
+            "Bdorts\nAPP\n — 09:30 م\n"
+            "BOUGHT MSFT 07/24 500C $2.00 [SMALL]\n"
+            "Bdorts•Today at 09:30 م\n"
+        )
+        segmented = segment_discord_batch(message_text)
+        resolved_id = _resolve_external_id(None, segmented[0].synthetic_id_input)
+
+        repository.create_raw_message(
+            self.connection, source.id, "already here empty",
+            external_id=resolved_id, channel_id=channel.id,
+        )
+        self.connection.commit()
+        batch_count_before = self._counts()["import_batches"]
+        trader_count_before = self._counts()["traders"]
+
+        with self._patch_lookup_with_delayed_race(skip_count=2):
+            result = self.service.ingest_batch(
+                source_name="discord", reference_date="2026-07-24", timezone="UTC",
+                raw_batch_text=message_text, channel_external_id="chan-race-empty",
+            )
+
+        self.assertIsNone(result.import_batch_id)
+        self.assertEqual(result.stored_count, 0)
+        self.assertEqual(result.duplicate_count, 1)
+        self.assertEqual(self._counts()["import_batches"], batch_count_before)
+        self.assertEqual(self._counts()["traders"], trader_count_before)
+
+    def test_unrelated_integrity_error_propagates_and_rolls_back_provisional_writes(self):
+        counts_before = self._counts()
+
+        with patch(
+            "database.service.create_raw_message",
+            side_effect=sqlite3.IntegrityError("simulated unrelated constraint violation"),
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.service.ingest_channel_message(
+                    source_name="discord", channel_external_id="chan-race-unrelated",
+                    trader_raw="brand-new-unrelated-trader",
+                    raw_text="hi", cleaned_text="hi", synthetic_id_input="s-race-unrelated",
+                    reference_date="2026-07-24", timezone="UTC",
+                )
+
+        self.assertEqual(self._counts(), counts_before)
+
+    def test_confirmed_race_rolls_back_provisional_writes(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(
+            self.connection, source.id, "chan-race-provisional"
+        )
+        repository.create_raw_message(
+            self.connection, source.id, "already here provisional",
+            external_id="ext-msg-race-provisional", channel_id=channel.id,
+        )
+        self.connection.commit()
+        counts_before = self._counts()
+
+        with self._patch_lookup_with_delayed_race(skip_count=1):
+            outcome = self.service.ingest_channel_message(
+                source_name="discord", channel_external_id="chan-race-provisional",
+                trader_raw="another-unseen-trader",
+                raw_text="incoming provisional", cleaned_text="incoming provisional",
+                external_id="ext-msg-race-provisional",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+        self.assertEqual(outcome.outcome, "duplicate")
+        counts_after = self._counts()
+        self.assertEqual(counts_after["traders"], counts_before["traders"])
+        self.assertEqual(
+            counts_after["message_extractions"], counts_before["message_extractions"]
+        )
+        self.assertEqual(counts_after["trade_signals"], counts_before["trade_signals"])
+        self.assertEqual(counts_after["raw_messages"], counts_before["raw_messages"])
+
+    def test_confirmed_race_preserves_existing_duplicate_row(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        channel = repository.get_or_create_channel(
+            self.connection, source.id, "chan-race-preserve"
+        )
+        existing = repository.create_raw_message(
+            self.connection, source.id, "original content preserved",
+            external_id="ext-msg-race-preserve", channel_id=channel.id,
+        )
+        self.connection.commit()
+
+        with self._patch_lookup_with_delayed_race(skip_count=1):
+            outcome = self.service.ingest_channel_message(
+                source_name="discord", channel_external_id="chan-race-preserve",
+                trader_raw="alice",
+                raw_text="a very different incoming body",
+                cleaned_text="a very different incoming body",
+                external_id="ext-msg-race-preserve",
+                reference_date="2026-07-24", timezone="UTC",
+            )
+
+        self.assertEqual(outcome.outcome, "duplicate")
+        self.assertEqual(outcome.raw_message_id, existing.id)
+        after = repository.get_raw_message_by_id(self.connection, existing.id)
+        self.assertEqual(after.raw_text, "original content preserved")
+        self.assertEqual(after.content_hash, existing.content_hash)
+        self.assertEqual(after.metadata, existing.metadata)
+
+
+class ReprocessingServiceTests(_R5ServiceTestCase):
+    def test_direct_single_message_reprocessing_from_provenance(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-reproc-1",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        reprocessed = self.service.reprocess_raw_message(outcome.raw_message_id)
+
+        self.assertEqual(reprocessed.raw_message_id, outcome.raw_message_id)
+        self.assertEqual(reprocessed.parse_status, "parsed")
+        self.assertEqual(len(reprocessed.new_trade_signal_ids), 1)
+
+        current = get_current_extraction(self.connection, outcome.raw_message_id)
+        self.assertEqual(current.id, reprocessed.new_extraction_id)
+
+    def test_reprocessing_supersedes_prior_extraction_and_signal(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-reproc-2",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        original_signal_id = outcome.trade_signal_ids[0]
+
+        reprocessed = self.service.reprocess_raw_message(outcome.raw_message_id)
+
+        self.assertNotEqual(reprocessed.new_trade_signal_ids[0], original_signal_id)
+        old_signal = repository.get_trade_signal_by_id(self.connection, original_signal_id)
+        self.assertIsNotNone(old_signal)
+        self.assertEqual(old_signal.symbol, "SPY")
+
+    def test_no_segmentation_rerun_during_reprocessing(self):
+        outcome = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-noresegment",
+        )
+        raw_message_id = outcome.messages[0].raw_message_id
+
+        with patch(
+            "database.service.segment_discord_batch",
+            side_effect=AssertionError("segmentation must never rerun during reprocessing"),
+        ):
+            self.service.reprocess_raw_message(raw_message_id)
+
+    def test_import_batch_reprocessing(self):
+        outcome = self.service.ingest_batch(
+            source_name="discord", reference_date="2026-07-24", timezone="Asia/Riyadh",
+            raw_batch_text=CORPUS, channel_external_id="chan-batchreproc",
+        )
+
+        batch_result = self.service.reprocess_import_batch(outcome.import_batch_id)
+
+        self.assertEqual(len(batch_result.outcomes), 68)
+        self.assertEqual(batch_result.import_batch_id, outcome.import_batch_id)
+        for reprocess_outcome in batch_result.outcomes:
+            self.assertEqual(reprocess_outcome.parse_status, "parsed")
+
+    def test_reprocess_nonexistent_raw_message_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.service.reprocess_raw_message(999999)
+
+    def test_reprocess_nonexistent_import_batch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.service.reprocess_import_batch(999999)
+
+    def test_reprocess_import_batch_with_zero_linked_messages_raises_value_error(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        self.connection.commit()
+        batch = repository.create_import_batch(
+            self.connection, source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.service.reprocess_import_batch(batch.id)
+
+    def test_legacy_manual_entry_message_not_reprocessable(self):
+        result = self.service.ingest_message(
+            "manual", "alice", "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+        )
+        self.connection.commit()
+
+        with self.assertRaises(ReprocessingNotSupportedError):
+            self.service.reprocess_raw_message(result["raw_message"].id)
+
+    def test_reprocessing_not_supported_error_is_a_value_error(self):
+        self.assertTrue(issubclass(ReprocessingNotSupportedError, ValueError))
+
+    def test_resolved_trader_id_preserved_during_reprocessing(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-reproc-trader-1",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        original_signal = repository.get_trade_signal_by_id(
+            self.connection, outcome.trade_signal_ids[0]
+        )
+
+        with patch.object(
+            TradeService,
+            "_classify_trader_identity",
+            side_effect=AssertionError(
+                "must not reclassify when resolved_trader_id is still valid"
+            ),
+        ):
+            reprocessed = self.service.reprocess_raw_message(outcome.raw_message_id)
+
+        new_signal = repository.get_trade_signal_by_id(
+            self.connection, reprocessed.new_trade_signal_ids[0]
+        )
+        self.assertEqual(new_signal.trader_id, original_signal.trader_id)
+
+    def test_unresolved_trader_identity_reevaluated_during_reprocessing(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw=None,
+            raw_text="BOUGHT SPY 450C $3.25", cleaned_text="BOUGHT SPY 450C $3.25",
+            synthetic_id_input="s-reproc-trader-2",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+        reprocessed = self.service.reprocess_raw_message(outcome.raw_message_id)
+
+        self.assertEqual(reprocessed.new_trade_signal_ids, [])
+        self.assertIn(AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING, reprocessed.ambiguity_flags)
+
+    def test_reprocessing_reclassifies_ambiguous_trader(self):
+        source = repository.get_or_create_source(self.connection, "discord")
+        create_trader(self.connection, source.id, "Dup")
+        create_trader(self.connection, source.id, "dup")
+        self.connection.commit()
+
+        ambiguous_outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="DUP",
+            raw_text="SOLD SPY 450C $4.00 ALL OUT",
+            cleaned_text="SOLD SPY 450C $4.00 ALL OUT",
+            synthetic_id_input="s-reproc-trader-4",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(ambiguous_outcome.trade_signal_ids, [])
+
+        reprocessed = self.service.reprocess_raw_message(ambiguous_outcome.raw_message_id)
+
+        self.assertIn(AMBIGUITY_FLAG_TRADER_IDENTITY_AMBIGUOUS, reprocessed.ambiguity_flags)
+        self.assertEqual(reprocessed.new_trade_signal_ids, [])
+
+    def test_reprocessing_produces_no_replacement_signal_when_unrecognized(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="just chatting here", cleaned_text="just chatting here",
+            synthetic_id_input="s-reproc-empty",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        self.assertEqual(outcome.trade_signal_ids, [])
+
+        reprocessed = self.service.reprocess_raw_message(outcome.raw_message_id)
+
+        self.assertEqual(reprocessed.parse_status, "unrecognized")
+        self.assertEqual(reprocessed.new_trade_signal_ids, [])
+
+
+class ChannelCheckpointServiceTests(_R5ServiceTestCase):
+    def test_no_channels_returns_empty_list(self):
+        self.assertEqual(self.service.get_channel_checkpoints(), [])
+
+    def test_out_of_order_historical_import_does_not_move_checkpoint_backward(self):
+        newer = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-hist", trader_raw="alice",
+            raw_text="newer", cleaned_text="newer", synthetic_id_input="s-hist-newer",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T20:00:00+00:00",
+        )
+        older = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-hist", trader_raw="alice",
+            raw_text="older", cleaned_text="older", synthetic_id_input="s-hist-older",
+            reference_date="2026-07-20", timezone="UTC",
+            native_received_at="2026-07-20T10:00:00+00:00",
+        )
+        checkpoints = self.service.get_channel_checkpoints()
+        checkpoint = next(c for c in checkpoints if c.channel_id == newer.channel_id)
+
+        self.assertEqual(checkpoint.latest_received_raw_message_id, newer.raw_message_id)
+        # The ingestion cursor still reflects the most recently INSERTED
+        # row - the older-content message pasted second.
+        self.assertEqual(checkpoint.last_ingested_raw_message_id, older.raw_message_id)
+
+    def test_unresolved_timestamps_report_no_false_chronological_checkpoint(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-unresolved", trader_raw="alice",
+            raw_text="no timestamp info", cleaned_text="no timestamp info",
+            synthetic_id_input="s-unresolved",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        checkpoints = self.service.get_channel_checkpoints()
+        checkpoint = next(c for c in checkpoints if c.channel_id == outcome.channel_id)
+
+        self.assertIsNone(checkpoint.latest_received_at)
+        self.assertIsNone(checkpoint.latest_received_raw_message_id)
+        self.assertIsNone(checkpoint.latest_received_external_id)
+        self.assertEqual(checkpoint.last_ingested_raw_message_id, outcome.raw_message_id)
+
+    def test_duplicate_imports_do_not_change_checkpoint(self):
+        self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-dupcheckpoint", trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-dupcheckpoint",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T12:00:00+00:00",
+        )
+        before = self.service.get_channel_checkpoints()
+
+        duplicate = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-dupcheckpoint", trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-dupcheckpoint",
+            reference_date="2026-07-24", timezone="UTC",
+            native_received_at="2026-07-24T12:00:00+00:00",
+        )
+        after = self.service.get_channel_checkpoints()
+
+        self.assertEqual(duplicate.outcome, "duplicate")
+        self.assertEqual(before, after)
+
+
+class LegacyIngestMessagePathUncontaminatedTests(_R5ServiceTestCase):
+    """Item 17 and the "keep ingest_message() unchanged" requirement."""
+
+    def test_ingest_message_creates_no_message_extraction(self):
+        result = self.service.ingest_message(
+            "manual", "alice", "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+        )
+        self.connection.commit()
+
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM message_extractions WHERE raw_message_id = ?",
+            (result["raw_message"].id,),
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_ingest_message_signature_unchanged(self):
+        import inspect
+
+        signature = inspect.signature(TradeService.ingest_message)
+        self.assertEqual(
+            list(signature.parameters),
+            [
+                "self", "source_name", "trader_name", "raw_text", "reference_time",
+                "external_trader_id", "external_message_id", "metadata", "received_at",
+                "trade_signals",
+            ],
+        )
+
+    def test_legacy_signal_visible_via_review_alongside_r5_signal(self):
+        self.service.ingest_message(
+            "manual", "alice", "BTO SPY 500c @3.25",
+            reference_time="2026-07-13 09:00:00",
+            trade_signals=[{"symbol": "SPY", "action": "BTO"}],
+        )
+        self.connection.commit()
+
+        self.service.ingest_channel_message(
+            source_name="discord", channel_external_id=None, trader_raw="bob",
+            raw_text="BOUGHT AAPL 07/24 200C $2.00",
+            cleaned_text="BOUGHT AAPL 07/24 200C $2.00",
+            synthetic_id_input="s-legacy-mix",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+
+        results = self.service.list_trade_signals_for_review()
+        symbols = {row["symbol"] for row in results}
+        self.assertIn("SPY", symbols)
+        self.assertIn("AAPL", symbols)
+
+
+class R5TransactionContextManagerTests(unittest.TestCase):
+    """Items 24-29: the safe transaction context manager contract."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = _open_failing_connection(self.config)
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _ingest_kwargs(self, synthetic_id_input="s-tx"):
+        return dict(
+            source_name="discord", channel_external_id=None, trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input=synthetic_id_input,
+            reference_date="2026-07-24", timezone="UTC",
+        )
+
+    def test_rejects_entry_when_in_transaction_already_true(self):
+        self.connection.execute("INSERT INTO sources (name) VALUES ('scratch')")
+        self.assertTrue(self.connection.in_transaction)
+
+        other_connection = get_connection(self.config)
+        try:
+            with self.assertRaises(RuntimeError):
+                self.service.ingest_channel_message(**self._ingest_kwargs())
+
+            self.assertTrue(self.connection.in_transaction)
+            visible_to_other = other_connection.execute(
+                "SELECT COUNT(*) FROM sources WHERE name = 'scratch'"
+            ).fetchone()[0]
+            self.assertEqual(
+                visible_to_other, 0,
+                "unrelated pending work must not be committed by a refused R5 call",
+            )
+        finally:
+            other_connection.close()
+            self.connection.rollback()
+
+    def test_rejects_entry_for_every_public_write_method(self):
+        self.connection.execute("INSERT INTO sources (name) VALUES ('scratch2')")
+
+        with self.assertRaises(RuntimeError):
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+        with self.assertRaises(RuntimeError):
+            self.service.ingest_batch(
+                source_name="discord", reference_date="2026-07-24", timezone="UTC",
+                raw_batch_text="BOUGHT SPY 450C $3.25",
+            )
+        with self.assertRaises(RuntimeError):
+            self.service.reprocess_raw_message(1)
+        with self.assertRaises(RuntimeError):
+            self.service.reprocess_import_batch(1)
+
+        self.connection.rollback()
+
+    def test_begin_failure_restores_isolation_level_and_leaves_no_open_transaction(self):
+        saved_isolation_level = self.connection.isolation_level
+        self.connection.fail_on_begin = True
+
+        with self.assertRaises(sqlite3.OperationalError):
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+        self.assertFalse(self.connection.in_transaction)
+        self.assertFalse(self.connection.rollback_called)
+
+    def test_body_failure_rolls_back_propagates_and_restores_isolation_level(self):
+        saved_isolation_level = self.connection.isolation_level
+
+        with patch.object(
+            TradeService,
+            "_ingest_channel_message_no_commit",
+            side_effect=RuntimeError("simulated body failure"),
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "simulated body failure")
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+        self.assertFalse(self.connection.in_transaction)
+        self.assertTrue(self.connection.rollback_called)
+
+    def test_commit_failure_rolls_back_propagates_and_restores_isolation_level(self):
+        saved_isolation_level = self.connection.isolation_level
+        self.connection.fail_on_commit = True
+
+        with self.assertRaises(sqlite3.OperationalError) as cm:
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "simulated COMMIT failure")
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+        self.assertFalse(self.connection.in_transaction)
+        self.assertTrue(self.connection.rollback_called)
+
+    def test_rollback_cleanup_failure_does_not_hide_primary_commit_exception(self):
+        saved_isolation_level = self.connection.isolation_level
+        self.connection.fail_on_commit = True
+        self.connection.fail_on_rollback = True
+
+        with self.assertRaises(sqlite3.OperationalError) as cm:
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "simulated COMMIT failure")
+        self.assertTrue(self.connection.rollback_called)
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+
+    def test_rollback_cleanup_failure_does_not_hide_primary_body_exception(self):
+        saved_isolation_level = self.connection.isolation_level
+        self.connection.fail_on_rollback = True
+
+        with patch.object(
+            TradeService,
+            "_ingest_channel_message_no_commit",
+            side_effect=RuntimeError("original body failure"),
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "original body failure")
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+
+    def test_rollback_fails_but_sql_rollback_fallback_succeeds_leaves_connection_usable(self):
+        saved_isolation_level = self.connection.isolation_level
+        self.connection.fail_on_commit = True
+        self.connection.fail_on_rollback = True
+
+        with self.assertRaises(sqlite3.OperationalError) as cm:
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "simulated COMMIT failure")
+        self.assertTrue(self.connection.rollback_called)
+        self.assertTrue(self.connection.rollback_sql_called)
+        self.assertFalse(self.connection.in_transaction)
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+        # The connection remains open and fully usable after the fallback.
+        self.connection.execute("SELECT 1")
+
+    def test_rollback_and_sql_rollback_both_fail_closes_connection_but_preserves_original_exception(
+        self,
+    ):
+        self.connection.fail_on_commit = True
+        self.connection.fail_on_rollback = True
+        self.connection.fail_on_rollback_sql = True
+
+        with self.assertRaises(sqlite3.OperationalError) as cm:
+            self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertEqual(str(cm.exception), "simulated COMMIT failure")
+        self.assertTrue(self.connection.rollback_called)
+        self.assertTrue(self.connection.rollback_sql_called)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            self.connection.execute("SELECT 1")
+
+    def test_successful_call_leaves_connection_clean(self):
+        saved_isolation_level = self.connection.isolation_level
+
+        self.service.ingest_channel_message(**self._ingest_kwargs())
+
+        self.assertFalse(self.connection.in_transaction)
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
+
+    def test_reprocess_raw_message_owns_its_own_transaction(self):
+        real_connection = get_connection(self.config)
+        try:
+            service = TradeService(real_connection)
+            outcome = service.ingest_channel_message(**self._ingest_kwargs())
+            real_connection.commit()
+        finally:
+            real_connection.close()
+
+        saved_isolation_level = self.connection.isolation_level
+        self.service.reprocess_raw_message(outcome.raw_message_id)
+        self.assertFalse(self.connection.in_transaction)
+        self.assertEqual(self.connection.isolation_level, saved_isolation_level)
 
 
 if __name__ == "__main__":

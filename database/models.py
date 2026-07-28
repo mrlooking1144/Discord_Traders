@@ -5,7 +5,7 @@ are the typed boundary between the database layer and the rest of the
 application. They contain no database access, validation, or business logic.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -237,3 +237,180 @@ class MessageExtraction:
     is_current: bool = True
     superseded_at: Optional[str] = None
     created_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R5: result models.
+#
+# These are plain, frozen result dataclasses returned by
+# database.service.TradeService's new R5 orchestration methods
+# (ingest_channel_message, ingest_batch, reprocess_raw_message,
+# reprocess_import_batch, get_channel_checkpoints). Unlike the models
+# above, they do not mirror a database table row-for-row - they are
+# purpose-built return shapes for one call's outcome. They contain no
+# database access, validation, or business logic. Unexpected exceptions
+# are never represented by any of these dataclasses - they always
+# propagate as raised Python exceptions instead.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MessageIngestOutcome:
+    """One message's ingestion result, from ingest_channel_message() or one
+    message within ingest_batch().
+
+    Attributes:
+        sequence_in_batch: 1-indexed position within its batch, or None for
+            a message ingested via a direct (non-batch)
+            ingest_channel_message() call.
+        outcome: Exactly "stored" or "duplicate". Never represents an
+            unexpected exception - those propagate as raised Python
+            exceptions and are never captured as a result value.
+        channel_id: FK to channels.id. Always populated.
+        raw_message_id: The new row's id (outcome="stored") or the
+            pre-existing row's id (outcome="duplicate"). Always populated.
+        external_id: The resolved (real or synthetic) external_id used for
+            this message. Always populated.
+        parse_status: One of 'parsed'/'partially_parsed'/'unrecognized'/
+            'failed' when outcome == "stored"; None when outcome ==
+            "duplicate", since no extraction is attempted for a recognized
+            duplicate.
+        trade_signal_ids: ids of every trade_signals row created for this
+            message. Empty (never None) when the signal-creation gate did
+            not pass, or when outcome == "duplicate".
+        ambiguity_flags: Merged adapter/extractor/resolver/trader-identity
+            flags. Empty (never None) when outcome == "duplicate".
+        content_differs: True/False when outcome == "duplicate" (whether
+            the newly-supplied raw_text's content hash differs from the
+            existing row's stored content_hash); None when outcome ==
+            "stored" (not applicable).
+    """
+
+    sequence_in_batch: Optional[int]
+    outcome: str
+    channel_id: int
+    raw_message_id: int
+    external_id: str
+    parse_status: Optional[str]
+    trade_signal_ids: list[int] = field(default_factory=list)
+    ambiguity_flags: list[str] = field(default_factory=list)
+    content_differs: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class BatchIngestResult:
+    """Result of one TradeService.ingest_batch() call.
+
+    Attributes:
+        import_batch_id: The newly-created import_batches.id, or None when
+            every segmented message was already present (a fully
+            duplicate/no-op batch), or when every intended new message was
+            reclassified as a duplicate via the narrow unique-constraint
+            race carve-out, leaving zero stored messages.
+        channel_id: FK to channels.id. Always populated.
+        total_segmented: Count segment_discord_batch() produced from the
+            pasted batch text.
+        stored_count: Count of messages with outcome == "stored"
+            (regardless of parse_status - unrecognized/failed extractions
+            still count as "stored", since the raw message and extraction
+            persist either way).
+        duplicate_count: Count of messages with outcome == "duplicate".
+        unrecognized_count: Subset of stored_count where
+            parse_status == "unrecognized".
+        failed_count: Subset of stored_count where parse_status ==
+            "failed" (extract_trade_event()'s own internal-error status,
+            not a Python exception).
+        messages: One MessageIngestOutcome per segmented message, in
+            sequence_in_batch order, including duplicates.
+    """
+
+    import_batch_id: Optional[int]
+    channel_id: int
+    total_segmented: int
+    stored_count: int
+    duplicate_count: int
+    unrecognized_count: int
+    failed_count: int
+    messages: list[MessageIngestOutcome] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReprocessOutcome:
+    """Result of reprocessing one raw message.
+
+    Attributes:
+        raw_message_id: The reprocessed row's id.
+        previous_extraction_id: The prior current extraction's id, or None
+            if this raw message had no current extraction before this call
+            (e.g. its first-ever extraction attempt).
+        new_extraction_id: The newly-created, now-current extraction's id.
+        parse_status: The new extraction's parse_status.
+        new_trade_signal_ids: ids of every new trade_signals row created,
+            linked to new_extraction_id. Empty (never None) if the
+            signal-creation gate did not pass.
+        ambiguity_flags: The new extraction's merged ambiguity flags.
+    """
+
+    raw_message_id: int
+    previous_extraction_id: Optional[int]
+    new_extraction_id: int
+    parse_status: str
+    new_trade_signal_ids: list[int] = field(default_factory=list)
+    ambiguity_flags: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReprocessBatchResult:
+    """Result of TradeService.reprocess_import_batch().
+
+    Attributes:
+        import_batch_id: The import_batches.id that was reprocessed.
+            Deliberately not channel_id - reprocessing scope is
+            batch-level, and this field name reflects exactly what was
+            requested and processed.
+        outcomes: One ReprocessOutcome per raw message linked to this
+            import_batch_id, in raw_messages.id order.
+    """
+
+    import_batch_id: int
+    outcomes: list[ReprocessOutcome] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChannelCheckpoint:
+    """One channel's composite resume/audit checkpoint.
+
+    Attributes:
+        channel_id: FK to channels.id.
+        channel_external_id: The channel's external_channel_id, or None.
+        channel_name: The channel's display name, or None.
+        latest_received_at: Canonical UTC ISO8601 string
+            ("YYYY-MM-DDTHH:MM:SS.ffffff+00:00"), the maximum non-NULL
+            raw_messages.received_at for this channel; None when no
+            message in this channel has any resolved timestamp at all -
+            this explicitly signals "chronological resume information
+            unavailable" and must never be substituted with insertion
+            order.
+        latest_received_raw_message_id: The specific raw_messages.id
+            latest_received_at came from, or None exactly when
+            latest_received_at is None.
+        latest_received_external_id: That same message's external_id, or
+            None exactly when latest_received_at is None.
+        last_ingested_raw_message_id: MAX(raw_messages.id) for this
+            channel - always populated (every channel returned here has
+            at least one raw_messages row).
+        last_ingested_at: That same row's ingested_at.
+        last_import_batch_id: That same row's import_batch_id, or None for
+            a channel whose most recently inserted message came from
+            single-message ingestion outside any batch.
+    """
+
+    channel_id: int
+    channel_external_id: Optional[str]
+    channel_name: Optional[str]
+    latest_received_at: Optional[str]
+    latest_received_raw_message_id: Optional[int]
+    latest_received_external_id: Optional[str]
+    last_ingested_raw_message_id: int
+    last_ingested_at: str
+    last_import_batch_id: Optional[int]

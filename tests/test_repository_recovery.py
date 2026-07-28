@@ -23,14 +23,20 @@ from database.repository import (
     create_raw_message,
     create_trade_signal,
     create_trader,
+    delete_import_batch_if_empty,
     get_channel_by_external_id,
+    get_channel_chronological_checkpoints,
+    get_channel_ingestion_cursors,
     get_current_extraction,
     get_import_batch_by_id,
     get_or_create_channel,
     get_or_create_source,
     get_or_create_unspecified_channel,
     get_raw_message_by_channel_and_external_id,
+    get_raw_message_by_id,
+    get_raw_message_ids_by_import_batch,
     get_trade_signal_by_id,
+    get_trader_by_id,
     get_traders_by_canonical_name,
     supersede_extraction,
 )
@@ -532,6 +538,186 @@ class TradeSignalExtendedFieldsTests(_RecoveryRepositoryTestCase):
         self.assertEqual(fetched, created)
         self.assertEqual(fetched.strike, "207.5")
         self.assertEqual(fetched.qualifier, "1/2")
+
+
+class GetRawMessageByIdTests(_RecoveryRepositoryTestCase):
+    def test_found_and_missing(self):
+        created = create_raw_message(self.connection, self.source.id, "BOUGHT AVGO ...")
+        self.connection.commit()
+
+        found = get_raw_message_by_id(self.connection, created.id)
+        missing = get_raw_message_by_id(self.connection, created.id + 999999)
+
+        self.assertEqual(found, created)
+        self.assertIsNone(missing)
+
+
+class GetRawMessageIdsByImportBatchTests(_RecoveryRepositoryTestCase):
+    def test_returns_only_linked_ids_in_ascending_order(self):
+        batch = create_import_batch(
+            self.connection, self.source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        other_batch = create_import_batch(
+            self.connection, self.source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        third = create_raw_message(
+            self.connection, self.source.id, "c", import_batch_id=batch.id
+        )
+        first = create_raw_message(
+            self.connection, self.source.id, "a", import_batch_id=batch.id
+        )
+        create_raw_message(
+            self.connection, self.source.id, "x", import_batch_id=other_batch.id
+        )
+        self.connection.commit()
+
+        ids = get_raw_message_ids_by_import_batch(self.connection, batch.id)
+
+        self.assertEqual(ids, sorted([third.id, first.id]))
+
+    def test_no_linked_messages_returns_empty_list(self):
+        batch = create_import_batch(
+            self.connection, self.source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        self.assertEqual(get_raw_message_ids_by_import_batch(self.connection, batch.id), [])
+
+    def test_nonexistent_import_batch_returns_empty_list(self):
+        self.assertEqual(
+            get_raw_message_ids_by_import_batch(self.connection, 999999), []
+        )
+
+
+class DeleteImportBatchIfEmptyTests(_RecoveryRepositoryTestCase):
+    def test_deletes_batch_with_no_linked_raw_messages(self):
+        batch = create_import_batch(
+            self.connection, self.source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+
+        deleted = delete_import_batch_if_empty(self.connection, batch.id)
+        self.connection.commit()
+
+        self.assertTrue(deleted)
+        self.assertIsNone(get_import_batch_by_id(self.connection, batch.id))
+
+    def test_does_not_delete_batch_with_linked_raw_messages(self):
+        batch = create_import_batch(
+            self.connection, self.source.id, reference_date="2026-07-24", timezone="UTC"
+        )
+        self.connection.commit()
+        create_raw_message(
+            self.connection, self.source.id, "a", import_batch_id=batch.id
+        )
+        self.connection.commit()
+
+        deleted = delete_import_batch_if_empty(self.connection, batch.id)
+        self.connection.commit()
+
+        self.assertFalse(deleted)
+        self.assertIsNotNone(get_import_batch_by_id(self.connection, batch.id))
+
+    def test_nonexistent_import_batch_returns_false(self):
+        self.assertFalse(delete_import_batch_if_empty(self.connection, 999999))
+
+
+class GetTraderByIdTests(_RecoveryRepositoryTestCase):
+    def test_found_and_missing(self):
+        created = create_trader(self.connection, self.source.id, "alice")
+        self.connection.commit()
+
+        found = get_trader_by_id(self.connection, created.id)
+        missing = get_trader_by_id(self.connection, created.id + 999999)
+
+        self.assertEqual(found, created)
+        self.assertIsNone(missing)
+
+
+class ChannelCheckpointQueryTests(_RecoveryRepositoryTestCase):
+    def test_ingestion_cursor_reflects_highest_id_per_channel(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-a")
+        self.connection.commit()
+        create_raw_message(self.connection, self.source.id, "first", channel_id=channel.id)
+        second = create_raw_message(
+            self.connection, self.source.id, "second", channel_id=channel.id
+        )
+        self.connection.commit()
+
+        rows = get_channel_ingestion_cursors(self.connection)
+        row = next(r for r in rows if r["channel_id"] == channel.id)
+
+        self.assertEqual(row["last_ingested_raw_message_id"], second.id)
+        self.assertEqual(row["channel_external_id"], "chan-a")
+
+    def test_channel_with_no_raw_messages_is_absent(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-empty")
+        self.connection.commit()
+
+        rows = get_channel_ingestion_cursors(self.connection)
+
+        self.assertNotIn(channel.id, {r["channel_id"] for r in rows})
+
+    def test_chronological_checkpoint_reflects_max_received_at(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-b")
+        self.connection.commit()
+        create_raw_message(
+            self.connection,
+            self.source.id,
+            "earlier",
+            channel_id=channel.id,
+            received_at="2026-07-24T10:00:00.000000+00:00",
+        )
+        later = create_raw_message(
+            self.connection,
+            self.source.id,
+            "later",
+            channel_id=channel.id,
+            received_at="2026-07-24T20:00:00.000000+00:00",
+        )
+        self.connection.commit()
+
+        rows = get_channel_chronological_checkpoints(self.connection)
+        row = next(r for r in rows if r["channel_id"] == channel.id)
+
+        self.assertEqual(row["latest_received_at"], "2026-07-24T20:00:00.000000+00:00")
+        self.assertEqual(row["latest_received_raw_message_id"], later.id)
+
+    def test_channel_with_no_resolved_timestamp_is_absent(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-c")
+        self.connection.commit()
+        create_raw_message(self.connection, self.source.id, "no ts", channel_id=channel.id)
+        self.connection.commit()
+
+        rows = get_channel_chronological_checkpoints(self.connection)
+
+        self.assertNotIn(channel.id, {r["channel_id"] for r in rows})
+
+    def test_tie_broken_by_highest_raw_message_id(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-d")
+        self.connection.commit()
+        create_raw_message(
+            self.connection,
+            self.source.id,
+            "tie-a",
+            channel_id=channel.id,
+            received_at="2026-07-24T10:00:00.000000+00:00",
+        )
+        tie_b = create_raw_message(
+            self.connection,
+            self.source.id,
+            "tie-b",
+            channel_id=channel.id,
+            received_at="2026-07-24T10:00:00.000000+00:00",
+        )
+        self.connection.commit()
+
+        rows = get_channel_chronological_checkpoints(self.connection)
+        row = next(r for r in rows if r["channel_id"] == channel.id)
+
+        self.assertEqual(row["latest_received_raw_message_id"], tie_b.id)
 
 
 if __name__ == "__main__":

@@ -979,6 +979,17 @@ def get_trade_signals_for_review(
     entirely rather than matching everything via a wildcard. This function
     performs no writes and never modifies any row.
 
+    Recovery Milestone R5: a signal whose extraction_id points at a
+    superseded (non-current) message_extractions row is excluded - only
+    the current derived signal set for a reprocessed message is shown by
+    default. A signal with extraction_id IS NULL (every pre-R5 row, and
+    every row from the unmodified legacy TradeService.ingest_message()
+    path) has nothing to be superseded by and is always treated as
+    current. The LEFT JOIN to message_extractions is keyed on that
+    table's own primary key (message_extractions.id), so it can match at
+    most one row per trade_signals.extraction_id and can never duplicate
+    a trade_signals row in the result set.
+
     Args:
         conn: An open sqlite3.Connection.
         source_name: Exact sources.name to filter by, or None/blank to omit.
@@ -1003,7 +1014,9 @@ def get_trade_signals_for_review(
     Raises:
         ValueError: If date is supplied and is not in "YYYY-MM-DD" format.
     """
-    where_clauses: list[str] = []
+    where_clauses: list[str] = [
+        "(trade_signals.extraction_id IS NULL OR message_extractions.is_current = 1)"
+    ]
     params: list = []
 
     if source_name and source_name.strip():
@@ -1046,6 +1059,8 @@ def get_trade_signals_for_review(
         "JOIN traders ON trade_signals.trader_id = traders.id "
         "JOIN raw_messages ON trade_signals.raw_message_id = raw_messages.id "
         "JOIN sources ON raw_messages.source_id = sources.id "
+        "LEFT JOIN message_extractions "
+        "ON trade_signals.extraction_id = message_extractions.id "
         f"{where_sql} "
         "ORDER BY trade_signals.id DESC "
         "LIMIT ?",
@@ -1424,3 +1439,196 @@ def supersede_extraction(
     if row is None:
         return None
     return _row_to_message_extraction(row)
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R5: additional raw_messages/import_batches helpers and
+# checkpoint queries. No schema change - every function below reads or
+# writes only existing columns/tables.
+# ---------------------------------------------------------------------------
+
+
+def get_trader_by_id(
+    conn: sqlite3.Connection,
+    trader_id: int,
+) -> Trader | None:
+    """Look up a trader by primary key.
+
+    Used by reprocessing to confirm a persisted resolved_trader_id (see
+    the "_r5_provenance" metadata block) still refers to an existing
+    trader before reusing it, rather than blindly trusting a stale id.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: Primary key to look up.
+
+    Returns:
+        The matching Trader, or None if no row exists with this id.
+    """
+    row = conn.execute(
+        "SELECT id, source_id, name, external_trader_id, created_at, canonical_name "
+        "FROM traders WHERE id = ?",
+        (trader_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_trader(row)
+
+
+def get_raw_message_by_id(
+    conn: sqlite3.Connection,
+    raw_message_id: int,
+) -> RawMessage | None:
+    """Look up a raw message by primary key.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_id: Primary key to look up.
+
+    Returns:
+        The matching RawMessage, or None if no row exists with this id.
+    """
+    row = conn.execute(
+        f"SELECT {_RAW_MESSAGE_COLUMNS} FROM raw_messages WHERE id = ?",
+        (raw_message_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_raw_message(row)
+
+
+def get_raw_message_ids_by_import_batch(
+    conn: sqlite3.Connection,
+    import_batch_id: int,
+) -> list[int]:
+    """List the ids of every raw message linked to an import batch.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        import_batch_id: FK to import_batches.id.
+
+    Returns:
+        Every matching raw_messages.id, ordered ascending (deterministic,
+        insertion order). Empty list if none match or the import batch
+        does not exist.
+    """
+    rows = conn.execute(
+        "SELECT id FROM raw_messages WHERE import_batch_id = ? ORDER BY id",
+        (import_batch_id,),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def delete_import_batch_if_empty(
+    conn: sqlite3.Connection,
+    import_batch_id: int,
+) -> bool:
+    """Delete an import_batches row only if no raw_messages reference it.
+
+    A narrow, defensive helper for the theoretical case where every
+    intended-new message in a batch is reclassified as a duplicate via a
+    unique-constraint race (see TradeService.ingest_batch's narrow
+    IntegrityError-to-duplicate carve-out), which would otherwise leave an
+    orphaned, empty import_batches row behind. This function never deletes
+    a batch that any raw_messages row still references.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        import_batch_id: Primary key of the import batch to conditionally
+            delete.
+
+    Returns:
+        True if the row was deleted, False if it still has at least one
+        linked raw_messages row (not deleted) or did not exist.
+    """
+    cursor = conn.execute(
+        "DELETE FROM import_batches WHERE id = ? "
+        "AND NOT EXISTS (SELECT 1 FROM raw_messages WHERE import_batch_id = ?)",
+        (import_batch_id, import_batch_id),
+    )
+    return cursor.rowcount > 0
+
+
+def get_channel_ingestion_cursors(conn: sqlite3.Connection) -> list[dict]:
+    """List the most-recently-inserted raw message per channel.
+
+    The "ingestion/audit cursor" half of the R5 composite channel
+    checkpoint: purely insertion-order based (raw_messages.id is always
+    present and monotonically increasing), so it is always defined and
+    never ambiguous, unlike a timestamp-based cursor.
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        One dict per channel that has at least one raw_messages row, with
+        keys: channel_id, channel_external_id, channel_name,
+        last_ingested_raw_message_id, last_ingested_at,
+        last_import_batch_id. Empty list if no channel has any raw
+        message.
+    """
+    rows = conn.execute(
+        "SELECT "
+        "c.id AS channel_id, "
+        "c.external_channel_id AS channel_external_id, "
+        "c.name AS channel_name, "
+        "rm.id AS last_ingested_raw_message_id, "
+        "rm.ingested_at AS last_ingested_at, "
+        "rm.import_batch_id AS last_import_batch_id "
+        "FROM channels c "
+        "JOIN raw_messages rm ON rm.channel_id = c.id "
+        "WHERE rm.id = (SELECT MAX(id) FROM raw_messages WHERE channel_id = c.id) "
+        "ORDER BY c.id"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_channel_chronological_checkpoints(conn: sqlite3.Connection) -> list[dict]:
+    """List the latest resolved authoritative timestamp per channel.
+
+    The "chronological resume point" half of the R5 composite channel
+    checkpoint. Only channels with at least one non-NULL
+    raw_messages.received_at appear in the result - a channel where every
+    message's received_at is NULL is entirely absent here, which is the
+    explicit, unambiguous signal that no chronological resume point is
+    available for it (the caller must not substitute insertion order).
+
+    Ties (two messages sharing the exact same received_at value) are
+    broken deterministically by the higher raw_messages.id.
+
+    This query's correctness as a plain string MAX()/comparison depends
+    on every non-NULL received_at value having already been normalized to
+    the fixed-width canonical UTC representation
+    ("YYYY-MM-DDTHH:MM:SS.ffffff+00:00") before being stored - see
+    TradeService._to_canonical_utc_string(). This function performs no
+    normalization itself; it only reads whatever was stored.
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        One dict per channel with at least one non-NULL received_at, with
+        keys: channel_id, latest_received_raw_message_id,
+        latest_received_at, latest_received_external_id. Empty list if no
+        channel has any resolved timestamp.
+    """
+    rows = conn.execute(
+        "SELECT "
+        "c.id AS channel_id, "
+        "rm.id AS latest_received_raw_message_id, "
+        "rm.received_at AS latest_received_at, "
+        "rm.external_id AS latest_received_external_id "
+        "FROM channels c "
+        "JOIN raw_messages rm ON rm.channel_id = c.id "
+        "WHERE rm.received_at IS NOT NULL "
+        "AND rm.received_at = ("
+        "    SELECT MAX(received_at) FROM raw_messages "
+        "    WHERE channel_id = c.id AND received_at IS NOT NULL"
+        ") "
+        "AND rm.id = ("
+        "    SELECT MAX(id) FROM raw_messages "
+        "    WHERE channel_id = c.id AND received_at = rm.received_at"
+        ") "
+        "ORDER BY c.id"
+    ).fetchall()
+    return [dict(row) for row in rows]

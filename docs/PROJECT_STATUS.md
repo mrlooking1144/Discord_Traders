@@ -2,8 +2,8 @@
 v0.1.0
 
 # Current Milestone
-Milestone 2D.7 — Release and User Acceptance Testing
-(UAT execution complete; all items passed; no release-blocking defects; ready for explicit v0.1.0 release approval)
+Recovery Milestone R5 — Metadata-Rich Ingestion, Batch Import, Reprocessing, Supersession, and Channel Checkpoints
+(implementation committed locally; documentation prepared and pending review/commit — see docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt)
 
 # Completed
 - Project structure
@@ -127,15 +127,21 @@ Milestone 2D.7 — Release and User Acceptance Testing
   - 433/433 tests passing (unchanged from Milestone 2D.6 — no application, database, or test code was modified in this milestone)
   - Local `main` and `origin/main` synchronized at `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` (0 ahead / 0 behind) throughout and after UAT; no `v0.1.0` tag exists yet
   - **Release status: ready for explicit Product Owner `v0.1.0` release approval** (a distinct, separate decision from the UAT-completion sign-off already recorded) — tagging has not occurred; **Phase 2E — Discord Ingestion has not started** and remains future scope; per the Product Owner's explicit instruction, project work stops after `v0.1.0` is released unless a new, separate, explicit approval is given later to begin Phase 2E
+- Recovery Milestone R5: Metadata-rich ingestion, batch import, reprocessing, supersession, and channel checkpoints — implementation committed locally (see docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt; commit 2bf81bedea5f501025389e952f52e70d9db2a384 — "Implement Recovery Milestone R5 ingestion and reprocessing"). **Implementation only; documentation for this milestone is prepared but not yet committed, and the implementation commit has not yet been pushed to `origin/main`. Recovery Milestone R5 is not considered fully complete until the documentation commit is reviewed, approved, and committed.**
+  - New `TradeService` public methods `ingest_channel_message()`, `ingest_batch()`, `reprocess_raw_message()`, `reprocess_import_batch()`, `get_channel_checkpoints()`; no schema or migration changes
+  - 826/826 tests passing (802 tests present after the R5 implementation, plus 24 new correction tests)
+  - This is a Recovery-track milestone; the pre-Recovery `2D.x`/`v0.1.0` track's own historical Milestone entries above (through 2D.7) are left intact as a record of that track's completed, released work — this document's current-status fields (top-level Current Milestone/Current Focus/Next Milestone, and the Documentation block below) have been updated to reflect the Recovery Phase now in progress
+  - Recovery Milestone R6 has not started
+  - Backend-only: the existing manual v0.1.0 application (`app/streamlit_app.py`) remains the only user-facing workflow and is unchanged by this milestone; the Product Owner's target workflow of pasting Discord messages directly into the application and viewing performance by trader is not yet achievable and requires later Recovery analytics and UI milestones (at minimum R6 lifecycle linking, R7 trader-performance analytics, and R8 UI)
 
 # Current Focus
-Milestone 2D.7 — Release and User Acceptance Testing UAT execution is complete: all 13 UAT items passed, with no release-blocking defects found, against release-candidate commit `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e` inside Windows Sandbox (Session A: Python-missing test; Session B: full happy path). 433/433 tests passing, unchanged. Local `main` and `origin/main` remain synchronized at `2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e`, 0 ahead / 0 behind. Documentation for this milestone (this update and docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt) is prepared and pending its own review/commit/push. **The release is now ready for explicit Product Owner `v0.1.0` release approval — a distinct, separate decision from the UAT-completion sign-off already recorded — after which the tag is created and pushed.** No `v0.1.0` tag exists yet. **Phase 2E — Discord Ingestion has not started** and remains future scope; per the Product Owner's explicit instruction, project work stops after `v0.1.0` is released unless a new, separate, explicit approval is given later to begin Phase 2E. Architecture (`docs/DATABASE_DESIGN_V1.md`) and the database design remain frozen; no schema, repository, model, parser, service, or database-configuration redesign occurred in Milestone 2D.7 — no application code was changed at all.
+The manual v0.1.0 track (Phase 2D, through Milestone 2D.7) is complete and released: the annotated tag `v0.1.0` exists and was pushed, pointing to commit `6e9350b5866c594ee4998f938459ac3db6056c1e`; the original manual v0.1.0 workflow remains fully usable exactly as documented in the Milestone entries above. Work is now in the Recovery Phase, layered on top of that released version. Recovery Milestones R1 through R4 are complete and pushed to `origin/main`. Recovery Milestone R5 — metadata-rich channel ingestion, Discord batch import, reprocessing/supersession, and per-channel checkpoints — is implemented and committed locally at commit `2bf81bedea5f501025389e952f52e70d9db2a384` ("Implement Recovery Milestone R5 ingestion and reprocessing"); its documentation (this file and docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt) is prepared and pending its own review/commit/push. Local `main` is one commit ahead of `origin/main` (`origin/main` at `0a1a3660013a3dd2c061b800c9325c6ce047cb59`, the completed R4 documentation commit), 0 behind. 826/826 tests passing. R5 is backend-only: the existing manual v0.1.0 application remains the only user-facing workflow, and the Product Owner cannot yet paste Discord batches through the application UI or view trader-performance analytics there — that target requires subsequent Recovery lifecycle/analytics/UI work (at minimum R6 lifecycle linking, R7 trader-performance analytics, and R8 UI). Recovery Milestone R6 has not started and must not begin without its own separate, explicit design approval.
 
 # Next Milestone
-None within Phase 2D — Milestone 2D.7 is the final milestone in Phase 2D. Next action is the explicit Product Owner `v0.1.0` release-approval and tagging step (outside any milestone's implementation scope), after which project work stops unless a new, separate, explicit approval is given to begin Phase 2E — Discord Ingestion.
+Recovery Milestone R6 (lifecycle linking — `trade_lifecycles`) is the next candidate milestone within the Recovery Phase, but it has not been approved or scoped and must not be started automatically. The immediate next action is Product Owner / Technical Architect (ChatGPT) review and approval of the Recovery Milestone R5 documentation (this file and docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt); only after that approval should the R5 documentation be committed, and, through a separately approved step, the R5 implementation and documentation commits pushed to `origin/main`.
 
 # Known Issues
-- Date/Time extraction not implemented
+- (Resolved by Recovery Milestones R3-R4) Date/time extraction and resolution are now implemented — see docs/HANDOFFS/R3_extractor_grammar_extension.txt and docs/HANDOFFS/R4_date_and_time_resolution.txt
 
 # Documentation
 
@@ -146,19 +152,28 @@ Database Design:
 FROZEN (docs/DATABASE_DESIGN_V1.md unchanged)
 
 Implementation Roadmap:
-Extended through Milestone 2D.7 (Phase 2D approved; commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64); Milestone 2D.7 is the final milestone under Phase 2D; Phase 2E (Discord Ingestion) recorded as future scope only, not yet scoped or approved for implementation
+Extended through Milestone 2D.7 (Phase 2D approved; commit 1ed88d3628823ce231f76d9ad9e4f5a46b953a64); Milestone 2D.7 was the final milestone under Phase 2D, and `v0.1.0` has since been released (see Release Status below). `docs/IMPLEMENTATION_ROADMAP.md` itself has not been re-opened or amended for the Recovery track — Recovery Milestones R1-R5 are not scoped there under any Phase 2E heading. Whether/how to fold the Recovery track into that roadmap document remains an open documentation-workflow question for the Product Owner/Technical Architect, not decided by this update.
 
 Current Phase:
-Phase 2D — Manual Version 1 Operational Readiness (complete pending v0.1.0 release approval)
+Recovery Phase (the Phase 2D / v0.1.0 manual-entry track is complete and released; Recovery work now proceeds on top of it)
 
 Current Milestone:
-2D.7 — Release and User Acceptance Testing (UAT execution complete via preparation commit 2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e; all 13 UAT items passed; no release-blocking defects; ready for explicit v0.1.0 release approval)
+Recovery Milestone R5 — implementation committed locally; documentation prepared and pending review/commit (see docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt)
 
 Git Synchronization:
-Local main and origin/main are synchronized at 2d39b93c37324b0a3a1a4a6f413bc7469dec1d4e (0 ahead / 0 behind). No v0.1.0 tag exists yet.
+Local main: 2bf81bedea5f501025389e952f52e70d9db2a384 ("Implement Recovery Milestone R5 ingestion and reprocessing"). origin/main: 0a1a3660013a3dd2c061b800c9325c6ce047cb59 (the completed R4 documentation commit). Ahead 1 / behind 0.
+
+Release Status:
+`v0.1.0` exists and was pushed (annotated tag `v0.1.0`, pointing to commit `6e9350b5866c594ee4998f938459ac3db6056c1e`). The original manual v0.1.0 release remains usable.
+
+Recovery Status:
+R1 complete and pushed. R2 complete and pushed. R3 complete and pushed. R4 complete and pushed. R5 implementation committed locally. R5 documentation prepared but not committed. R6 not started.
 
 Test Suite:
-433/433 tests passing
+826/826 tests passing
+
+User-Facing Readiness:
+The existing manual v0.1.0 workflow remains usable. R5 backend ingestion, batch import, reprocessing, supersession, and checkpoints are implemented. The Product Owner cannot yet paste Discord batches through the application UI and view trader-performance analytics. That target requires subsequent lifecycle/analytics/UI work, including R6, R7, and R8.
 
 Next Action:
-ChatGPT review of the Milestone 2D.7 documentation diff (this file and docs/HANDOFFS/2D.7_release_and_user_acceptance_testing.txt). On approval, commit the documentation, then push it to origin/main. Obtain the Product Owner's separate, explicit v0.1.0 release approval per docs/RELEASE_CHECKLIST.md Section 18, then create and push the v0.1.0 tag. After v0.1.0 is released, project work stops; Phase 2E — Discord Ingestion must not begin without a new, separate, explicit Product Owner approval.
+Review and approve the Recovery Milestone R5 documentation (this file and docs/HANDOFFS/R5_ingestion_reprocessing_and_checkpoints.txt). Then commit and push the R5 implementation and documentation through separately approved steps. Do not start R6 automatically.

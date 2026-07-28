@@ -1,0 +1,379 @@
+# Milestone
+
+Recovery Milestone R5 - Metadata-Rich Ingestion, Batch Import, Reprocessing,
+Supersession, and Channel Checkpoints
+Status: implementation complete locally. Not yet pushed to origin/main at
+the time this handoff is written.
+
+# Summary
+
+Objective: give the Recovery pipeline a real, idempotent, channel-scoped
+persistence layer on top of R1's schema additions, R2's Discord
+segmentation adapter, R3's extractor grammar, and R4's date/time
+resolution - so a pasted Discord channel-history batch (or a single
+metadata-rich message) can be ingested exactly once, its trade signals
+derived and stored, and later reprocessed as the extractor improves,
+without ever losing or duplicating data. R5 adds no schema or migration
+changes: every new column and table it relies on (channels, import_batches,
+message_extractions, and the raw_messages/trade_signals columns added
+alongside them) was already added by earlier Recovery milestones.
+
+## Repository state
+
+- Branch: main
+- Full implementation commit hash:
+  2bf81bedea5f501025389e952f52e70d9db2a384
+- Exact commit message:
+  Implement Recovery Milestone R5 ingestion and reprocessing
+- Baseline immediately before this commit: 0a1a3660013a3dd2c061b800c9325c6ce047cb59
+  ("Add Recovery Milestone R4 handoff")
+- Local main was exactly one commit ahead of origin/main (origin/main at
+  0a1a3660013a3dd2c061b800c9325c6ce047cb59), 0 behind, immediately before
+  this documentation work began.
+- This commit has not been pushed to origin/main as of this handoff.
+
+# Files Modified
+
+Exactly seven files, all in the single R5 implementation commit
+(2bf81bedea5f501025389e952f52e70d9db2a384):
+
+    database/models.py                        |  179 +++-
+    database/repository.py                    |  210 +++-
+    database/service.py                       | 1263 +++++++++++++++++++++-
+    tests/test_batch_ingestion_integration.py |  285 +++++ (new file)
+    tests/test_repository_recovery.py         |  186 ++++
+    tests/test_repository_sources.py          |   92 ++
+    tests/test_service.py                     | 1634 +++++++++++++++++++++++++++++
+    7 files changed, 3843 insertions(+), 6 deletions(-)
+
+No schema, migration, UI, requirements, roadmap, project-status, or
+handoff file is part of this commit. `database/schema.sql`,
+`app/parser.py`, `app/discord_adapter.py`, `app/datetime_resolution.py`,
+`app/streamlit_app.py`, `start.bat`, `requirements.txt`, and every other
+tracked file outside the seven listed above are unchanged by this
+milestone.
+
+# Public APIs Added
+
+All five are new public methods on `database.service.TradeService`. Every
+pre-R5 method (`ingest_message`, `check_duplicate_signal`,
+`update_trade_signal`, `list_trade_signals_for_review`,
+`list_trade_signal_audit_history`) is completely unmodified and keeps its
+existing caller-owned commit/rollback convention.
+
+- `TradeService.ingest_channel_message(...)` - ingest one metadata-rich,
+  channel-scoped message. Accepts only user/source-facing fields (source
+  name, channel identity, trader identity, raw/cleaned text, a real or
+  synthetic external id, native/footer timestamp inputs, reference
+  date/timezone, channel tags, adapter ambiguity flags, and optional
+  extra metadata). Returns a `MessageIngestOutcome`.
+- `TradeService.ingest_batch(...)` - segments one pasted Discord
+  channel-history block via `app.discord_adapter.segment_discord_batch()`
+  and ingests every resulting message under one shared `import_batches`
+  row. Returns a `BatchIngestResult`.
+- `TradeService.reprocess_raw_message(raw_message_id)` - re-runs
+  extraction against an already-stored message's persisted R5 provenance
+  (never re-segments, never touches `raw_text`), superseding the prior
+  extraction and creating a new one. Returns a `ReprocessOutcome`.
+- `TradeService.reprocess_import_batch(import_batch_id)` - reprocesses
+  every raw message linked to one import batch as a single all-or-nothing
+  transaction. Returns a `ReprocessBatchResult`.
+- `TradeService.get_channel_checkpoints()` - read-only; lists the
+  composite resume/audit checkpoint for every channel. Returns a
+  `list[ChannelCheckpoint]`.
+
+Five new frozen result dataclasses were added to `database/models.py` to
+back these methods: `MessageIngestOutcome`, `BatchIngestResult`,
+`ReprocessOutcome`, `ReprocessBatchResult`, `ChannelCheckpoint`. List-typed
+fields carry precise element types
+(`trade_signal_ids: list[int]`, `ambiguity_flags: list[str]`,
+`messages: list[MessageIngestOutcome]`, `outcomes: list[ReprocessOutcome]`),
+each backed by a `typing.get_type_hints()` test, not just a field-name
+check.
+
+# Functional Behavior
+
+- Metadata-rich single-message ingestion via `ingest_channel_message()`:
+  resolves source and channel (find-or-create), classifies trader
+  identity read-only before any write, extracts trade data via
+  `app.parser.extract_trade_event()`, resolves expiration and the
+  authoritative received-at timestamp, and persists the raw message,
+  its extraction record, and (when the signal-creation gate passes) a
+  trade signal.
+- Discord batch segmentation and ingestion via `ingest_batch()`:
+  validates batch-wide anchors and segments the pasted text (both pure,
+  no database access) before ever opening a transaction; then resolves
+  source/channel, runs a duplicate preflight over every segmented
+  message, and ingests each intended-new message under one shared
+  `import_batches` row.
+- Channel-scoped idempotency: a message is recognized as already-stored
+  by `(channel_id, external_id)`, not by a source-wide key alone, so the
+  same external id may legitimately repeat across two different
+  channels of the same source.
+- Approved durable synthetic message-ID format (see "Product Owner
+  Decisions" below) is used whenever no real source-provided message id
+  is available.
+- Duplicate detection never overwrites stored raw content: a duplicate
+  message returns the pre-existing row's id and a `content_differs`
+  flag (whether the newly-supplied text's hash differs from what is
+  stored) without ever touching `raw_text`, `metadata`, or any
+  downstream extraction/signal row.
+- A fully duplicate batch (every segmented message already present)
+  creates no `import_batches` row at all.
+- A partial duplicate batch links only the genuinely new messages to
+  the new `import_batches` row; already-present messages are reported
+  as duplicates referencing their original batch/channel.
+- Missing or ambiguous trader identity is preserved without guessing:
+  a message with no resolvable trader (blank/missing trader text, or a
+  canonical name matching more than one existing trader) is still
+  stored, flagged (`trader_identity_missing` /
+  `trader_identity_ambiguous`), and never assigned to an arbitrarily
+  chosen trader row.
+- Signal creation gate: a `trade_signals` row is created only when a
+  resolved trader id, a non-None extracted action, and a non-None
+  extracted symbol are all present simultaneously; a partially or fully
+  unresolved message still persists its raw message and extraction
+  record, just with zero signals.
+- Raw messages and extraction audit data are preserved: `raw_text` and
+  the reserved `_r5_provenance` metadata block are write-once and never
+  modified by reprocessing.
+- Reprocessing supersedes the prior current extraction (marks it
+  `is_current = 0`, stamps `superseded_at`) instead of deleting it, then
+  inserts a new current extraction from the same persisted provenance.
+- Old trade signals tied to a superseded extraction remain completely
+  immutable - reprocessing never edits or removes them.
+- Current-signal review (`get_trade_signals_for_review()`) excludes
+  signals whose `extraction_id` points at a superseded (non-current)
+  extraction; a signal with `extraction_id IS NULL` (every pre-R5 row,
+  and every row from the unmodified legacy `ingest_message()` path) has
+  nothing to be superseded by and is always treated as current.
+- Per-channel checkpoints (`get_channel_checkpoints()`) report two
+  independent cursors per channel: an insertion-order ingestion cursor
+  (always defined) and a chronological cursor based on the maximum
+  resolved `received_at` (explicitly `None`, never substituted with
+  insertion order, when no message in that channel has any resolved
+  timestamp at all).
+- Canonical UTC timestamp storage: every resolved `received_at` value is
+  normalized to a fixed-width UTC ISO8601 string
+  ("YYYY-MM-DDTHH:MM:SS.ffffff+00:00") before being stored, so a plain
+  SQL `MAX()`/string comparison is guaranteed to match true chronological
+  order regardless of the timestamp's original UTC offset.
+- No schema migration was required for any of the above - R5 is
+  entirely an orchestration/business-rule layer on top of tables and
+  columns already added by R1.
+
+# Transaction and Safety Design
+
+- All five R5 public write methods (`ingest_channel_message`,
+  `ingest_batch`, `reprocess_raw_message`, `reprocess_import_batch`) own
+  and fully control one explicit transaction each via the private
+  `TradeService._r5_write_transaction()` context manager - a deliberate,
+  explicit divergence from every pre-R5 method's caller-owned
+  commit/rollback convention (`get_channel_checkpoints()` is read-only
+  and owns no transaction).
+- `_r5_write_transaction()` rejects entry with `RuntimeError` when
+  `self.conn.in_transaction` is already true, so an R5 method can never
+  silently sweep a caller's unrelated pending work into its own
+  commit/rollback.
+- It issues `BEGIN IMMEDIATE`, reserving the write lock immediately
+  rather than deferring it to the first actual write - this is what
+  makes `ingest_batch()`'s duplicate preflight and its conditional
+  inserts atomic together.
+- On normal completion, it commits before returning.
+- On any failure (BEGIN, the transaction body, or COMMIT), cleanup is
+  delegated to `_cleanup_failed_r5_transaction()`: it tries
+  `self.conn.rollback()` first; if that itself raises, it logs the
+  failure and falls back to a raw SQL `"ROLLBACK"` statement; if the
+  fallback also raises, or the connection still reports an open
+  transaction even after the fallback succeeds, the connection is
+  closed outright, so later code can never reuse a connection left in
+  an unknown transactional state. In every case the original
+  BEGIN/body/COMMIT exception is re-raised unmodified - a cleanup
+  failure is only logged, never allowed to replace or mask it.
+  `isolation_level` restoration is attempted independently in a
+  `finally` block; a restoration failure (e.g. the connection was
+  closed by the step above) is likewise only logged as a secondary
+  cleanup failure.
+- A message-level `SAVEPOINT` (uniquely named per call) wraps deferred
+  trader creation and the `create_raw_message()` insert attempt inside
+  `_ingest_channel_message_no_commit()`. If `create_raw_message()` raises
+  `sqlite3.IntegrityError`, the exact `(channel_id, external_id)` key is
+  re-queried: if no row is found, the savepoint is rolled back and
+  released and the original `IntegrityError` re-raised (an unrelated
+  constraint failure); if a row is found (a confirmed unique-constraint
+  race), the savepoint is rolled back and released - discarding any
+  trader row created earlier in that same attempt - and a `duplicate`
+  outcome referencing the confirmed existing row is returned. This
+  guarantees a confirmed-race duplicate can never leave a provisional
+  trader (or any other write made after the initial duplicate lookup)
+  behind, while never rolling back writes made before that savepoint,
+  such as the batch's own `import_batches` row or earlier messages
+  already processed in the same batch transaction. The savepoint is
+  released on every path via a `finally` block.
+- Caller-supplied `metadata_extra` is validated (must be `None` or a
+  `dict`, and must not define the reserved `"_r5_provenance"` key)
+  before trader classification, the duplicate lookup, or any database
+  write - even when the message will turn out to be a duplicate, so
+  invalid metadata is never silently ignored just because no new row
+  ends up being written.
+
+# Product Owner Decisions
+
+- Synthetic ID format (approved for Recovery Milestone R5
+  implementation): `"synthetic:"` plus the full lowercase hexadecimal
+  SHA-256 digest of the UTF-8 encoding of `synthetic_id_input`. No
+  truncation. This is treated as a durable identifier format - changing
+  any part of it later would orphan every previously-synthesized id.
+- Exactly one of a real `external_id` or a `synthetic_id_input` must be
+  supplied per message; both `None` and both supplied are rejected.
+  Either supplied value must be a non-blank string (empty and
+  whitespace-only are rejected) - a real `external_id` is never
+  stripped or otherwise mutated once accepted.
+- Edited-message content is treated as a new, unrelated message in V1:
+  since `synthetic_id_input` is built from the message's own cleaned
+  text (among other deterministic inputs), a Discord message edited
+  after being ingested once and re-pasted will hash to a different
+  synthetic id and be stored as an entirely new, independent row. There
+  is no edit-guessing, no fuzzy matching, and no linkage back to the
+  original row in V1.
+
+# Tests Executed
+
+Focused command:
+    python -m unittest tests.test_service tests.test_repository_sources tests.test_repository_recovery tests.test_batch_ingestion_integration -v
+Result: 370 tests, OK (0 failures/errors)
+
+Full suite command:
+    python -m unittest discover -s tests -v
+Result: 826 tests, OK (0 failures/errors)
+
+All 802 tests present after the initial R5 implementation remained
+passing throughout the correction pass; 24 new correction tests were
+added on top of that baseline to reach 826/826 (covering: metadata_extra
+validation ordering ahead of the duplicate-lookup return; the message-
+level SAVEPOINT's confirmed-race-duplicate and rollback-of-provisional-
+writes behavior in both direct and batch ingestion, including empty-
+batch cleanup and unrelated-IntegrityError propagation; the safe
+rollback-fallback/connection-closing behavior in
+`_r5_write_transaction`; strengthened blank/whitespace validation in
+`_resolve_external_id()`; and precise `list[int]`/`list[str]`/
+`list[MessageIngestOutcome]`/`list[ReprocessOutcome]` dataclass type
+annotations verified via `typing.get_type_hints()`).
+
+# Review Status
+
+Implementation was reviewed and corrected in one dedicated correction
+pass before this commit, addressing seven identified defects: (1)
+`metadata_extra` validation ordering relative to the duplicate lookup,
+(2) provisional-trader-write safety on the confirmed unique-constraint
+race path via a message-level `SAVEPOINT`, (3) safe rollback-failure/
+connection-closing handling in `_r5_write_transaction`, (4) missing
+explicit unique-constraint-race test coverage, (5) strengthened
+`_resolve_external_id()` blank/whitespace validation, (6) precise
+dataclass list-element type annotations, and (7) an unused-import
+cleanup in `database/service.py`. All seven were corrected and verified
+via the test evidence above before this commit was made.
+
+# Git Commit
+
+Implementation commit `2bf81bedea5f501025389e952f52e70d9db2a384`
+("Implement Recovery Milestone R5 ingestion and reprocessing") committed
+locally. No Co-Authored-By trailer. No tag was created or moved as part
+of this milestone. This commit has not yet been pushed to origin/main.
+
+All pre-existing untracked entries (`CLAUDE.md`,
+`docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/DECISION_TEMPLATE.md`,
+`docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and the `app/__pycache__/`,
+`database/__pycache__/`, `tests/__pycache__/` directories) were preserved
+untouched throughout implementation, correction, review, and commit.
+
+# Scope Exclusions
+
+- No Recovery Milestone R6 (lifecycle linking - `trade_lifecycles`) work
+  of any kind.
+- No trader-performance analytics (Recovery Milestone R7).
+- No new user interface for batch import, reprocessing, or channel
+  checkpoints (Recovery Milestone R8) - every capability in this
+  milestone is backend-only, reachable today only via direct
+  `TradeService` calls, not through `app/streamlit_app.py`.
+- No automated Discord server ingestion (e.g. a bot, webhook, or API
+  poller) - input remains a manually pasted text block.
+- No broker integration of any kind.
+- No schema or migration changes.
+- No push or tag has been performed as part of this milestone.
+
+# User-Facing Readiness
+
+The existing manual v0.1.0 application (`app/streamlit_app.py`) remains
+fully usable exactly as documented in `docs/PROJECT_STATUS.md`'s 2D.x
+track - this milestone changes nothing about that workflow. R5 delivers
+backend ingestion and reprocessing capability only: idempotent
+channel-scoped ingestion, Discord batch import, reprocessing/
+supersession, and channel checkpoints all exist and are fully tested at
+the `TradeService`/`database.repository` layer, but there is no UI path
+to reach any of them yet. The Product Owner cannot yet use the improved
+workflow from the application itself, and trader-performance reporting
+(pasting Discord messages in the app and viewing performance by trader)
+still requires the later Recovery analytics and UI milestones (at
+minimum R6 lifecycle linking, R7 trader-performance analytics, and R8
+UI) before it becomes available.
+
+# Next Authorized Action
+
+Documentation review only. This handoff and the accompanying
+`docs/PROJECT_STATUS.md` update are prepared and pending Product Owner /
+Technical Architect (ChatGPT) review. Wait for explicit approval before
+committing or pushing this documentation. Recovery Milestone R6 must not
+be started automatically - any R6 work requires its own separate design
+approval before implementation begins.
+
+# Known Limitations
+
+- No UI exists yet for any R5 capability - see "User-Facing Readiness"
+  above.
+- Reprocessing re-runs extraction and trader-identity re-classification
+  (when the previously resolved trader no longer exists) but never
+  re-runs segmentation or timestamp re-resolution against a changed
+  wall clock - both remain anchored to the original persisted
+  provenance, by design.
+- The confirmed unique-constraint-race path exercised by this
+  milestone's new tests is a narrow, defensive carve-out for genuine
+  concurrent-writer races; this application has no concurrent-writer
+  deployment today, so the path is currently reachable only via the
+  dedicated tests that simulate it.
+
+# Next Milestone
+
+Not yet approved/scoped. Recovery Milestone R6 (lifecycle linking -
+`trade_lifecycles`) has not started; no lifecycle-linking work exists
+beyond this ingestion/reprocessing/checkpoint milestone. Any R6 work
+requires its own separate design approval before implementation begins.
+Per the approved recovery roadmap, R7 (trader performance analytics) and
+R8 (UI - batch import, checkpoint view, unresolved-message review,
+lifecycle review, trader performance dashboard) remain outstanding after
+R6 before a user can exercise the recovered pipeline manually end-to-end
+from the application itself.
+
+# Notes
+
+This is the first Recovery-track handoff to be accompanied by a
+`docs/PROJECT_STATUS.md` update - R1 through R4 deliberately left that
+file untouched (see `docs/HANDOFFS/R4_date_and_time_resolution.txt`'s own
+Notes section), since whether/how to fold the Recovery track into it was
+an open documentation-workflow question. `docs/PROJECT_STATUS.md`'s
+current-status fields (top-level Current Milestone/Current Focus/Next
+Milestone, and the Documentation block's Current Phase/Current
+Milestone/Git Synchronization/Release Status/Recovery Status/Test
+Suite/User-Facing Readiness/Next Action) were explicitly corrected by the
+Product Owner in a dedicated documentation-correction pass following this
+handoff's initial preparation, since those fields had gone stale (they
+still described the pre-Recovery 2D.x/v0.1.0 track as current, before
+`v0.1.0` was tagged and pushed and before Recovery Milestones R1-R4
+completed). They now accurately reflect the Recovery Phase and Recovery
+Milestone R5's status as of this handoff. The pre-Recovery 2D.x/v0.1.0
+track's historical Milestone entries under `# Completed` (through 2D.7)
+remain untouched, as they are a dated record of that track's own
+completed, released work, not a current-state claim.

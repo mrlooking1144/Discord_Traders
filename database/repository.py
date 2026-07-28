@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
+from database.lifecycle import SignalSnapshot
 from database.models import (
     Channel,
     ImportBatch,
@@ -22,6 +23,8 @@ from database.models import (
     RawMessage,
     Source,
     Trader,
+    TradeLifecycle,
+    TradeLifecycleEvent,
     TradeSignal,
     TradeSignalEdit,
 )
@@ -547,6 +550,7 @@ def _row_to_trade_signal(row: sqlite3.Row) -> TradeSignal:
         stated_return_pct=row["stated_return_pct"],
         notes=row["notes"],
         extraction_id=row["extraction_id"],
+        lifecycle_id=row["lifecycle_id"],
     )
 
 
@@ -554,7 +558,7 @@ _TRADE_SIGNAL_COLUMNS = (
     "id, raw_message_id, trader_id, symbol, action, option_type, price, "
     "expiration, position_size, created_at, updated_at, strike, "
     "expiration_raw, event_type, qualifier, stated_entry_price, "
-    "stated_return_pct, notes, extraction_id"
+    "stated_return_pct, notes, extraction_id, lifecycle_id"
 )
 
 
@@ -1632,3 +1636,1459 @@ def get_channel_chronological_checkpoints(conn: sqlite3.Connection) -> list[dict
         "ORDER BY c.id"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R6.3: repository layer for trade_lifecycles /
+# trade_lifecycle_events / trade_signals.lifecycle_id (schema added by
+# R6.1, pure matching engine added by R6.2). No matching/linking
+# orchestration lives here - that is TradeService's job (R6.4, not yet
+# implemented). Every function below either discovers data for the R6.4
+# orchestration layer to feed into database.lifecycle.build_lifecycle_sequence(),
+# or persists exactly what that pure function computed. As with every
+# other function in this module, callers own the transaction - nothing
+# here commits or rolls back.
+# ---------------------------------------------------------------------------
+
+
+def _decimal_equal(stored_strike_text: str | None, target_strike: Decimal | None) -> bool:
+    """Compare a stored strike string to a target Decimal, numerically.
+
+    Never a raw string comparison: "207.50" and "207.5" are the same
+    strike (_serialize_price() performs no normalization, so equal
+    Decimals can be stored with different textual representations).
+
+    Args:
+        stored_strike_text: A trade_signals.strike or trade_lifecycles.strike
+            value as read from the database, or None.
+        target_strike: The Decimal strike being searched for, or None.
+
+    Returns:
+        True if both are None, or both are non-None and numerically
+        equal; False otherwise (including exactly one side being None).
+    """
+    if stored_strike_text is None and target_strike is None:
+        return True
+    if stored_strike_text is None or target_strike is None:
+        return False
+    return Decimal(stored_strike_text) == target_strike
+
+
+def _is_complete_lifecycle_key_shape(
+    option_type: str | None, strike_text: str | None, expiration: str | None
+) -> bool:
+    """Return whether (option_type, strike, expiration) form a valid
+    lifecycle key shape: either all three None (equity) or all three
+    non-None (a complete option identity). Any other combination is an
+    incomplete option identity and must never be treated as a normal
+    lifecycle key - never guessed or partially matched.
+    """
+    all_none = option_type is None and strike_text is None and expiration is None
+    all_present = option_type is not None and strike_text is not None and expiration is not None
+    return all_none or all_present
+
+
+def _lifecycle_key_sort_key(key: tuple) -> tuple:
+    """A total, deterministic ordering for a (trader_id, symbol,
+    option_type, strike, expiration) lifecycle key tuple.
+
+    None-safe: option_type/strike/expiration may each independently be
+    None (an equity key, or - for strike - simply absent), which cannot
+    be compared directly against a str/Decimal in Python 3. Each field is
+    instead represented as (is_present, value_or_placeholder), so two
+    keys are always fully orderable regardless of which fields are None,
+    and the resulting order never depends on set/dict iteration order or
+    SQL row-return order. Shared by every function that must return
+    lifecycle keys/violations in a normalized, repeatable order
+    (get_distinct_lifecycle_keys_for_signal_ids(),
+    _check_invariant_h_multiple_active_per_key()).
+    """
+    trader_id, symbol, option_type, strike, expiration = key
+    return (
+        trader_id,
+        symbol,
+        option_type is not None,
+        option_type or "",
+        strike is not None,
+        strike if strike is not None else Decimal(0),
+        expiration is not None,
+        expiration or "",
+    )
+
+
+_LIFECYCLE_SIGNAL_SELECT = (
+    "ts.id AS trade_signal_id, "
+    "ts.raw_message_id AS raw_message_id, "
+    "ts.trader_id AS trader_id, "
+    "ts.symbol AS symbol, "
+    "ts.option_type AS option_type, "
+    "ts.strike AS strike, "
+    "ts.expiration AS expiration, "
+    "ts.event_type AS event_type, "
+    "ts.qualifier AS qualifier, "
+    "ts.action AS action, "
+    "ts.price AS price, "
+    "ts.stated_entry_price AS stated_entry_price, "
+    "ts.stated_return_pct AS stated_return_pct, "
+    "ts.notes AS notes, "
+    "ts.extraction_id AS extraction_id, "
+    "rm.received_at AS received_at"
+)
+
+_LIFECYCLE_SIGNAL_CURRENT_JOIN = (
+    "FROM trade_signals ts "
+    "JOIN raw_messages rm ON rm.id = ts.raw_message_id "
+    "LEFT JOIN message_extractions me ON me.id = ts.extraction_id"
+)
+
+_LIFECYCLE_SIGNAL_CURRENT_AND_ELIGIBLE = (
+    "ts.event_type IS NOT NULL "
+    "AND (ts.extraction_id IS NULL OR me.is_current = 1)"
+)
+
+
+def _row_to_signal_snapshot(row: sqlite3.Row, ordering_key: tuple) -> SignalSnapshot:
+    """Map one joined trade_signals/raw_messages row to a SignalSnapshot.
+
+    Args:
+        row: A row selected via _LIFECYCLE_SIGNAL_SELECT.
+        ordering_key: The already-decided chronological ordering tuple
+            for this row within its caller's result set (see
+            _order_signal_rows()).
+
+    Returns:
+        The corresponding SignalSnapshot.
+    """
+    return SignalSnapshot(
+        trade_signal_id=row["trade_signal_id"],
+        raw_message_id=row["raw_message_id"],
+        trader_id=row["trader_id"],
+        symbol=row["symbol"],
+        option_type=row["option_type"],
+        strike=row["strike"],
+        expiration=row["expiration"],
+        event_type=row["event_type"],
+        qualifier=row["qualifier"],
+        action=row["action"],
+        price=row["price"],
+        stated_entry_price=row["stated_entry_price"],
+        stated_return_pct=row["stated_return_pct"],
+        notes=row["notes"],
+        extraction_id=row["extraction_id"],
+        ordering_key=ordering_key,
+    )
+
+
+def _order_signal_rows(rows: list[sqlite3.Row]) -> list[SignalSnapshot]:
+    """Deterministically order a set of candidate signal rows and build
+    their SignalSnapshots.
+
+    Uses received_at-based ordering (received_at, raw_message_id,
+    trade_signal_id) only when every row in the set has a resolved
+    received_at; otherwise falls back to (raw_message_id, trade_signal_id)
+    ordering for the entire set - never mixing the two modes within one
+    result set, so a handful of unresolved timestamps can never silently
+    reorder the rows that do have one.
+
+    Args:
+        rows: Candidate rows selected via _LIFECYCLE_SIGNAL_SELECT,
+            already filtered to the desired key/current/eligible set but
+            not yet ordered.
+
+    Returns:
+        SignalSnapshots in the chosen chronological order, each carrying
+        the ordering_key actually used.
+    """
+    if not rows:
+        return []
+
+    all_have_received_at = all(row["received_at"] is not None for row in rows)
+    if all_have_received_at:
+        ordered = sorted(
+            rows, key=lambda r: (r["received_at"], r["raw_message_id"], r["trade_signal_id"])
+        )
+        return [
+            _row_to_signal_snapshot(
+                row, (row["received_at"], row["raw_message_id"], row["trade_signal_id"])
+            )
+            for row in ordered
+        ]
+
+    ordered = sorted(rows, key=lambda r: (r["raw_message_id"], r["trade_signal_id"]))
+    return [
+        _row_to_signal_snapshot(row, (row["raw_message_id"], row["trade_signal_id"]))
+        for row in ordered
+    ]
+
+
+def get_current_trade_signals_for_key(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    option_type: str | None,
+    strike: Decimal | None,
+    expiration: str | None,
+) -> list[SignalSnapshot]:
+    """List every current, lifecycle-eligible signal for one exact
+    lifecycle key, in deterministic chronological order.
+
+    "Current" is the same rule get_trade_signals_for_review() already
+    applies: extraction_id IS NULL OR message_extractions.is_current = 1.
+    "Eligible" additionally requires event_type IS NOT NULL - a legacy
+    signal from the pre-Recovery ingest_message() path (event_type always
+    NULL) can never be lifecycle-linked and is excluded here, not merely
+    downstream.
+
+    Key matching: symbol is matched case-insensitively; option_type and
+    expiration are matched with SQLite's NULL-safe IS operator (so an
+    equity key - option_type/strike/expiration all None - matches
+    correctly, which a plain "=" comparison against NULL never would);
+    strike is never compared in SQL at all - it is matched exactly via
+    Decimal equality in Python, since trade_signals.strike is stored via
+    _serialize_price() with no normalization, so "207.50" and "207.5" are
+    numerically equal but textually different.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol, matched case-insensitively.
+        option_type: 'call'/'put' to match exactly (via IS), or None for
+            an equity key.
+        strike: The Decimal strike to match, or None for an equity key.
+        expiration: Resolved ISO8601 date to match exactly (via IS), or
+            None for an equity key.
+
+    Returns:
+        SignalSnapshots in chronological order (see _order_signal_rows()),
+        using received_at ordering only when every matching signal has a
+        resolved received_at, otherwise falling back consistently to
+        (raw_message_id, trade_signal_id) ordering for all of them. Empty
+        list if nothing matches.
+    """
+    rows = conn.execute(
+        f"SELECT {_LIFECYCLE_SIGNAL_SELECT} "
+        f"{_LIFECYCLE_SIGNAL_CURRENT_JOIN} "
+        "WHERE ts.trader_id = ? "
+        "AND UPPER(ts.symbol) = UPPER(?) "
+        "AND ts.option_type IS ? "
+        "AND ts.expiration IS ? "
+        f"AND {_LIFECYCLE_SIGNAL_CURRENT_AND_ELIGIBLE}",
+        (trader_id, symbol, option_type, expiration),
+    ).fetchall()
+
+    matching = [row for row in rows if _decimal_equal(row["strike"], strike)]
+    return _order_signal_rows(matching)
+
+
+def get_distinct_lifecycle_keys_for_signal_ids(
+    conn: sqlite3.Connection,
+    trade_signal_ids: list[int],
+) -> list[tuple]:
+    """List the distinct, complete lifecycle keys among a set of signals.
+
+    A signal whose own (option_type, strike, expiration) shape is
+    incomplete (some but not all of the three populated) never
+    contributes a key here - it is silently excluded, never guessed into
+    a normal key. Callers are responsible for routing such a signal to
+    its own unresolved singleton by other means (see
+    create_lifecycle_unresolved_singleton()); this function's contract is
+    "distinct valid keys only."
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_ids: The trade_signals.id values to inspect.
+
+    Returns:
+        Distinct (trader_id, symbol_upper, option_type, strike, expiration)
+        tuples, one per complete key shape found among trade_signal_ids -
+        symbol is normalized to uppercase and strike is a Decimal (or
+        None), so each tuple is directly usable as
+        get_current_trade_signals_for_key()'s own arguments. Returned in
+        a deterministic, normalized order (see _lifecycle_key_sort_key())
+        - never raw set/dict iteration order, so calling this twice with
+        trade_signal_ids in a different order, or against data inserted
+        in a different order, always yields the identical list. Empty
+        list if trade_signal_ids is empty or no signal has a complete key
+        shape.
+    """
+    if not trade_signal_ids:
+        return []
+
+    placeholders = ",".join("?" * len(trade_signal_ids))
+    rows = conn.execute(
+        "SELECT trader_id, symbol, option_type, strike, expiration "
+        f"FROM trade_signals WHERE id IN ({placeholders})",
+        list(trade_signal_ids),
+    ).fetchall()
+
+    keys: set = set()
+    for row in rows:
+        option_type, strike_text, expiration = (
+            row["option_type"], row["strike"], row["expiration"]
+        )
+        if not _is_complete_lifecycle_key_shape(option_type, strike_text, expiration):
+            continue
+        strike = Decimal(strike_text) if strike_text is not None else None
+        keys.add((row["trader_id"], row["symbol"].upper(), option_type, strike, expiration))
+
+    return sorted(keys, key=_lifecycle_key_sort_key)
+
+
+def get_current_signal_snapshot_for_raw_message(
+    conn: sqlite3.Connection,
+    raw_message_id: int,
+) -> SignalSnapshot | None:
+    """Look up the current, lifecycle-eligible signal for one raw message.
+
+    Fails closed rather than silently picking one: queries every current,
+    lifecycle-eligible signal for raw_message_id in deterministic
+    trade_signal_id order and raises if more than one is found, instead
+    of using fetchone() to select an arbitrary row. At most one such
+    signal should ever legitimately exist (the extractor produces at most
+    one candidate trade event per message, and message_extractions
+    enforces at most one current extraction per raw message) - if that
+    assumption is ever violated, silently returning one of them would let
+    a real data-integrity problem masquerade as normal operation.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_id: FK to raw_messages.id.
+
+    Returns:
+        The matching SignalSnapshot, or None if this raw message has no
+        current, lifecycle-eligible signal (including if the raw message
+        does not exist, has no signal at all, has only a superseded
+        signal, or its signal's event_type is NULL).
+
+    Raises:
+        ValueError: If more than one current, lifecycle-eligible signal
+            exists for raw_message_id - names the raw_message_id and every
+            matching trade_signal_id.
+    """
+    rows = conn.execute(
+        f"SELECT {_LIFECYCLE_SIGNAL_SELECT} "
+        f"{_LIFECYCLE_SIGNAL_CURRENT_JOIN} "
+        "WHERE ts.raw_message_id = ? "
+        f"AND {_LIFECYCLE_SIGNAL_CURRENT_AND_ELIGIBLE} "
+        "ORDER BY ts.id",
+        (raw_message_id,),
+    ).fetchall()
+
+    if not rows:
+        return None
+    if len(rows) > 1:
+        matching_trade_signal_ids = [row["trade_signal_id"] for row in rows]
+        raise ValueError(
+            f"raw_message_id {raw_message_id} has {len(rows)} current, "
+            f"lifecycle-eligible signals {matching_trade_signal_ids} - expected at most one."
+        )
+
+    row = rows[0]
+    if row["received_at"] is not None:
+        ordering_key = (row["received_at"], row["raw_message_id"], row["trade_signal_id"])
+    else:
+        ordering_key = (row["raw_message_id"], row["trade_signal_id"])
+    return _row_to_signal_snapshot(row, ordering_key)
+
+
+def get_chronological_positions_for_raw_messages(
+    conn: sqlite3.Connection,
+    raw_message_ids: list[int],
+) -> dict[int, tuple]:
+    """Compute whole-set-consistent chronological positions for a batch of
+    raw messages.
+
+    Replaces any notion of an independently-decided per-row position:
+    deciding one row's position in isolation from its siblings is exactly
+    the mixed-mode bug this function exists to prevent. If every row in
+    the requested set has a resolved received_at, every returned position
+    is timestamp-based. If any row in the set lacks one, EVERY returned
+    position - including for rows that do have a resolved received_at -
+    falls back to (raw_message_id,) only, so a later-inserted,
+    timestamp-less message can never be misread as chronologically
+    earlier than an earlier, timestamped one just because "no timestamp"
+    was treated as "sorts first": once any sibling lacks a timestamp,
+    received_at is not consulted for anyone in the set, and insertion
+    order (raw_message_id) alone governs every comparison.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_ids: The raw_messages.id values to compute positions
+            for. Duplicates are harmless (de-duplicated internally). Order
+            does not affect the result: the returned mapping's values
+            depend only on the requested set's own data, never on the
+            order raw_message_ids was given in.
+
+    Returns:
+        A dict mapping each requested raw_message_id to its position
+        tuple - either (received_at, raw_message_id) for every entry, or
+        (raw_message_id,) for every entry - the two shapes are never
+        mixed within one returned dict. Key iteration order is always
+        ascending raw_message_id, regardless of the order raw_message_ids
+        was given in and regardless of any duplicates in it (a duplicated
+        id still produces exactly one entry). Empty dict for empty input.
+
+    Raises:
+        ValueError: If any requested raw_message_id does not exist,
+            naming every missing id (sorted, for a deterministic message).
+    """
+    if not raw_message_ids:
+        return {}
+
+    unique_ids = list(dict.fromkeys(raw_message_ids))
+    placeholders = ",".join("?" * len(unique_ids))
+    # ORDER BY id makes the row-return order - and therefore this
+    # function's returned dict's insertion/iteration order - always
+    # ascending raw_message_id, independent of both the order
+    # raw_message_ids was given in and SQLite's own unordered-by-default
+    # row-return order for an IN (...) scan.
+    rows = conn.execute(
+        f"SELECT id, received_at FROM raw_messages WHERE id IN ({placeholders}) ORDER BY id",
+        unique_ids,
+    ).fetchall()
+
+    found_ids = {row["id"] for row in rows}
+    missing_ids = sorted(set(unique_ids) - found_ids)
+    if missing_ids:
+        raise ValueError(f"raw_message_id(s) do not exist: {missing_ids}")
+
+    all_have_received_at = all(row["received_at"] is not None for row in rows)
+    if all_have_received_at:
+        return {row["id"]: (row["received_at"], row["id"]) for row in rows}
+    return {row["id"]: (row["id"],) for row in rows}
+
+
+_TRADE_LIFECYCLE_STATUSES = frozenset(
+    {"open", "partially_closed", "closed", "orphan", "unresolved", "invalid"}
+)
+
+_TRADE_LIFECYCLE_COLUMNS = (
+    "id, trader_id, symbol, option_type, strike, expiration, status, "
+    "remaining_fraction, opened_by_signal_id, closed_by_signal_id, "
+    "is_current, superseded_at, ambiguity_flags, created_at, updated_at"
+)
+
+
+def _validate_trade_lifecycle_required_fields(
+    trader_id: int | None,
+    symbol: str | None,
+    status: str | None,
+    remaining_fraction: str | None,
+) -> None:
+    """Validate the trade_lifecycles fields required by the schema.
+
+    Raises:
+        ValueError: If trader_id is None, symbol is None/blank, status is
+            not one of the six approved values, or remaining_fraction is
+            None/blank.
+    """
+    if trader_id is None:
+        raise ValueError("trader_id is required.")
+    if symbol is None or not symbol.strip():
+        raise ValueError("symbol must not be empty or whitespace-only.")
+    if status not in _TRADE_LIFECYCLE_STATUSES:
+        raise ValueError(f"status must be one of {sorted(_TRADE_LIFECYCLE_STATUSES)}.")
+    if remaining_fraction is None or not remaining_fraction.strip():
+        raise ValueError("remaining_fraction must not be empty or whitespace-only.")
+
+
+def _row_to_trade_lifecycle(row: sqlite3.Row) -> TradeLifecycle:
+    """Map a ``trade_lifecycles`` table row to a TradeLifecycle model.
+
+    Args:
+        row: A row from the trade_lifecycles table, with all columns
+            selected.
+
+    Returns:
+        The corresponding TradeLifecycle, with ambiguity_flags
+        deserialized from its stored JSON representation (or None if the
+        column is NULL) - matching MessageExtraction's own convention.
+    """
+    ambiguity_flags = (
+        json.loads(row["ambiguity_flags"]) if row["ambiguity_flags"] is not None else None
+    )
+    return TradeLifecycle(
+        id=row["id"],
+        trader_id=row["trader_id"],
+        symbol=row["symbol"],
+        option_type=row["option_type"],
+        strike=row["strike"],
+        expiration=row["expiration"],
+        status=row["status"],
+        remaining_fraction=row["remaining_fraction"],
+        opened_by_signal_id=row["opened_by_signal_id"],
+        closed_by_signal_id=row["closed_by_signal_id"],
+        is_current=bool(row["is_current"]),
+        superseded_at=row["superseded_at"],
+        ambiguity_flags=ambiguity_flags,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def create_trade_lifecycle(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    status: str,
+    remaining_fraction: str,
+    option_type: str | None = None,
+    strike: Decimal | None = None,
+    expiration: str | None = None,
+    opened_by_signal_id: int | None = None,
+    closed_by_signal_id: int | None = None,
+    ambiguity_flags: list | None = None,
+) -> TradeLifecycle:
+    """Insert a new lifecycle generation row, marked as the current one.
+
+    A generation is never edited in place once created by any repository
+    function, aside from supersede_trade_lifecycle() - this mirrors
+    create_message_extraction()/supersede_extraction()'s established
+    contract one level up.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol, stored exactly as given (not forced
+            uppercase - callers already normalize via
+            get_distinct_lifecycle_keys_for_signal_ids() when relevant).
+        status: One of 'open', 'partially_closed', 'closed', 'orphan',
+            'unresolved', 'invalid'.
+        remaining_fraction: The exact string form of a fractions.Fraction
+            (e.g. "1", "1/2", "0"), never a Decimal string.
+        option_type: 'call'/'put', or None for an equity key.
+        strike: A Decimal strike, or None. Never a float or string.
+        expiration: Resolved ISO8601 date, or None.
+        opened_by_signal_id: FK to trade_signals.id, or None.
+        closed_by_signal_id: FK to trade_signals.id, or None.
+        ambiguity_flags: List of JSON-serializable flag strings, or None.
+
+    Returns:
+        The newly created TradeLifecycle, including its generated id,
+        created_at, and updated_at.
+
+    Raises:
+        ValueError: If trader_id is None, symbol is empty/whitespace-only,
+            status is not one of the six approved values, or
+            remaining_fraction is empty/whitespace-only.
+        TypeError: If strike is supplied and is not a Decimal.
+        sqlite3.IntegrityError: If trader_id, opened_by_signal_id, or
+            closed_by_signal_id does not reference an existing row.
+    """
+    _validate_trade_lifecycle_required_fields(trader_id, symbol, status, remaining_fraction)
+    strike_text = _serialize_price(strike)
+    serialized_flags = (
+        json.dumps(ambiguity_flags, sort_keys=True) if ambiguity_flags is not None else None
+    )
+
+    cursor = conn.execute(
+        "INSERT INTO trade_lifecycles "
+        "(trader_id, symbol, option_type, strike, expiration, status, "
+        "remaining_fraction, opened_by_signal_id, closed_by_signal_id, "
+        "is_current, ambiguity_flags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        (
+            trader_id,
+            symbol,
+            option_type,
+            strike_text,
+            expiration,
+            status,
+            remaining_fraction,
+            opened_by_signal_id,
+            closed_by_signal_id,
+            serialized_flags,
+        ),
+    )
+    row = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_trade_lifecycle(row)
+
+
+def supersede_trade_lifecycle(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> TradeLifecycle | None:
+    """Mark a lifecycle generation row as no longer current.
+
+    Updates only is_current, superseded_at, and updated_at - status,
+    remaining_fraction, membership, and every other field are left
+    exactly as they were. Never deletes the row or its
+    trade_lifecycle_events membership rows, which remain permanently
+    queryable for audit via get_trade_lifecycle_history_rows()/
+    get_trade_lifecycle_events(). Does not insert a replacement
+    generation - that is TradeService's job (R6.4).
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: Primary key of the generation to supersede.
+
+    Returns:
+        The updated TradeLifecycle, or None if no row exists with this id.
+    """
+    conn.execute(
+        "UPDATE trade_lifecycles "
+        "SET is_current = 0, superseded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?",
+        (trade_lifecycle_id,),
+    )
+    row = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles WHERE id = ?",
+        (trade_lifecycle_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_trade_lifecycle(row)
+
+
+def get_current_lifecycles_for_key(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    option_type: str | None,
+    strike: Decimal | None,
+    expiration: str | None,
+) -> list[TradeLifecycle]:
+    """List every currently current (is_current=1) generation for one
+    exact lifecycle key.
+
+    May return zero, one, or several rows: at most one non-terminal
+    ('open'/'partially_closed') row can validly exist per key (see
+    validate_lifecycle_membership_integrity()'s invariant H), but any
+    number of terminal ('closed'/'orphan'/'unresolved'/'invalid')
+    generations - each a distinct past re-entry - remain simultaneously
+    current until their own lineage changes.
+
+    Key matching uses the same rules as get_current_trade_signals_for_key():
+    symbol case-insensitive, option_type/expiration NULL-safe via IS,
+    strike compared exactly via Decimal in Python.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol, matched case-insensitively.
+        option_type: 'call'/'put' to match exactly, or None for an equity
+            key.
+        strike: The Decimal strike to match, or None for an equity key.
+        expiration: Resolved ISO8601 date to match exactly, or None for
+            an equity key.
+
+    Returns:
+        Matching TradeLifecycles, ordered by id ascending. Empty list if
+        none match.
+    """
+    rows = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles "
+        "WHERE trader_id = ? AND UPPER(symbol) = UPPER(?) "
+        "AND option_type IS ? AND expiration IS ? AND is_current = 1 "
+        "ORDER BY id",
+        (trader_id, symbol, option_type, expiration),
+    ).fetchall()
+    matching = [row for row in rows if _decimal_equal(row["strike"], strike)]
+    return [_row_to_trade_lifecycle(row) for row in matching]
+
+
+def get_trade_lifecycle_history_rows(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    option_type: str | None,
+    strike: Decimal | None,
+    expiration: str | None,
+) -> list[TradeLifecycle]:
+    """List every generation - current and superseded - for one exact
+    lifecycle key, newest first.
+
+    Unlike get_current_lifecycles_for_key(), this applies no is_current
+    filter at all, so a fully superseded generation remains visible here
+    forever, exactly matching "auditable lifecycle history."
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id.
+        symbol: Ticker symbol, matched case-insensitively.
+        option_type: 'call'/'put' to match exactly, or None for an equity
+            key.
+        strike: The Decimal strike to match, or None for an equity key.
+        expiration: Resolved ISO8601 date to match exactly, or None for
+            an equity key.
+
+    Returns:
+        Matching TradeLifecycles, ordered by id descending (newest
+        first). Empty list if none match.
+    """
+    rows = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles "
+        "WHERE trader_id = ? AND UPPER(symbol) = UPPER(?) "
+        "AND option_type IS ? AND expiration IS ? "
+        "ORDER BY id DESC",
+        (trader_id, symbol, option_type, expiration),
+    ).fetchall()
+    matching = [row for row in rows if _decimal_equal(row["strike"], strike)]
+    return [_row_to_trade_lifecycle(row) for row in matching]
+
+
+def get_trade_lifecycle_lineage_raw_message_ids(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> frozenset[int]:
+    """Return the fixed set of raw_message_ids that make up one
+    generation's lineage.
+
+    Derived from the generation's member signals' own raw_message_id -
+    this is the persisted boundary a later rebuild uses to decide whether
+    an incoming signal is a lineage-linked replacement for one of this
+    generation's own members (reprocessing, or a key-changing correction)
+    versus a genuinely unrelated new signal, per the approved R6 lineage-
+    aware finalization design. Distinct terminal generations at the same
+    key have disjoint lineage sets by construction.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: FK to trade_lifecycles.id.
+
+    Returns:
+        The distinct raw_message_id values among this generation's
+        current membership rows. Empty frozenset if the generation has no
+        members or does not exist.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT ts.raw_message_id "
+        "FROM trade_lifecycle_events tle "
+        "JOIN trade_signals ts ON ts.id = tle.trade_signal_id "
+        "WHERE tle.trade_lifecycle_id = ?",
+        (trade_lifecycle_id,),
+    ).fetchall()
+    return frozenset(row["raw_message_id"] for row in rows)
+
+
+def get_recorded_shape_for_generation(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> tuple | None:
+    """Return one generation's recorded shape, for rebuild idempotency
+    comparison.
+
+    The returned shape is a 1-tuple containing a single
+    (status, remaining_fraction, member_signal_ids, ambiguity_flags)
+    tuple - the same 4-field shape a caller (R6.4) would compute for one
+    database.lifecycle.LifecycleBuild - so a caller can directly compare
+    "here is what build_lifecycle_sequence() just proposed for this key"
+    (a list of such 4-tuples) against "here is what is already recorded"
+    to decide whether a rebuild would actually change anything.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: FK to trade_lifecycles.id.
+
+    Returns:
+        ((status, remaining_fraction, member_signal_ids, ambiguity_flags),)
+        or None if no trade_lifecycles row exists with this id.
+    """
+    lifecycle_row = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles WHERE id = ?",
+        (trade_lifecycle_id,),
+    ).fetchone()
+    if lifecycle_row is None:
+        return None
+    lifecycle = _row_to_trade_lifecycle(lifecycle_row)
+
+    member_rows = conn.execute(
+        "SELECT trade_signal_id FROM trade_lifecycle_events "
+        "WHERE trade_lifecycle_id = ? ORDER BY sequence_index",
+        (trade_lifecycle_id,),
+    ).fetchall()
+    member_signal_ids = tuple(row["trade_signal_id"] for row in member_rows)
+    ambiguity_flags = tuple(lifecycle.ambiguity_flags) if lifecycle.ambiguity_flags else ()
+
+    return (
+        (lifecycle.status, lifecycle.remaining_fraction, member_signal_ids, ambiguity_flags),
+    )
+
+
+def _row_to_trade_lifecycle_event(row: sqlite3.Row) -> TradeLifecycleEvent:
+    """Map a ``trade_lifecycle_events`` table row to a TradeLifecycleEvent
+    model.
+
+    signal_snapshot is returned exactly as stored - raw JSON text, never
+    decoded here. Decoding (and raising a service-layer error on
+    malformed JSON) is TradeService's responsibility (R6.4), matching how
+    trade_signal_edits.previous_values is likewise left encoded at this
+    layer and only decoded by TradeService.list_trade_signal_audit_history().
+
+    Args:
+        row: A row from the trade_lifecycle_events table, with all
+            columns selected.
+
+    Returns:
+        The corresponding TradeLifecycleEvent.
+    """
+    return TradeLifecycleEvent(
+        id=row["id"],
+        trade_lifecycle_id=row["trade_lifecycle_id"],
+        trade_signal_id=row["trade_signal_id"],
+        sequence_index=row["sequence_index"],
+        signal_snapshot=row["signal_snapshot"],
+        created_at=row["created_at"],
+    )
+
+
+def build_signal_snapshot_json(snapshot: SignalSnapshot) -> str:
+    """Serialize a SignalSnapshot into canonical, immutable JSON text.
+
+    The single place that ever builds trade_lifecycle_events.signal_snapshot
+    text - callers never hand-construct this JSON themselves. Uses
+    json.dumps(..., sort_keys=True) for deterministic output: the same
+    snapshot always serializes to byte-identical text. ordering_key (a
+    tuple) is serialized as a JSON array.
+
+    Args:
+        snapshot: The SignalSnapshot to serialize.
+
+    Returns:
+        The canonical JSON text, containing at minimum trade_signal_id,
+        raw_message_id, trader_id, symbol, option_type, strike,
+        expiration, event_type, qualifier, action, price,
+        stated_entry_price, stated_return_pct, notes, extraction_id, and
+        ordering_key.
+    """
+    payload = {
+        "trade_signal_id": snapshot.trade_signal_id,
+        "raw_message_id": snapshot.raw_message_id,
+        "trader_id": snapshot.trader_id,
+        "symbol": snapshot.symbol,
+        "option_type": snapshot.option_type,
+        "strike": snapshot.strike,
+        "expiration": snapshot.expiration,
+        "event_type": snapshot.event_type,
+        "qualifier": snapshot.qualifier,
+        "action": snapshot.action,
+        "price": snapshot.price,
+        "stated_entry_price": snapshot.stated_entry_price,
+        "stated_return_pct": snapshot.stated_return_pct,
+        "notes": snapshot.notes,
+        "extraction_id": snapshot.extraction_id,
+        "ordering_key": list(snapshot.ordering_key),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def create_trade_lifecycle_event(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+    trade_signal_id: int,
+    sequence_index: int,
+    signal_snapshot: str,
+) -> TradeLifecycleEvent:
+    """Insert one membership/audit row linking a generation to one of its
+    member signals.
+
+    signal_snapshot must already be serialized (e.g. via
+    build_signal_snapshot_json()) - this function performs no
+    serialization and no decoding, and never updates or deletes a row in
+    this table once created, matching raw_messages.raw_text's existing
+    write-once contract. This is what keeps a superseded generation's
+    original membership permanently auditable even after later
+    reprocessing or correction changes the live trade_signals row.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: FK to trade_lifecycles.id.
+        trade_signal_id: FK to trade_signals.id.
+        sequence_index: 1-based order of this signal within its
+            generation.
+        signal_snapshot: Pre-serialized canonical JSON text.
+
+    Returns:
+        The newly created TradeLifecycleEvent, including its generated id
+        and created_at.
+
+    Raises:
+        ValueError: If signal_snapshot is empty.
+        sqlite3.IntegrityError: If trade_lifecycle_id or trade_signal_id
+            does not reference an existing row, or if this exact
+            (trade_lifecycle_id, trade_signal_id) pair already exists.
+    """
+    if not signal_snapshot:
+        raise ValueError("signal_snapshot must not be empty.")
+
+    cursor = conn.execute(
+        "INSERT INTO trade_lifecycle_events "
+        "(trade_lifecycle_id, trade_signal_id, sequence_index, signal_snapshot) "
+        "VALUES (?, ?, ?, ?)",
+        (trade_lifecycle_id, trade_signal_id, sequence_index, signal_snapshot),
+    )
+    row = conn.execute(
+        "SELECT id, trade_lifecycle_id, trade_signal_id, sequence_index, "
+        "signal_snapshot, created_at FROM trade_lifecycle_events WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_trade_lifecycle_event(row)
+
+
+def get_trade_lifecycle_events(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> list[TradeLifecycleEvent]:
+    """List one generation's membership, in chronological order.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: FK to trade_lifecycles.id.
+
+    Returns:
+        TradeLifecycleEvents ordered by sequence_index ascending. Empty
+        list if the generation has no members or does not exist.
+    """
+    rows = conn.execute(
+        "SELECT id, trade_lifecycle_id, trade_signal_id, sequence_index, "
+        "signal_snapshot, created_at "
+        "FROM trade_lifecycle_events WHERE trade_lifecycle_id = ? "
+        "ORDER BY sequence_index",
+        (trade_lifecycle_id,),
+    ).fetchall()
+    return [_row_to_trade_lifecycle_event(row) for row in rows]
+
+
+def update_trade_signal_lifecycle_pointer(
+    conn: sqlite3.Connection,
+    trade_signal_id: int,
+    trade_lifecycle_id: int | None,
+) -> None:
+    """Set (or clear, if trade_lifecycle_id is None) one signal's current
+    lifecycle pointer.
+
+    The one narrow, maintained exception to trade_signals' otherwise
+    strict immutability - written only by the lifecycle engine's
+    orchestration (R6.4), never by ingestion, reprocessing-of-extraction,
+    or the correction workflow directly. Does not touch updated_at:
+    lifecycle_id is a derived pointer maintained outside the audited
+    six-field correction surface, not a correction.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_signal_id: FK to trade_signals.id.
+        trade_lifecycle_id: FK to trade_lifecycles.id, or None to clear.
+
+    Raises:
+        sqlite3.IntegrityError: If trade_lifecycle_id is not None and does
+            not reference an existing row.
+    """
+    conn.execute(
+        "UPDATE trade_signals SET lifecycle_id = ? WHERE id = ?",
+        (trade_lifecycle_id, trade_signal_id),
+    )
+
+
+def clear_lifecycle_pointers_for_generation(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> int:
+    """Clear lifecycle_id to NULL for every signal still pointing at one
+    generation.
+
+    Only clears signals whose lifecycle_id currently equals
+    trade_lifecycle_id - order-independent by construction: if a
+    different key's rebuild has already reassigned a formerly-departed
+    member elsewhere, its lifecycle_id no longer equals
+    trade_lifecycle_id, so this UPDATE's WHERE clause simply does not
+    touch it, regardless of which rebuild runs first.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: The generation whose pointers should be
+            cleared.
+
+    Returns:
+        The number of trade_signals rows actually cleared.
+    """
+    cursor = conn.execute(
+        "UPDATE trade_signals SET lifecycle_id = NULL WHERE lifecycle_id = ?",
+        (trade_lifecycle_id,),
+    )
+    return cursor.rowcount
+
+
+def _validate_lifecycle_builds_before_persisting(
+    builds: list,
+    snapshots_by_signal_id: dict,
+) -> None:
+    """Validate an entire builds list before persist_lifecycle_builds()
+    performs its first database write.
+
+    Every check below runs to completion (nothing here writes to the
+    database), so a rejected call leaves zero lifecycle rows, zero
+    membership rows, and no lifecycle pointer changes - even before an
+    explicit rollback, since nothing was ever written in the first place.
+
+    Args:
+        builds: A list of database.lifecycle.LifecycleBuild.
+        snapshots_by_signal_id: Maps every trade_signal_id appearing in
+            any build's member_signal_ids to the SignalSnapshot it was
+            read from.
+
+    Raises:
+        ValueError: If any build has no member signals; if any
+            trade_signal_id occurs more than once across the complete
+            builds list (whether duplicated within one build or split
+            across two different builds); if any member trade_signal_id
+            has no entry in snapshots_by_signal_id; or if any entry in
+            snapshots_by_signal_id - referenced by a build's members or
+            not - has a snapshot whose own trade_signal_id does not match
+            the dict key it is stored under. Every message names the
+            exact offending id(s).
+    """
+    empty_build_indexes = [i for i, build in enumerate(builds) if not build.member_signal_ids]
+    if empty_build_indexes:
+        raise ValueError(
+            f"builds at index(es) {empty_build_indexes} contain no member signals - "
+            "every LifecycleBuild must have at least one member."
+        )
+
+    seen_signal_ids: set = set()
+    duplicate_signal_ids: set = set()
+    for build in builds:
+        for signal_id in build.member_signal_ids:
+            if signal_id in seen_signal_ids:
+                duplicate_signal_ids.add(signal_id)
+            else:
+                seen_signal_ids.add(signal_id)
+    if duplicate_signal_ids:
+        raise ValueError(
+            f"trade_signal_id(s) {sorted(duplicate_signal_ids)} appear more than once "
+            "across the builds list - a signal may belong to at most one build."
+        )
+
+    all_member_signal_ids = {
+        signal_id for build in builds for signal_id in build.member_signal_ids
+    }
+    missing_snapshot_ids = sorted(all_member_signal_ids - set(snapshots_by_signal_id.keys()))
+    if missing_snapshot_ids:
+        raise ValueError(
+            f"trade_signal_id(s) {missing_snapshot_ids} have no entry in "
+            "snapshots_by_signal_id."
+        )
+
+    # Every entry in the mapping is validated - not only entries a
+    # build's member_signal_ids happens to reference - so a stray,
+    # unreferenced, mismatched entry can never slip through unnoticed.
+    mismatched_mapping_keys = sorted(
+        mapping_key
+        for mapping_key, snapshot in snapshots_by_signal_id.items()
+        if snapshot.trade_signal_id != mapping_key
+    )
+    if mismatched_mapping_keys:
+        raise ValueError(
+            f"snapshots_by_signal_id key(s) {mismatched_mapping_keys} do not match "
+            "their own snapshot's trade_signal_id."
+        )
+
+
+def persist_lifecycle_builds(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    option_type: str | None,
+    strike: Decimal | None,
+    expiration: str | None,
+    builds: list,
+    snapshots_by_signal_id: dict,
+) -> list[int]:
+    """Persist a pure-engine build sequence for one lifecycle key.
+
+    Validates the entire builds/snapshots_by_signal_id shape (see
+    _validate_lifecycle_builds_before_persisting()) before performing any
+    database write. Only once that validation passes: for each
+    database.lifecycle.LifecycleBuild in builds (typically
+    build_lifecycle_sequence()'s own return value, in order), inserts one
+    fresh trade_lifecycles row, inserts its ordered trade_lifecycle_events
+    membership (each carrying an immutable canonical signal_snapshot via
+    build_signal_snapshot_json()), and updates each member signal's
+    lifecycle_id to point at the new generation. Creates no duplicate
+    membership: each build's own member_signal_ids has no repeats, and
+    each freshly created trade_lifecycle_id is unique, so every
+    (trade_lifecycle_id, trade_signal_id) pair inserted is unique by
+    construction.
+
+    Does not supersede any existing generation and does not commit or
+    roll back - the caller (R6.4) is responsible for superseding whatever
+    generation(s) this replaces, in the same transaction.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id, symbol, option_type, strike, expiration: The lifecycle
+            key every build in `builds` belongs to.
+        builds: A list of database.lifecycle.LifecycleBuild.
+        snapshots_by_signal_id: Maps every trade_signal_id appearing in
+            any build's member_signal_ids to the SignalSnapshot it was
+            read from.
+
+    Returns:
+        The newly created trade_lifecycles.id values, one per build, in
+        the same order as `builds`. Empty list if builds is empty.
+
+    Raises:
+        ValueError: See _validate_lifecycle_builds_before_persisting() -
+            raised before any write, so nothing is ever partially
+            persisted.
+    """
+    _validate_lifecycle_builds_before_persisting(builds, snapshots_by_signal_id)
+
+    new_lifecycle_ids: list[int] = []
+    for build in builds:
+        lifecycle = create_trade_lifecycle(
+            conn,
+            trader_id=trader_id,
+            symbol=symbol,
+            status=build.status,
+            remaining_fraction=build.remaining_fraction,
+            option_type=option_type,
+            strike=strike,
+            expiration=expiration,
+            opened_by_signal_id=build.opened_by_signal_id,
+            closed_by_signal_id=build.closed_by_signal_id,
+            ambiguity_flags=list(build.ambiguity_flags) or None,
+        )
+        for sequence_index, member_signal_id in enumerate(build.member_signal_ids, start=1):
+            snapshot = snapshots_by_signal_id[member_signal_id]
+            create_trade_lifecycle_event(
+                conn,
+                lifecycle.id,
+                member_signal_id,
+                sequence_index,
+                build_signal_snapshot_json(snapshot),
+            )
+            update_trade_signal_lifecycle_pointer(conn, member_signal_id, lifecycle.id)
+        new_lifecycle_ids.append(lifecycle.id)
+    return new_lifecycle_ids
+
+
+def create_lifecycle_unresolved_singleton(
+    conn: sqlite3.Connection,
+    trader_id: int,
+    symbol: str,
+    option_type: str | None,
+    strike: Decimal | None,
+    expiration: str | None,
+    snapshot: SignalSnapshot,
+    flag: str,
+) -> int:
+    """Create a standalone 'unresolved' generation for exactly one signal.
+
+    For a signal classified unresolved outside of a normal
+    build_lifecycle_sequence() replay - e.g. a genuinely new signal a
+    later rebuild (R6.4) classifies out_of_order_after_terminal_lifecycle
+    before it is ever added to any replay window, or a signal whose own
+    key/event_type made it ineligible for a normal window in the first
+    place.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id, symbol, option_type, strike, expiration: The lifecycle
+            key this singleton is recorded under.
+        snapshot: The SignalSnapshot for the one signal this singleton
+            represents.
+        flag: The single ambiguity flag naming why this signal is
+            unresolved.
+
+    Returns:
+        The newly created trade_lifecycles.id.
+    """
+    lifecycle = create_trade_lifecycle(
+        conn,
+        trader_id=trader_id,
+        symbol=symbol,
+        status="unresolved",
+        remaining_fraction="0",
+        option_type=option_type,
+        strike=strike,
+        expiration=expiration,
+        ambiguity_flags=[flag],
+    )
+    create_trade_lifecycle_event(
+        conn,
+        lifecycle.id,
+        snapshot.trade_signal_id,
+        1,
+        build_signal_snapshot_json(snapshot),
+    )
+    update_trade_signal_lifecycle_pointer(conn, snapshot.trade_signal_id, lifecycle.id)
+    return lifecycle.id
+
+
+def list_current_trade_lifecycles(
+    conn: sqlite3.Connection,
+    *,
+    trader_name: str | None = None,
+    symbol: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """List current (is_current=1) lifecycle generations for read-only
+    display, newest first.
+
+    Mirrors get_trade_signals_for_review()'s filter/display pattern: a
+    blank or None filter omits its WHERE fragment entirely rather than
+    matching everything via a wildcard. This function performs no writes.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_name: Exact traders.name to filter by, or None/blank to
+            omit.
+        symbol: Ticker symbol to filter by, matched case-insensitively,
+            or None/blank to omit.
+        status: Exact trade_lifecycles.status to filter by, or None/blank
+            to omit.
+        limit: Maximum number of rows to return, applied in SQL via
+            LIMIT. Defaults to 100.
+
+    Returns:
+        A list of dicts, newest first (trade_lifecycles.id descending),
+        each with keys: id, trader_id, trader_name, symbol, option_type,
+        strike, expiration, status, remaining_fraction,
+        opened_by_signal_id, closed_by_signal_id, ambiguity_flags (a
+        decoded list or None), created_at, updated_at. Empty list if
+        nothing matches.
+    """
+    where_clauses = ["trade_lifecycles.is_current = 1"]
+    params: list = []
+
+    if trader_name and trader_name.strip():
+        where_clauses.append("traders.name = ?")
+        params.append(trader_name)
+    if symbol and symbol.strip():
+        where_clauses.append("UPPER(trade_lifecycles.symbol) = UPPER(?)")
+        params.append(symbol)
+    if status and status.strip():
+        where_clauses.append("trade_lifecycles.status = ?")
+        params.append(status)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}"
+
+    rows = conn.execute(
+        "SELECT "
+        "trade_lifecycles.id AS id, "
+        "trade_lifecycles.trader_id AS trader_id, "
+        "traders.name AS trader_name, "
+        "trade_lifecycles.symbol AS symbol, "
+        "trade_lifecycles.option_type AS option_type, "
+        "trade_lifecycles.strike AS strike, "
+        "trade_lifecycles.expiration AS expiration, "
+        "trade_lifecycles.status AS status, "
+        "trade_lifecycles.remaining_fraction AS remaining_fraction, "
+        "trade_lifecycles.opened_by_signal_id AS opened_by_signal_id, "
+        "trade_lifecycles.closed_by_signal_id AS closed_by_signal_id, "
+        "trade_lifecycles.ambiguity_flags AS ambiguity_flags, "
+        "trade_lifecycles.created_at AS created_at, "
+        "trade_lifecycles.updated_at AS updated_at "
+        "FROM trade_lifecycles "
+        "JOIN traders ON trade_lifecycles.trader_id = traders.id "
+        f"{where_sql} "
+        "ORDER BY trade_lifecycles.id DESC "
+        "LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        result = dict(row)
+        result["ambiguity_flags"] = (
+            json.loads(result["ambiguity_flags"])
+            if result["ambiguity_flags"] is not None
+            else None
+        )
+        results.append(result)
+    return results
+
+
+def _check_invariant_h_multiple_active_per_key(conn: sqlite3.Connection) -> list[str]:
+    """Invariant H: at most one current non-terminal ('open'/
+    'partially_closed') lifecycle may exist per normalized key.
+
+    Grouped in Python, not SQL: strike must be compared via Decimal, and
+    symbol case-insensitively, neither of which a raw SQL GROUP BY on the
+    stored text/columns would get right (SQLite's GROUP BY does treat
+    NULL as equal to NULL, which is correct for the equity-key case, but
+    it cannot know that stored strike text "207.50" and "207.5" are the
+    same number).
+
+    Returns:
+        One human-readable violation string per key with more than one
+        current non-terminal row, naming the exact violating
+        trade_lifecycles.id values, in a deterministic, normalized order
+        (see _lifecycle_key_sort_key()) - independent of trade_lifecycles
+        row-insertion order or SQL row-return order. The key itself is
+        placed before the (inherently insertion-order-correlated)
+        trade_lifecycles.id list within each message, so that sorting
+        these strings - whether here or by the caller re-sorting the
+        full combined violations list - is driven by the key's own
+        content (trader/symbol/strike/expiration), never by which row
+        happened to be inserted first and therefore received a lower id.
+        Empty list if the invariant holds.
+    """
+    rows = conn.execute(
+        "SELECT id, trader_id, symbol, option_type, strike, expiration "
+        "FROM trade_lifecycles WHERE is_current = 1 AND status IN ('open', 'partially_closed') "
+        "ORDER BY id"
+    ).fetchall()
+
+    groups: dict = {}
+    for row in rows:
+        strike = Decimal(row["strike"]) if row["strike"] is not None else None
+        key = (
+            row["trader_id"], row["symbol"].upper(), row["option_type"], strike,
+            row["expiration"],
+        )
+        groups.setdefault(key, []).append(row["id"])
+
+    violations = []
+    for key in sorted(groups.keys(), key=_lifecycle_key_sort_key):
+        ids = groups[key]
+        if len(ids) > 1:
+            # The key is deliberately placed before the ids list in the
+            # message text itself: sorting these strings lexicographically
+            # (whether here or by a caller re-sorting a larger combined
+            # list) must be driven by the key's own content, never by the
+            # (insertion-order-correlated) trade_lifecycles.id values.
+            violations.append(
+                f"Invariant H violated: key {key!r} has {len(ids)} current "
+                f"non-terminal lifecycles {sorted(ids)}."
+            )
+    return sorted(violations)
+
+
+def validate_lifecycle_membership_integrity(conn: sqlite3.Connection) -> list[str]:
+    """Check every approved lifecycle membership invariant (A-H).
+
+    Performs no writes and raises no service-layer exception - this is a
+    read-only, deterministic check. TradeService (R6.4, not yet
+    implemented) is responsible for raising LifecycleIntegrityError on any
+    non-empty result and rolling back its own transaction; this function
+    only reports.
+
+    Every check is scoped to is_current = 1 lifecycles (or signals
+    reachable from one), so a superseded generation's own membership -
+    however it looks - never triggers a violation here: audit rows tied
+    to a superseded generation remain fully permitted, exactly matching
+    "auditable lifecycle history."
+
+    Invariants checked:
+        A. One signal belongs to at most one current lifecycle.
+        B. Every current lifecycle-event membership agrees with
+           trade_signals.lifecycle_id.
+        C. Every non-NULL trade_signals.lifecycle_id references an
+           existing lifecycle with is_current = 1.
+        D. Every non-NULL lifecycle_id has a matching
+           trade_lifecycle_events row for that same lifecycle and signal.
+        E/F. Every signal contained in a current lifecycle is itself
+           current (extraction_id IS NULL OR message_extractions.is_current = 1)
+           - equivalently, no superseded signal remains inside any
+           current lifecycle. Logically equivalent (each the contrapositive
+           of the other); checked with one query.
+        G. Every event_type IS NULL legacy signal has lifecycle_id IS NULL.
+        H. At most one current non-terminal ('open'/'partially_closed')
+           lifecycle exists per normalized key.
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        A list of human-readable violation descriptions, each naming
+        which invariant failed and the exact violating id(s)/detail, in
+        deterministic sorted order - never dependent on SQL row-return
+        order, so repeated calls against unchanged state, or calls
+        against equivalent data inserted in a different order, always
+        return an identically-ordered list. Empty list if every
+        invariant holds.
+    """
+    violations: list[str] = []
+
+    rows = conn.execute(
+        "SELECT tle.trade_signal_id, COUNT(DISTINCT tle.trade_lifecycle_id) AS n "
+        "FROM trade_lifecycle_events tle "
+        "JOIN trade_lifecycles tl ON tl.id = tle.trade_lifecycle_id "
+        "WHERE tl.is_current = 1 "
+        "GROUP BY tle.trade_signal_id HAVING n > 1"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant A violated: trade_signal_id {row['trade_signal_id']} belongs to "
+            f"{row['n']} current lifecycles."
+        )
+
+    rows = conn.execute(
+        "SELECT tle.trade_signal_id, tl.id AS trade_lifecycle_id, ts.lifecycle_id "
+        "FROM trade_lifecycle_events tle "
+        "JOIN trade_lifecycles tl ON tl.id = tle.trade_lifecycle_id "
+        "JOIN trade_signals ts ON ts.id = tle.trade_signal_id "
+        "WHERE tl.is_current = 1 AND ts.lifecycle_id IS NOT tl.id"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant B violated: trade_signal_id {row['trade_signal_id']} is a current "
+            f"member of trade_lifecycle_id {row['trade_lifecycle_id']} but its own "
+            f"lifecycle_id is {row['lifecycle_id']}."
+        )
+
+    rows = conn.execute(
+        "SELECT ts.id, ts.lifecycle_id FROM trade_signals ts "
+        "WHERE ts.lifecycle_id IS NOT NULL "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM trade_lifecycles tl "
+        "    WHERE tl.id = ts.lifecycle_id AND tl.is_current = 1"
+        ")"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant C violated: trade_signal_id {row['id']} has lifecycle_id "
+            f"{row['lifecycle_id']}, which is not a current (is_current=1) lifecycle."
+        )
+
+    rows = conn.execute(
+        "SELECT ts.id, ts.lifecycle_id FROM trade_signals ts "
+        "WHERE ts.lifecycle_id IS NOT NULL "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM trade_lifecycle_events tle "
+        "    WHERE tle.trade_lifecycle_id = ts.lifecycle_id AND tle.trade_signal_id = ts.id"
+        ")"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant D violated: trade_signal_id {row['id']} has lifecycle_id "
+            f"{row['lifecycle_id']} but no matching trade_lifecycle_events row exists."
+        )
+
+    rows = conn.execute(
+        "SELECT tle.trade_signal_id, tl.id AS trade_lifecycle_id "
+        "FROM trade_lifecycle_events tle "
+        "JOIN trade_lifecycles tl ON tl.id = tle.trade_lifecycle_id "
+        "JOIN trade_signals ts ON ts.id = tle.trade_signal_id "
+        "LEFT JOIN message_extractions me ON me.id = ts.extraction_id "
+        "WHERE tl.is_current = 1 "
+        "AND NOT (ts.extraction_id IS NULL OR me.is_current = 1)"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant E/F violated: trade_signal_id {row['trade_signal_id']} is a member "
+            f"of current trade_lifecycle_id {row['trade_lifecycle_id']} but is itself "
+            "superseded (not current)."
+        )
+
+    rows = conn.execute(
+        "SELECT id FROM trade_signals WHERE event_type IS NULL AND lifecycle_id IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        violations.append(
+            f"Invariant G violated: legacy trade_signal_id {row['id']} (event_type IS NULL) "
+            "has a non-NULL lifecycle_id."
+        )
+
+    violations.extend(_check_invariant_h_multiple_active_per_key(conn))
+
+    # Sorted regardless of SQL row-return order or which invariant found
+    # what first, so repeated calls against the same state - and calls
+    # against equivalent data built in a different insertion order -
+    # always return byte-identical, identically-ordered results.
+    return sorted(violations)

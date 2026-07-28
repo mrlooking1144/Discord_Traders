@@ -115,6 +115,52 @@ def _column_names(connection, table):
     }
 
 
+def _index_names(connection):
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
+
+
+def _foreign_keys(connection, table):
+    """Return the exact (from_column, target_table, to_column) triples for
+    every foreign key defined on `table`, via PRAGMA foreign_key_list - not
+    merely the set of target table names."""
+    return {
+        (row[3], row[2], row[4])  # from, table, to
+        for row in connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+    }
+
+
+def _column_type_and_notnull(connection, table, column):
+    """Return (declared_type, notnull) for one column via PRAGMA table_info."""
+    for row in connection.execute(f"PRAGMA table_info({table})").fetchall():
+        if row[1] == column:
+            return row[2], bool(row[3])
+    raise AssertionError(f"column {column!r} not found on table {table!r}")
+
+
+def _index_is_unique(connection, table, index_name):
+    """Return whether `index_name` on `table` is unique, via PRAGMA index_list."""
+    for row in connection.execute(f"PRAGMA index_list({table})").fetchall():
+        if row[1] == index_name:
+            return bool(row[2])
+    raise AssertionError(f"index {index_name!r} not found on table {table!r}")
+
+
+def _index_columns_in_order(connection, index_name):
+    """Return the exact, ordered column names of `index_name`, via
+    PRAGMA index_info (sorted by seqno, the index's own column position -
+    not insertion order of the returned rows)."""
+    rows = sorted(
+        connection.execute(f"PRAGMA index_info({index_name})").fetchall(),
+        key=lambda row: row[0],
+    )
+    return [row[2] for row in rows]
+
+
 class FreshDatabaseMigrationTests(unittest.TestCase):
     def setUp(self):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -171,10 +217,10 @@ class FreshDatabaseMigrationTests(unittest.TestCase):
                 "extraction_id",
             }.issubset(trade_signal_columns)
         )
-        self.assertNotIn(
+        self.assertIn(
             "lifecycle_id",
             trade_signal_columns,
-            "lifecycle_id belongs to a later milestone (R6, alongside trade_lifecycles)",
+            "lifecycle_id is added by Recovery Milestone R6.1 alongside trade_lifecycles",
         )
         self.assertIn("canonical_name", trader_columns)
 
@@ -194,7 +240,7 @@ class FreshDatabaseMigrationTests(unittest.TestCase):
 
         expected = {p.name for p in _MIGRATIONS_DIR.glob("*.sql")}
         self.assertEqual(applied, expected)
-        self.assertGreaterEqual(len(expected), 6)
+        self.assertGreaterEqual(len(expected), 7)
 
     def test_reinitializing_is_idempotent(self):
         initialize_database(self.config)
@@ -286,6 +332,369 @@ class FreshDatabaseMigrationTests(unittest.TestCase):
                 )
         finally:
             connection.close()
+
+
+class R6LifecycleSchemaMigrationTests(unittest.TestCase):
+    """Recovery Milestone R6.1: trade_lifecycles / trade_lifecycle_events /
+    trade_signals.lifecycle_id.
+
+    Schema/migration-level tests only - no matching/linking behavior exists
+    yet. Verifies the migration's tables, columns, constraints, and indexes
+    against a fresh database, following the same pattern as
+    FreshDatabaseMigrationTests above.
+    """
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _insert_source_trader_message_signal(self):
+        conn = self.connection
+        conn.execute("INSERT INTO sources (name) VALUES ('discord')")
+        source_id = conn.execute(
+            "SELECT id FROM sources WHERE name = 'discord'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO traders (source_id, name) VALUES (?, 'TC')", (source_id,)
+        )
+        trader_id = conn.execute(
+            "SELECT id FROM traders WHERE name = 'TC'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO raw_messages (source_id, raw_text, content_hash) "
+            "VALUES (?, 'x', 'hash-r6')",
+            (source_id,),
+        )
+        raw_message_id = conn.execute(
+            "SELECT id FROM raw_messages WHERE content_hash = 'hash-r6'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO trade_signals (raw_message_id, trader_id, symbol, action) "
+            "VALUES (?, ?, 'IBM', 'BOUGHT')",
+            (raw_message_id, trader_id),
+        )
+        signal_id = conn.execute(
+            "SELECT id FROM trade_signals WHERE raw_message_id = ?", (raw_message_id,)
+        ).fetchone()[0]
+        conn.commit()
+        return trader_id, signal_id
+
+    def test_new_lifecycle_tables_created(self):
+        tables = _table_names(self.connection)
+        self.assertIn("trade_lifecycles", tables)
+        self.assertIn("trade_lifecycle_events", tables)
+
+    def test_trade_lifecycles_columns_match_approved_schema(self):
+        columns = _column_names(self.connection, "trade_lifecycles")
+        self.assertEqual(
+            columns,
+            {
+                "id", "trader_id", "symbol", "option_type", "strike", "expiration",
+                "status", "remaining_fraction", "opened_by_signal_id",
+                "closed_by_signal_id", "is_current", "superseded_at",
+                "ambiguity_flags", "created_at", "updated_at",
+            },
+        )
+
+    def test_trade_lifecycle_events_columns_match_approved_schema(self):
+        columns = _column_names(self.connection, "trade_lifecycle_events")
+        self.assertEqual(
+            columns,
+            {
+                "id", "trade_lifecycle_id", "trade_signal_id", "sequence_index",
+                "signal_snapshot", "created_at",
+            },
+        )
+
+    def test_trade_signals_gains_lifecycle_id_column(self):
+        self.assertIn("lifecycle_id", _column_names(self.connection, "trade_signals"))
+
+    def test_expected_indexes_exist(self):
+        index_names = _index_names(self.connection)
+        self.assertIn("idx_trade_lifecycles_key", index_names)
+        self.assertIn("idx_trade_lifecycle_events_unique_membership", index_names)
+        self.assertIn("idx_trade_lifecycle_events_signal_id", index_names)
+        self.assertIn("idx_trade_signals_lifecycle_id", index_names)
+
+    def test_foreign_keys_reference_expected_tables(self):
+        fk_targets = {
+            row[2]  # PRAGMA foreign_key_list: table
+            for row in self.connection.execute(
+                "PRAGMA foreign_key_list(trade_lifecycles)"
+            ).fetchall()
+        }
+        self.assertEqual(fk_targets, {"traders", "trade_signals"})
+
+        fk_targets = {
+            row[2]
+            for row in self.connection.execute(
+                "PRAGMA foreign_key_list(trade_lifecycle_events)"
+            ).fetchall()
+        }
+        self.assertEqual(fk_targets, {"trade_lifecycles", "trade_signals"})
+
+    def test_trade_lifecycles_status_check_rejects_invalid_value(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycles "
+                "(trader_id, symbol, status, remaining_fraction) "
+                "VALUES (?, 'IBM', 'bogus_status', '1')",
+                (trader_id,),
+            )
+
+    def test_trade_lifecycles_status_check_accepts_every_approved_value(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+
+        for status in (
+            "open", "partially_closed", "closed", "orphan", "unresolved", "invalid",
+        ):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycles "
+                "(trader_id, symbol, status, remaining_fraction) "
+                "VALUES (?, 'IBM', ?, '1')",
+                (trader_id, status),
+            )
+        self.connection.commit()
+
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_lifecycles"
+        ).fetchone()[0]
+        self.assertEqual(count, 6)
+
+    def test_trade_lifecycles_is_current_check_rejects_invalid_value(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycles "
+                "(trader_id, symbol, status, remaining_fraction, is_current) "
+                "VALUES (?, 'IBM', 'open', '1', 2)",
+                (trader_id,),
+            )
+
+    def test_trade_lifecycles_is_current_defaults_to_one(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+
+        self.connection.execute(
+            "INSERT INTO trade_lifecycles (trader_id, symbol, status, remaining_fraction) "
+            "VALUES (?, 'IBM', 'open', '1')",
+            (trader_id,),
+        )
+        self.connection.commit()
+
+        is_current = self.connection.execute(
+            "SELECT is_current FROM trade_lifecycles WHERE trader_id = ?", (trader_id,)
+        ).fetchone()[0]
+        self.assertEqual(is_current, 1)
+
+    def test_trade_lifecycles_trader_id_foreign_key_enforced(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycles "
+                "(trader_id, symbol, status, remaining_fraction) "
+                "VALUES (999999, 'IBM', 'open', '1')"
+            )
+
+    def test_trade_lifecycle_events_signal_snapshot_is_not_null(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+        self.connection.execute(
+            "INSERT INTO trade_lifecycles (trader_id, symbol, status, remaining_fraction) "
+            "VALUES (?, 'IBM', 'open', '1')",
+            (trader_id,),
+        )
+        lifecycle_id = self.connection.execute(
+            "SELECT id FROM trade_lifecycles WHERE trader_id = ?", (trader_id,)
+        ).fetchone()[0]
+        self.connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycle_events "
+                "(trade_lifecycle_id, trade_signal_id, sequence_index) "
+                "VALUES (?, ?, 1)",
+                (lifecycle_id, signal_id),
+            )
+
+    def test_trade_lifecycle_events_unique_membership_enforced(self):
+        trader_id, signal_id = self._insert_source_trader_message_signal()
+        self.connection.execute(
+            "INSERT INTO trade_lifecycles (trader_id, symbol, status, remaining_fraction) "
+            "VALUES (?, 'IBM', 'open', '1')",
+            (trader_id,),
+        )
+        lifecycle_id = self.connection.execute(
+            "SELECT id FROM trade_lifecycles WHERE trader_id = ?", (trader_id,)
+        ).fetchone()[0]
+        self.connection.execute(
+            "INSERT INTO trade_lifecycle_events "
+            "(trade_lifecycle_id, trade_signal_id, sequence_index, signal_snapshot) "
+            "VALUES (?, ?, 1, '{}')",
+            (lifecycle_id, signal_id),
+        )
+        self.connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO trade_lifecycle_events "
+                "(trade_lifecycle_id, trade_signal_id, sequence_index, signal_snapshot) "
+                "VALUES (?, ?, 2, '{}')",
+                (lifecycle_id, signal_id),
+            )
+
+    def test_existing_trade_signals_row_receives_null_lifecycle_id(self):
+        _trader_id, signal_id = self._insert_source_trader_message_signal()
+
+        lifecycle_id = self.connection.execute(
+            "SELECT lifecycle_id FROM trade_signals WHERE id = ?", (signal_id,)
+        ).fetchone()[0]
+        self.assertIsNone(lifecycle_id)
+
+    def test_migration_performs_no_backfill(self):
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM trade_lifecycles"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM trade_lifecycle_events"
+            ).fetchone()[0],
+            0,
+        )
+
+
+class R6LifecycleSchemaExactDefinitionTests(unittest.TestCase):
+    """Recovery Milestone R6.1: verifies the *exact* approved schema
+    definition, via direct PRAGMA evidence, rather than only object names.
+
+    R6LifecycleSchemaMigrationTests above already confirms the tables,
+    columns, and indexes exist and that the relevant CHECK/UNIQUE/NOT NULL
+    constraints are enforced at the behavioral level (a bad INSERT is
+    rejected). This class instead asserts the schema's own declared shape
+    directly: exact source-column -> (target table, target column) foreign
+    key mappings (not merely the set of tables a foreign key reaches),
+    exact declared column type and NOT NULL flag for signal_snapshot/
+    sequence_index, and exact index column order plus uniqueness for every
+    R6.1 index.
+    """
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def test_trade_lifecycles_foreign_keys_exact(self):
+        self.assertEqual(
+            _foreign_keys(self.connection, "trade_lifecycles"),
+            {
+                ("trader_id", "traders", "id"),
+                ("opened_by_signal_id", "trade_signals", "id"),
+                ("closed_by_signal_id", "trade_signals", "id"),
+            },
+        )
+
+    def test_trade_lifecycle_events_foreign_keys_exact(self):
+        self.assertEqual(
+            _foreign_keys(self.connection, "trade_lifecycle_events"),
+            {
+                ("trade_lifecycle_id", "trade_lifecycles", "id"),
+                ("trade_signal_id", "trade_signals", "id"),
+            },
+        )
+
+    def test_trade_signals_lifecycle_id_foreign_key_exact(self):
+        # trade_signals also carries pre-existing foreign keys
+        # (raw_message_id, trader_id, extraction_id) from earlier
+        # milestones, out of R6.1 scope - this asserts only the R6.1
+        # addition maps exactly as approved, not the complete set.
+        self.assertIn(
+            ("lifecycle_id", "trade_lifecycles", "id"),
+            _foreign_keys(self.connection, "trade_signals"),
+        )
+
+    def test_signal_snapshot_column_is_exactly_text_not_null(self):
+        column_type, notnull = _column_type_and_notnull(
+            self.connection, "trade_lifecycle_events", "signal_snapshot"
+        )
+        self.assertEqual(column_type, "TEXT")
+        self.assertTrue(notnull)
+
+    def test_sequence_index_column_is_exactly_integer_not_null(self):
+        column_type, notnull = _column_type_and_notnull(
+            self.connection, "trade_lifecycle_events", "sequence_index"
+        )
+        self.assertEqual(column_type, "INTEGER")
+        self.assertTrue(notnull)
+
+    def test_idx_trade_lifecycles_key_exact_definition(self):
+        self.assertEqual(
+            _index_columns_in_order(self.connection, "idx_trade_lifecycles_key"),
+            ["trader_id", "symbol", "option_type", "strike", "expiration", "is_current"],
+        )
+        self.assertFalse(
+            _index_is_unique(
+                self.connection, "trade_lifecycles", "idx_trade_lifecycles_key"
+            )
+        )
+
+    def test_idx_trade_lifecycle_events_unique_membership_exact_definition(self):
+        self.assertEqual(
+            _index_columns_in_order(
+                self.connection, "idx_trade_lifecycle_events_unique_membership"
+            ),
+            ["trade_lifecycle_id", "trade_signal_id"],
+        )
+        self.assertTrue(
+            _index_is_unique(
+                self.connection,
+                "trade_lifecycle_events",
+                "idx_trade_lifecycle_events_unique_membership",
+            )
+        )
+
+    def test_idx_trade_lifecycle_events_signal_id_exact_definition(self):
+        self.assertEqual(
+            _index_columns_in_order(
+                self.connection, "idx_trade_lifecycle_events_signal_id"
+            ),
+            ["trade_signal_id"],
+        )
+        self.assertFalse(
+            _index_is_unique(
+                self.connection,
+                "trade_lifecycle_events",
+                "idx_trade_lifecycle_events_signal_id",
+            )
+        )
+
+    def test_idx_trade_signals_lifecycle_id_exact_definition(self):
+        self.assertEqual(
+            _index_columns_in_order(self.connection, "idx_trade_signals_lifecycle_id"),
+            ["lifecycle_id"],
+        )
+        self.assertFalse(
+            _index_is_unique(
+                self.connection, "trade_signals", "idx_trade_signals_lifecycle_id"
+            )
+        )
 
 
 class MigrationAtomicityTests(unittest.TestCase):
@@ -535,6 +944,36 @@ class V010BackwardCompatibilityTests(unittest.TestCase):
         self.assertIsNone(trade_signal_row["strike"])
         self.assertIsNone(trade_signal_row["event_type"])
         self.assertIsNone(trade_signal_row["extraction_id"])
+
+    def test_upgrade_leaves_existing_trade_signal_lifecycle_id_null(self):
+        # Recovery Milestone R6.1: trade_signals.lifecycle_id is added by
+        # migrations/0007_trade_lifecycles.sql with no backfill of any kind
+        # - every pre-existing v0.1.0 trade_signals row must come through
+        # the upgrade with lifecycle_id NULL, exactly like every other
+        # additive column this project has ever migrated in.
+        _, _, raw_message_id = self._insert_v010_data()
+
+        apply_migrations(self.connection)
+
+        lifecycle_id = self.connection.execute(
+            "SELECT lifecycle_id FROM trade_signals WHERE raw_message_id = ?",
+            (raw_message_id,),
+        ).fetchone()[0]
+        self.assertIsNone(lifecycle_id)
+
+    def test_upgrade_creates_empty_lifecycle_tables(self):
+        self._insert_v010_data()
+
+        apply_migrations(self.connection)
+
+        trade_lifecycles_count = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_lifecycles"
+        ).fetchone()[0]
+        trade_lifecycle_events_count = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_lifecycle_events"
+        ).fetchone()[0]
+        self.assertEqual(trade_lifecycles_count, 0)
+        self.assertEqual(trade_lifecycle_events_count, 0)
 
     def test_upgrade_backfills_legacy_extraction_per_raw_message(self):
         _, _, raw_message_id = self._insert_v010_data()

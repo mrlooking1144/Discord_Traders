@@ -102,8 +102,11 @@ class TradeSignal:
         strike: Normalized decimal string (e.g. "207.5"), or None.
         expiration_raw: Verbatim expiration token as it appeared in the
             message (e.g. "07/24"), before year resolution, or None.
-        event_type: Derived lifecycle event kind (e.g. ENTRY, ADD, ROLL_UP,
-            PARTIAL_EXIT, FULL_EXIT, STOP_EXIT), or None.
+        event_type: Derived lifecycle event kind - exactly one of ENTRY,
+            ADD, ROLL_UP, PARTIAL_EXIT, FULL_EXIT (per the Recovery
+            Milestone R3 extractor grammar; a stop-out is a FULL_EXIT
+            whose reason is preserved verbatim in notes, never a separate
+            event type) - or None.
         qualifier: Raw fraction text (e.g. "1/2"), "ALL OUT", or a bracket
             annotation (e.g. "[SMALL]"), or None.
         stated_entry_price: Normalized decimal string of the entry price as
@@ -116,6 +119,15 @@ class TradeSignal:
         extraction_id: FK to message_extractions.id identifying which parse
             attempt produced this row, or None for rows persisted before
             this column existed.
+        lifecycle_id: FK to trade_lifecycles.id identifying this signal's
+            current lifecycle generation (Recovery Milestone R6), or None
+            if this signal belongs to no lifecycle - always None for a
+            legacy signal with event_type None, and None until the R6
+            lifecycle engine (not yet implemented as of R6.1) links it.
+            The one narrow, maintained exception to this model's
+            otherwise immutable fields - never written by ingestion,
+            reprocessing-of-extraction, or the correction workflow
+            directly.
     """
 
     raw_message_id: int
@@ -137,6 +149,7 @@ class TradeSignal:
     stated_return_pct: Optional[str] = None
     notes: Optional[str] = None
     extraction_id: Optional[int] = None
+    lifecycle_id: Optional[int] = None
 
 
 @dataclass
@@ -414,3 +427,142 @@ class ChannelCheckpoint:
     last_ingested_raw_message_id: int
     last_ingested_at: str
     last_import_batch_id: Optional[int]
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R6.1: trade_lifecycles / trade_lifecycle_events models.
+#
+# These mirror the two new tables added by
+# database/migrations/0007_trade_lifecycles.sql field-for-field, following
+# the same convention as every table-mirroring model above (Source,
+# Trader, RawMessage, TradeSignal, TradeSignalEdit, Channel, ImportBatch,
+# MessageExtraction): plain data shape only, no database access, no
+# validation, no business logic. R6.1 adds schema, migration, and these
+# models only - no lifecycle matching/linking behavior exists yet (that is
+# Recovery Milestones R6.2-R6.4); nothing in this codebase constructs a
+# TradeLifecycle or TradeLifecycleEvent as of R6.1.
+#
+# Unlike the R5 result dataclasses above (MessageIngestOutcome and
+# following), which are frozen, purpose-built call-result shapes with no
+# database row of their own, TradeLifecycle and TradeLifecycleEvent each
+# mirror one real table row - so they are declared frozen dataclasses here
+# for the same reason the R5 result models are frozen (a persisted
+# lifecycle generation, once created, is never mutated in place except via
+# the is_current/superseded_at bookkeeping the lifecycle engine will apply
+# by constructing a new model instance from a fresh row read, not by
+# mutating an existing one), while still mirroring a table row like the
+# earlier, non-frozen models above.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TradeLifecycle:
+    """Mirrors the trade_lifecycles table.
+
+    One row per lifecycle *generation* - the persisted outcome of
+    replaying one (trader_id, symbol, option_type, strike, expiration)
+    key's current signal history through the lifecycle-matching engine
+    (not yet implemented as of Recovery Milestone R6.1). A generation is
+    never edited in place once created, aside from is_current/
+    superseded_at - reprocessing or a key-changing correction supersedes
+    the old row and inserts a fresh one, mirroring MessageExtraction's
+    is_current/superseded_at contract exactly. Unlike MessageExtraction's
+    strict one-current-per-raw-message invariant, a single lifecycle key
+    may legitimately have multiple simultaneously current rows over time
+    (each a distinct re-entry).
+
+    Attributes:
+        id: Primary key. None until the row is persisted.
+        trader_id: FK to traders.id. Required.
+        symbol: Ticker symbol. Required.
+        option_type: Free-text call/put, or None for an equity key.
+        strike: Normalized decimal string (e.g. "207.5"), or None for an
+            equity key.
+        expiration: Resolved ISO8601 date string, or None for an equity
+            key.
+        status: Exactly one of 'open', 'partially_closed', 'closed',
+            'orphan', 'unresolved', 'invalid'. Required. A stop-out is
+            represented as 'closed' plus the closing signal's own notes -
+            there is no separate 'stopped' status.
+        remaining_fraction: The exact string form of a fractions.Fraction
+            (e.g. "1", "1/2", "5/6", "0"), never a Decimal string - several
+            approved fraction tokens (1/3, 1/6) do not terminate in base
+            10, and exact rational arithmetic avoids any rounding-residue
+            risk when checking whether an exit exactly zeroes the
+            remaining position. Required.
+        opened_by_signal_id: FK to trade_signals.id for the signal that
+            opened this generation, or None (an 'orphan'/'unresolved'
+            generation may have no verified opening signal).
+        closed_by_signal_id: FK to trade_signals.id for the signal that
+            brought remaining_fraction to zero, or None (an 'open'/
+            'partially_closed'/'unresolved' generation has none yet).
+        is_current: True if this is the active (non-superseded)
+            generation. Unlike MessageExtraction, this is not a
+            per-key-exclusive flag - see the class docstring above.
+        superseded_at: ISO8601 timestamp of when this row was superseded
+            by a rebuild, or None if still current.
+        ambiguity_flags: List of flag strings (e.g.
+            "ambiguous_add_no_open_position"), or None.
+        created_at: ISO8601 timestamp. None to let the database default
+            apply.
+        updated_at: ISO8601 timestamp. None to let the database default
+            apply.
+    """
+
+    trader_id: int
+    symbol: str
+    status: str
+    remaining_fraction: str
+    id: Optional[int] = None
+    option_type: Optional[str] = None
+    strike: Optional[str] = None
+    expiration: Optional[str] = None
+    opened_by_signal_id: Optional[int] = None
+    closed_by_signal_id: Optional[int] = None
+    is_current: bool = True
+    superseded_at: Optional[str] = None
+    ambiguity_flags: Optional[list] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TradeLifecycleEvent:
+    """Mirrors the trade_lifecycle_events table.
+
+    The membership/audit table linking one TradeLifecycle generation to
+    the trade_signals rows that made it up, in chronological order
+    (sequence_index). No repository function ever updates or deletes a
+    row in this table once created, matching raw_messages.raw_text's
+    existing write-once contract - this is what keeps a superseded
+    generation's original membership auditable even after later
+    reprocessing or correction.
+
+    Attributes:
+        id: Primary key. None until the row is persisted.
+        trade_lifecycle_id: FK to trade_lifecycles.id. Required.
+        trade_signal_id: FK to trade_signals.id. Required.
+        sequence_index: 1-based order of this signal within its
+            generation. Required.
+        signal_snapshot: Immutable canonical JSON captured at the moment
+            this row is created - never updated or deleted afterward.
+            Required (NOT NULL at the schema level). Captures, at
+            minimum, this signal's trade_signal_id, raw_message_id,
+            trader_id, symbol, option_type, strike, expiration,
+            event_type, qualifier, action, price, stated_entry_price,
+            stated_return_pct, notes, extraction_id, and the exact
+            ordering key used to place it within this generation's
+            replay - so a later correction to the live trade_signals row
+            (e.g. its price, per the existing 2D.5 correction workflow)
+            can never silently alter what this generation is recorded as
+            having been built from.
+        created_at: ISO8601 timestamp. None to let the database default
+            apply.
+    """
+
+    trade_lifecycle_id: int
+    trade_signal_id: int
+    sequence_index: int
+    signal_snapshot: str
+    id: Optional[int] = None
+    created_at: Optional[str] = None

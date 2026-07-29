@@ -38,11 +38,16 @@ from database.repository import (
     create_trade_signal,
     create_trader,
     delete_import_batch_if_empty,
+    get_all_current_lifecycle_eligible_signal_ids,
+    get_all_current_lifecycle_keys,
     get_channel_by_external_id,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
     get_chronological_positions_for_raw_messages,
     get_current_extraction,
+    get_current_incomplete_lifecycle_signal_snapshots,
+    get_current_incomplete_lifecycles,
+    get_current_lifecycle_ids_for_raw_message_ids,
     get_current_lifecycles_for_key,
     get_current_signal_snapshot_for_raw_message,
     get_current_trade_signals_for_key,
@@ -55,6 +60,7 @@ from database.repository import (
     get_raw_message_by_id,
     get_raw_message_ids_by_import_batch,
     get_recorded_shape_for_generation,
+    get_trade_lifecycle_by_id,
     get_trade_lifecycle_events,
     get_trade_lifecycle_history_rows,
     get_trade_lifecycle_lineage_raw_message_ids,
@@ -2512,6 +2518,246 @@ class DeterministicOutputAcrossIsolatedInsertionOrderTests(unittest.TestCase):
         self.assertIn("'ZZZ'", h_violations1[1])
         self.assertIn("'AAA'", h_violations2[0])
         self.assertIn("'ZZZ'", h_violations2[1])
+
+
+class R64RepositorySupportTests(_LifecycleRepositoryTestCase):
+    """Focused tests for the five narrowly-scoped repository helpers added
+    to support Recovery Milestone R6.4's TradeService orchestration:
+    get_all_current_lifecycle_eligible_signal_ids(),
+    get_current_incomplete_lifecycle_signal_snapshots(),
+    get_trade_lifecycle_by_id(),
+    get_current_lifecycle_ids_for_raw_message_ids(), and
+    get_all_current_lifecycle_keys(). No R6.3 behavior is changed by this
+    class - it covers only the new additions."""
+
+    # -- get_all_current_lifecycle_eligible_signal_ids -----------------
+
+    def test_all_eligible_signal_ids_empty_when_nothing_exists(self):
+        self.assertEqual(get_all_current_lifecycle_eligible_signal_ids(self.connection), [])
+
+    def test_all_eligible_signal_ids_includes_eligible_excludes_legacy(self):
+        eligible, _ = self._make_signal(strike=Decimal("207.5"))
+        raw = create_raw_message(self.connection, self.source.id, "legacy")
+        self.connection.commit()
+        legacy = create_trade_signal(self.connection, raw.id, self.trader.id, "IBM", "BTO")
+        self.connection.commit()
+
+        ids = get_all_current_lifecycle_eligible_signal_ids(self.connection)
+
+        self.assertEqual(ids, [eligible.id])
+        self.assertNotIn(legacy.id, ids)
+
+    def test_all_eligible_signal_ids_excludes_superseded_extraction(self):
+        raw_message = create_raw_message(self.connection, self.source.id, "x")
+        self.connection.commit()
+        extraction = create_message_extraction(
+            self.connection, raw_message.id, parser_version="v2", parse_status="parsed"
+        )
+        self.connection.commit()
+        signal = create_trade_signal(
+            self.connection, raw_message.id, self.trader.id, "IBM", "BOUGHT",
+            option_type="call", strike=Decimal("207.5"), expiration="2026-07-24",
+            event_type="ENTRY", extraction_id=extraction.id,
+        )
+        self.connection.commit()
+        supersede_extraction(self.connection, extraction.id)
+        self.connection.commit()
+
+        self.assertNotIn(signal.id, get_all_current_lifecycle_eligible_signal_ids(self.connection))
+
+    def test_all_eligible_signal_ids_ascending_order(self):
+        first, _ = self._make_signal(strike=Decimal("207.5"))
+        second, _ = self._make_signal(symbol="AVGO", strike=Decimal("380"), option_type="put")
+
+        ids = get_all_current_lifecycle_eligible_signal_ids(self.connection)
+
+        self.assertEqual(ids, sorted([first.id, second.id]))
+
+    # -- get_current_incomplete_lifecycle_signal_snapshots --------------
+
+    def test_incomplete_signal_snapshots_empty_when_none_incomplete(self):
+        self._make_signal(strike=Decimal("207.5"))
+        self.assertEqual(get_current_incomplete_lifecycle_signal_snapshots(self.connection), [])
+
+    def test_incomplete_signal_snapshots_finds_partial_option_identity(self):
+        incomplete, _ = self._make_signal(option_type="call", strike=None, expiration=None)
+        self._make_signal(symbol="AVGO", strike=Decimal("380"), option_type="put")
+
+        snapshots = get_current_incomplete_lifecycle_signal_snapshots(self.connection)
+
+        self.assertEqual([s.trade_signal_id for s in snapshots], [incomplete.id])
+
+    def test_incomplete_signal_snapshots_excludes_legacy_signal(self):
+        raw = create_raw_message(self.connection, self.source.id, "legacy")
+        self.connection.commit()
+        create_trade_signal(
+            self.connection, raw.id, self.trader.id, "IBM", "BTO", option_type="call"
+        )
+        self.connection.commit()
+
+        self.assertEqual(get_current_incomplete_lifecycle_signal_snapshots(self.connection), [])
+
+    # -- get_current_incomplete_lifecycles --------------------------------
+
+    def test_current_incomplete_lifecycles_empty_when_none_exist(self):
+        self.assertEqual(get_current_incomplete_lifecycles(self.connection), [])
+
+    def test_current_incomplete_lifecycles_excludes_complete_shape(self):
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open", remaining_fraction="1",
+            option_type="call", strike=Decimal("207.5"), expiration="2026-07-24",
+        )
+        self.connection.commit()
+
+        self.assertEqual(get_current_incomplete_lifecycles(self.connection), [])
+
+    def test_current_incomplete_lifecycles_finds_incomplete_shape(self):
+        incomplete = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="unresolved",
+            remaining_fraction="0", option_type="call",
+        )
+        self.connection.commit()
+
+        found = get_current_incomplete_lifecycles(self.connection)
+
+        self.assertEqual([lc.id for lc in found], [incomplete.id])
+
+    def test_current_incomplete_lifecycles_excludes_superseded(self):
+        incomplete = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="unresolved",
+            remaining_fraction="0", option_type="call",
+        )
+        self.connection.commit()
+        supersede_trade_lifecycle(self.connection, incomplete.id)
+        self.connection.commit()
+
+        self.assertEqual(get_current_incomplete_lifecycles(self.connection), [])
+
+    def test_current_incomplete_lifecycles_does_not_dedupe_identical_shapes(self):
+        first = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="unresolved",
+            remaining_fraction="0", option_type="call",
+        )
+        second = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="unresolved",
+            remaining_fraction="0", option_type="call",
+        )
+        self.connection.commit()
+
+        found_ids = {lc.id for lc in get_current_incomplete_lifecycles(self.connection)}
+
+        self.assertEqual(found_ids, {first.id, second.id})
+
+    # -- get_trade_lifecycle_by_id ---------------------------------------
+
+    def test_get_trade_lifecycle_by_id_found(self):
+        lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open", remaining_fraction="1"
+        )
+        self.connection.commit()
+
+        self.assertEqual(get_trade_lifecycle_by_id(self.connection, lifecycle.id), lifecycle)
+
+    def test_get_trade_lifecycle_by_id_missing_returns_none(self):
+        self.assertIsNone(get_trade_lifecycle_by_id(self.connection, 999999))
+
+    # -- get_current_lifecycle_ids_for_raw_message_ids -------------------
+
+    def test_current_lifecycle_ids_for_raw_message_ids_empty_input(self):
+        self.assertEqual(get_current_lifecycle_ids_for_raw_message_ids(self.connection, []), [])
+
+    def test_current_lifecycle_ids_for_raw_message_ids_finds_lineage(self):
+        signal, raw = self._make_signal(strike=Decimal("207.5"))
+        self.connection.commit()
+        lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open", remaining_fraction="1",
+            option_type="call", strike=Decimal("207.5"), expiration="2026-07-24",
+        )
+        self.connection.commit()
+        create_trade_lifecycle_event(self.connection, lifecycle.id, signal.id, 1, "{}")
+        self.connection.commit()
+
+        ids = get_current_lifecycle_ids_for_raw_message_ids(self.connection, [raw.id])
+
+        self.assertEqual(ids, [lifecycle.id])
+
+    def test_current_lifecycle_ids_for_raw_message_ids_excludes_superseded(self):
+        signal, raw = self._make_signal(strike=Decimal("207.5"))
+        self.connection.commit()
+        lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open", remaining_fraction="1"
+        )
+        self.connection.commit()
+        create_trade_lifecycle_event(self.connection, lifecycle.id, signal.id, 1, "{}")
+        supersede_trade_lifecycle(self.connection, lifecycle.id)
+        self.connection.commit()
+
+        ids = get_current_lifecycle_ids_for_raw_message_ids(self.connection, [raw.id])
+
+        self.assertEqual(ids, [])
+
+    def test_current_lifecycle_ids_for_raw_message_ids_unrelated_id_contributes_nothing(self):
+        self._make_signal(strike=Decimal("207.5"))
+        unrelated_raw = create_raw_message(self.connection, self.source.id, "y")
+        self.connection.commit()
+
+        ids = get_current_lifecycle_ids_for_raw_message_ids(self.connection, [unrelated_raw.id])
+
+        self.assertEqual(ids, [])
+
+    # -- get_all_current_lifecycle_keys -----------------------------------
+
+    def test_all_current_lifecycle_keys_empty_when_none_exist(self):
+        self.assertEqual(get_all_current_lifecycle_keys(self.connection), [])
+
+    def test_all_current_lifecycle_keys_includes_stale_key_with_no_current_signal(self):
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="closed", remaining_fraction="0",
+            option_type="call", strike=Decimal("207.5"), expiration="2026-07-24",
+        )
+        self.connection.commit()
+
+        keys = get_all_current_lifecycle_keys(self.connection)
+
+        self.assertEqual(keys, [(self.trader.id, "IBM", "call", Decimal("207.5"), "2026-07-24")])
+
+    def test_all_current_lifecycle_keys_excludes_superseded(self):
+        lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open", remaining_fraction="1"
+        )
+        self.connection.commit()
+        supersede_trade_lifecycle(self.connection, lifecycle.id)
+        self.connection.commit()
+
+        self.assertEqual(get_all_current_lifecycle_keys(self.connection), [])
+
+    def test_all_current_lifecycle_keys_groups_decimal_equivalent_strikes(self):
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="closed", remaining_fraction="0",
+            option_type="call", strike=Decimal("207.50"), expiration="2026-07-24",
+        )
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="orphan", remaining_fraction="0",
+            option_type="call", strike=Decimal("207.5"), expiration="2026-07-24",
+        )
+        self.connection.commit()
+
+        self.assertEqual(len(get_all_current_lifecycle_keys(self.connection)), 1)
+
+    def test_all_current_lifecycle_keys_deterministic_normalized_order(self):
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "SPX", status="open", remaining_fraction="1",
+            option_type="put", strike=Decimal("7430"), expiration="2026-07-24",
+        )
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "AVGO", status="open", remaining_fraction="1",
+            option_type="put", strike=Decimal("380"), expiration="2026-07-24",
+        )
+        self.connection.commit()
+
+        symbols = [key[1] for key in get_all_current_lifecycle_keys(self.connection)]
+
+        self.assertEqual(symbols, sorted(symbols))
 
 
 class RepositoryTransactionDisciplineTests(_LifecycleRepositoryTestCase):

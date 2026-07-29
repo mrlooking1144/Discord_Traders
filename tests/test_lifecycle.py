@@ -18,6 +18,7 @@ from database.lifecycle import (
     FLAG_AMBIGUOUS_ADD_NO_OPEN_POSITION,
     FLAG_ENTRY_AGAINST_OPEN_POSITION_SAME_KEY,
     FLAG_FRACTION_EXCEEDS_REMAINING,
+    FLAG_INCOMPLETE_CONTRACT_IDENTITY,
     FLAG_LIFECYCLE_EVENT_TYPE_UNRECOGNIZED,
     FLAG_ORPHAN_INTERRUPTED_BY_NEW_ENTRY,
     FLAG_PARTIAL_EXIT_FRACTION_EXCEEDS_ONE,
@@ -905,6 +906,15 @@ class ModuleVocabularyConsistencyTests(unittest.TestCase):
             set(_APPROVED_FRACTION_TOKENS.keys()),
             {"1/2", "1/3", "1/4", "1/6", "1/8", "1/16"},
         )
+
+    def test_incomplete_contract_identity_flag_exported_with_approved_value(self):
+        # R6.4 compatibility correction: repository/service code (R6.3/
+        # R6.4) routes a signal with an incomplete option identity
+        # (some but not all of option_type/strike/expiration populated)
+        # to its own unresolved singleton before it ever reaches
+        # build_lifecycle_sequence(). This flag names that outcome - it
+        # is never raised by build_lifecycle_sequence() itself.
+        self.assertEqual(FLAG_INCOMPLETE_CONTRACT_IDENTITY, "incomplete_contract_identity")
 
 
 class PureModuleBoundaryTests(unittest.TestCase):

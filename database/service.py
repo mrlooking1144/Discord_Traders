@@ -34,25 +34,43 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.datetime_resolution import resolve_expiration, resolve_footer_timestamp
 from app.discord_adapter import segment_discord_batch
 from app.parser import PARSER_VERSION, extract_trade_event
+from database.lifecycle import (
+    FLAG_INCOMPLETE_CONTRACT_IDENTITY,
+    STATUS_UNRESOLVED,
+    build_lifecycle_sequence,
+)
 from database.models import (
     BatchIngestResult,
     ChannelCheckpoint,
+    LifecycleRebuildResult,
     MessageIngestOutcome,
     ReprocessBatchResult,
     ReprocessOutcome,
     TradeSignal,
 )
 from database.repository import (
+    clear_lifecycle_pointers_for_generation,
     create_import_batch,
+    create_lifecycle_unresolved_singleton,
     create_message_extraction,
     create_raw_message,
     create_trade_signal,
     create_trade_signal_edit,
     create_trader,
     delete_import_batch_if_empty,
+    get_all_current_lifecycle_eligible_signal_ids,
+    get_all_current_lifecycle_keys,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
+    get_chronological_positions_for_raw_messages,
     get_current_extraction,
+    get_current_incomplete_lifecycle_signal_snapshots,
+    get_current_incomplete_lifecycles,
+    get_current_lifecycle_ids_for_raw_message_ids,
+    get_current_lifecycles_for_key,
+    get_current_signal_snapshot_for_raw_message,
+    get_current_trade_signals_for_key,
+    get_distinct_lifecycle_keys_for_signal_ids,
     get_import_batch_by_id,
     get_or_create_channel,
     get_or_create_source,
@@ -60,6 +78,10 @@ from database.repository import (
     get_raw_message_by_channel_and_external_id,
     get_raw_message_by_id,
     get_raw_message_ids_by_import_batch,
+    get_recorded_shape_for_generation,
+    get_trade_lifecycle_by_id,
+    get_trade_lifecycle_events,
+    get_trade_lifecycle_lineage_raw_message_ids,
     get_trade_signal_by_id,
     get_trade_signal_edits,
     get_trade_signals_for_review,
@@ -67,8 +89,11 @@ from database.repository import (
     get_trader_by_external_id,
     get_trader_by_id,
     get_traders_by_canonical_name,
+    persist_lifecycle_builds,
     supersede_extraction,
+    supersede_trade_lifecycle,
     update_trade_signal as _repository_update_trade_signal,
+    validate_lifecycle_membership_integrity,
     validate_trade_signal_update_fields,
 )
 
@@ -331,6 +356,283 @@ class TradeSignalNotFoundError(ValueError):
 class AuditHistoryError(Exception):
     """Raised when a stored trade_signal_edits.previous_values value
     cannot be decoded as JSON, or does not decode to a dict."""
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R6.4: lifecycle rebuild orchestration exceptions and
+# pure helpers. Kept separate from the R5 section above; the actual
+# TradeService methods (rebuild_all_lifecycles,
+# rebuild_lifecycles_for_raw_message_ids, and their private helpers) are
+# defined at the end of the TradeService class below.
+# ---------------------------------------------------------------------------
+
+
+class LifecycleIntegrityError(Exception):
+    """Raised when validate_lifecycle_membership_integrity() reports one or
+    more violations after a lifecycle rebuild's writes, but before commit.
+
+    The entire rebuild transaction is rolled back by the caller (the
+    _r5_write_transaction() context manager the rebuild methods reuse) once
+    this propagates - no newly created lifecycle, superseded generation, or
+    pointer change from this call is ever left in place.
+    """
+
+    def __init__(self, violations: list[str]) -> None:
+        self.violations = list(violations)
+        message = "Lifecycle membership integrity violated:\n" + "\n".join(self.violations)
+        super().__init__(message)
+
+
+class LifecycleSnapshotError(Exception):
+    """Raised when a persisted trade_lifecycle_events.signal_snapshot
+    cannot be safely decoded or validated while rebuilding a lifecycle key.
+
+    Malformed or contradictory snapshot evidence is never silently
+    reconstructed or replaced - this always aborts the entire rebuild call
+    (rolled back by the caller) before any write occurs for the key being
+    compared.
+    """
+
+    def __init__(
+        self, trade_lifecycle_id: int, trade_lifecycle_event_id: int, reason: str
+    ) -> None:
+        self.trade_lifecycle_id = trade_lifecycle_id
+        self.trade_lifecycle_event_id = trade_lifecycle_event_id
+        self.reason = reason
+        message = (
+            f"Invalid signal_snapshot for trade_lifecycle_event_id "
+            f"{trade_lifecycle_event_id} (trade_lifecycle_id {trade_lifecycle_id}): {reason}"
+        )
+        super().__init__(message)
+
+
+_REQUIRED_SNAPSHOT_FIELDS = frozenset(
+    {
+        "trade_signal_id", "raw_message_id", "trader_id", "symbol", "option_type",
+        "strike", "expiration", "event_type", "qualifier", "action", "price",
+        "stated_entry_price", "stated_return_pct", "notes", "extraction_id",
+        "ordering_key",
+    }
+)
+
+
+def _is_complete_key_shape(
+    option_type: str | None, strike: object, expiration: str | None
+) -> bool:
+    """Return whether (option_type, strike, expiration) form a valid
+    lifecycle key shape: either all three None (equity) or all three
+    non-None (a complete option identity). A tiny, purely structural
+    mirror of database.repository._is_complete_lifecycle_key_shape() -
+    duplicated rather than imported, since that helper is module-private
+    to repository.py and this check is a plain structural classification
+    (documented in the R6 ADR/plan), not a business rule this module
+    should ever reinterpret or extend.
+    """
+    all_none = option_type is None and strike is None and expiration is None
+    all_present = option_type is not None and strike is not None and expiration is not None
+    return all_none or all_present
+
+
+def _normalize_key_from_lifecycle(lifecycle) -> tuple:
+    """Build a normalized (trader_id, symbol_upper, option_type, strike,
+    expiration) key tuple from a database.models.TradeLifecycle."""
+    strike = Decimal(lifecycle.strike) if lifecycle.strike is not None else None
+    return (
+        lifecycle.trader_id, lifecycle.symbol.upper(), lifecycle.option_type, strike,
+        lifecycle.expiration,
+    )
+
+
+def _normalize_key_from_snapshot(snapshot) -> tuple:
+    """Build a normalized (trader_id, symbol_upper, option_type, strike,
+    expiration) key tuple from a database.lifecycle.SignalSnapshot."""
+    strike = Decimal(snapshot.strike) if snapshot.strike is not None else None
+    return (
+        snapshot.trader_id, snapshot.symbol.upper(), snapshot.option_type, strike,
+        snapshot.expiration,
+    )
+
+
+def _key_sort_key(key: tuple) -> tuple:
+    """A total, deterministic ordering for a lifecycle key tuple - the
+    same None-safe shape as
+    database.repository._lifecycle_key_sort_key(), duplicated for the same
+    reason as _is_complete_key_shape() above (that helper is module-private
+    to repository.py)."""
+    trader_id, symbol, option_type, strike, expiration = key
+    return (
+        trader_id,
+        symbol,
+        option_type is not None,
+        option_type or "",
+        strike is not None,
+        strike if strike is not None else Decimal(0),
+        expiration is not None,
+        expiration or "",
+    )
+
+
+def _validate_and_decode_snapshot(trade_lifecycle_id: int, event) -> dict:
+    """Decode and structurally validate one persisted
+    trade_lifecycle_events.signal_snapshot value.
+
+    Never checks the decoded values against the live trade_signals row -
+    a snapshot is an immutable historical record and is expected to differ
+    from the current row after any later correction. Only the snapshot's
+    own internal shape/self-consistency is checked.
+
+    Args:
+        trade_lifecycle_id: The generation this event belongs to (for the
+            raised error only).
+        event: A database.models.TradeLifecycleEvent, as returned by
+            database.repository.get_trade_lifecycle_events().
+
+    Returns:
+        The decoded snapshot dict.
+
+    Raises:
+        LifecycleSnapshotError: If signal_snapshot is not valid JSON, does
+            not decode to a JSON object, is missing or has a non-integer
+            (bool explicitly rejected, even though bool is a Python int
+            subclass) trade_signal_id, has a trade_signal_id that does
+            not match the event's own trade_signal_id column, is missing
+            or has a non-integer raw_message_id, is missing any other
+            required snapshot field, or has an ordering_key that is not
+            one of the two canonical shapes: [raw_message_id,
+            trade_signal_id] (both plain integers, never bool) or
+            [received_at, raw_message_id, trade_signal_id] (received_at a
+            non-empty string; the trailing two elements plain integers,
+            never bool) - in either shape, ordering_key's raw_message_id
+            must equal the snapshot's own raw_message_id and
+            ordering_key's trade_signal_id must equal the snapshot's own
+            trade_signal_id (and therefore the event's own trade_signal_id
+            column, already checked above). An empty array, wrong length,
+            wrong element types, or a mismatched id is never accepted.
+    """
+    try:
+        decoded = json.loads(event.signal_snapshot)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id, f"signal_snapshot is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(decoded, dict):
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id, "decoded signal_snapshot is not a JSON object."
+        )
+
+    decoded_trade_signal_id = decoded.get("trade_signal_id")
+    if not isinstance(decoded_trade_signal_id, int) or isinstance(decoded_trade_signal_id, bool):
+        # Explicit type check before the equality comparison below: bool
+        # is a Python int subclass, so e.g. True == 1 - without this
+        # check, a decoded trade_signal_id of JSON true would silently
+        # pass the equality check whenever event.trade_signal_id == 1.
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"trade_signal_id is missing or not an integer: {decoded_trade_signal_id!r}.",
+        )
+
+    if decoded_trade_signal_id != event.trade_signal_id:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"decoded trade_signal_id {decoded_trade_signal_id!r} does not match "
+            f"this event's own trade_signal_id {event.trade_signal_id}.",
+        )
+
+    raw_message_id = decoded.get("raw_message_id")
+    if not isinstance(raw_message_id, int) or isinstance(raw_message_id, bool):
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"raw_message_id is missing or not an integer: {raw_message_id!r}.",
+        )
+
+    ordering_key = decoded.get("ordering_key")
+    if not isinstance(ordering_key, list):
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"ordering_key is missing or not a JSON array: {ordering_key!r}.",
+        )
+
+    def _is_plain_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    if len(ordering_key) == 2:
+        key_raw_message_id, key_trade_signal_id = ordering_key
+        if not _is_plain_int(key_raw_message_id) or not _is_plain_int(key_trade_signal_id):
+            raise LifecycleSnapshotError(
+                trade_lifecycle_id, event.id,
+                f"ordering_key must be [raw_message_id, trade_signal_id] with both "
+                f"elements plain integers: {ordering_key!r}.",
+            )
+    elif len(ordering_key) == 3:
+        received_at, key_raw_message_id, key_trade_signal_id = ordering_key
+        if not isinstance(received_at, str) or not received_at.strip():
+            raise LifecycleSnapshotError(
+                trade_lifecycle_id, event.id,
+                f"ordering_key's received_at must be a non-empty string: {ordering_key!r}.",
+            )
+        if not _is_plain_int(key_raw_message_id) or not _is_plain_int(key_trade_signal_id):
+            raise LifecycleSnapshotError(
+                trade_lifecycle_id, event.id,
+                f"ordering_key must be [received_at, raw_message_id, trade_signal_id] "
+                f"with the trailing two elements plain integers: {ordering_key!r}.",
+            )
+    else:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"ordering_key must have exactly 2 or 3 elements: {ordering_key!r}.",
+        )
+
+    if key_raw_message_id != raw_message_id:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"ordering_key raw_message_id {key_raw_message_id!r} does not match "
+            f"the snapshot's own raw_message_id {raw_message_id!r}.",
+        )
+    if key_trade_signal_id != decoded_trade_signal_id:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"ordering_key trade_signal_id {key_trade_signal_id!r} does not match "
+            f"the snapshot's own trade_signal_id {decoded_trade_signal_id!r}.",
+        )
+
+    missing_fields = sorted(_REQUIRED_SNAPSHOT_FIELDS - set(decoded.keys()))
+    if missing_fields:
+        raise LifecycleSnapshotError(
+            trade_lifecycle_id, event.id,
+            f"missing required snapshot field(s): {missing_fields}.",
+        )
+
+    return decoded
+
+
+class _RebuildCounters:
+    """Mutable accumulator for one rebuild_all_lifecycles() or
+    rebuild_lifecycles_for_raw_message_ids() call - converted to an
+    immutable LifecycleRebuildResult via to_result() once the call
+    finishes. Never exposed outside this module."""
+
+    def __init__(self) -> None:
+        self.keys_considered = 0
+        self.keys_changed = 0
+        self.keys_unchanged = 0
+        self.lifecycles_superseded = 0
+        self.lifecycles_created = 0
+        self.lifecycle_events_created = 0
+        self.signal_pointers_cleared = 0
+        self.signal_pointers_assigned = 0
+
+    def to_result(self) -> LifecycleRebuildResult:
+        return LifecycleRebuildResult(
+            keys_considered=self.keys_considered,
+            keys_changed=self.keys_changed,
+            keys_unchanged=self.keys_unchanged,
+            lifecycles_superseded=self.lifecycles_superseded,
+            lifecycles_created=self.lifecycles_created,
+            lifecycle_events_created=self.lifecycle_events_created,
+            signal_pointers_cleared=self.signal_pointers_cleared,
+            signal_pointers_assigned=self.signal_pointers_assigned,
+        )
 
 
 def _current_correction_values(signal: TradeSignal) -> dict:
@@ -1803,3 +2105,448 @@ class TradeService:
                 )
             )
         return checkpoints
+
+    # -----------------------------------------------------------------
+    # Recovery Milestone R6.4
+    #
+    # Lifecycle rebuild orchestration on top of database/lifecycle.py's
+    # pure matching engine (R6.2) and database/repository.py's lifecycle
+    # persistence layer (R6.3). Both public methods below own one complete
+    # transaction via the existing _r5_write_transaction() context manager
+    # - reused exactly as-is, despite its "r5" name, per this project's
+    # existing transaction convention. Neither method touches
+    # database/lifecycle.py's state-machine rules directly - both only
+    # discover/compare/persist what that pure module computes.
+    # -----------------------------------------------------------------
+
+    def _supersede_one(self, trade_lifecycle_id: int, counters: _RebuildCounters) -> None:
+        """Clear pointers from, then supersede, one lifecycle generation.
+        Shared by the normal per-key rebuild path and the incomplete-
+        identity singleton path."""
+        cleared = clear_lifecycle_pointers_for_generation(self.conn, trade_lifecycle_id)
+        counters.signal_pointers_cleared += cleared
+        supersede_trade_lifecycle(self.conn, trade_lifecycle_id)
+        counters.lifecycles_superseded += 1
+
+    def _rebuild_one_key(self, key: tuple, counters: _RebuildCounters) -> None:
+        """Rebuild every current lifecycle generation at one normal,
+        complete lifecycle key - the shared algorithm behind both
+        rebuild_all_lifecycles() and rebuild_lifecycles_for_raw_message_ids().
+
+        Never touches an incomplete-identity signal or singleton - those
+        are handled entirely by _process_incomplete_signal().
+        """
+        trader_id, symbol, option_type, strike, expiration = key
+
+        existing_lifecycles = get_current_lifecycles_for_key(
+            self.conn, trader_id, symbol, option_type, strike, expiration
+        )
+
+        first_member_raw_message_id: dict[int, int] = {}
+        for lifecycle in existing_lifecycles:
+            events = get_trade_lifecycle_events(self.conn, lifecycle.id)
+            if not events:
+                raise LifecycleIntegrityError(
+                    [
+                        f"Lifecycle {lifecycle.id} (current, key {key!r}) has no "
+                        "membership events."
+                    ]
+                )
+            first_raw_message_id = None
+            for event in events:
+                decoded = _validate_and_decode_snapshot(lifecycle.id, event)
+                if first_raw_message_id is None:
+                    first_raw_message_id = decoded["raw_message_id"]
+            first_member_raw_message_id[lifecycle.id] = first_raw_message_id
+
+        if existing_lifecycles:
+            positions = get_chronological_positions_for_raw_messages(
+                self.conn, list(first_member_raw_message_id.values())
+            )
+            ordered_existing_ids = sorted(
+                first_member_raw_message_id.keys(),
+                key=lambda lifecycle_id: positions[first_member_raw_message_id[lifecycle_id]],
+            )
+        else:
+            ordered_existing_ids = []
+
+        existing_shapes = [
+            get_recorded_shape_for_generation(self.conn, lifecycle_id)[0]
+            for lifecycle_id in ordered_existing_ids
+        ]
+
+        proposed_snapshots = get_current_trade_signals_for_key(
+            self.conn, trader_id, symbol, option_type, strike, expiration
+        )
+        proposed_builds = (
+            build_lifecycle_sequence(proposed_snapshots) if proposed_snapshots else []
+        )
+        proposed_shapes = [
+            (build.status, build.remaining_fraction, tuple(build.member_signal_ids),
+             tuple(build.ambiguity_flags))
+            for build in proposed_builds
+        ]
+
+        counters.keys_considered += 1
+
+        if proposed_shapes == existing_shapes:
+            counters.keys_unchanged += 1
+            return
+
+        counters.keys_changed += 1
+
+        for lifecycle_id in ordered_existing_ids:
+            self._supersede_one(lifecycle_id, counters)
+
+        snapshots_by_signal_id = {s.trade_signal_id: s for s in proposed_snapshots}
+        new_ids = persist_lifecycle_builds(
+            self.conn, trader_id, symbol, option_type, strike, expiration,
+            proposed_builds, snapshots_by_signal_id,
+        )
+        counters.lifecycles_created += len(new_ids)
+        member_count = sum(len(build.member_signal_ids) for build in proposed_builds)
+        counters.lifecycle_events_created += member_count
+        counters.signal_pointers_assigned += member_count
+
+    def _is_unchanged_incomplete_singleton(
+        self,
+        old_lifecycle,
+        events: list,
+        decoded_events: list[dict],
+        current_snapshot,
+        raw_message_id: int,
+    ) -> bool:
+        """Return whether a persisted incomplete-identity singleton is
+        provably identical to current_snapshot, using only recorded/
+        persisted evidence (old_lifecycle's own columns and its already
+        decoded-and-validated event snapshot(s)) - never by reconstructing
+        historical evidence from current_snapshot itself, beyond the one
+        legitimate comparison of current_snapshot's own identity/id fields
+        against what was recorded.
+
+        Args:
+            old_lifecycle: The single stale incomplete TradeLifecycle
+                candidate.
+            events: Every TradeLifecycleEvent for old_lifecycle.id (already
+                fetched by the caller), in sequence_index order.
+            decoded_events: The result of calling
+                _validate_and_decode_snapshot() on every element of events,
+                in the same order - already validated by the caller before
+                this method is ever called, so a malformed snapshot always
+                raises LifecycleSnapshotError before reaching here.
+            current_snapshot: The current SignalSnapshot for
+                raw_message_id.
+            raw_message_id: The raw_messages.id being processed.
+
+        Returns:
+            True only when every one of the following holds: old_lifecycle
+            has exactly one recorded event, at sequence_index 1; its
+            status is STATUS_UNRESOLVED with remaining_fraction == "0" and
+            ambiguity_flags == [FLAG_INCOMPLETE_CONTRACT_IDENTITY] exactly;
+            that one event's trade_signal_id matches
+            current_snapshot.trade_signal_id; its validated snapshot's own
+            recorded raw_message_id matches raw_message_id; and
+            old_lifecycle's own normalized identity (trader_id,
+            case-insensitive symbol, option_type, Decimal-equivalent
+            strike, expiration) matches current_snapshot's. False
+            otherwise - including zero or more-than-one recorded events,
+            which are never treated as unchanged.
+        """
+        if old_lifecycle.status != STATUS_UNRESOLVED:
+            return False
+        if old_lifecycle.remaining_fraction != "0":
+            return False
+        if (old_lifecycle.ambiguity_flags or []) != [FLAG_INCOMPLETE_CONTRACT_IDENTITY]:
+            return False
+        if len(events) != 1:
+            return False
+
+        event = events[0]
+        if event.sequence_index != 1:
+            return False
+        if event.trade_signal_id != current_snapshot.trade_signal_id:
+            return False
+
+        decoded = decoded_events[0]
+        if decoded["raw_message_id"] != raw_message_id:
+            return False
+
+        old_key = _normalize_key_from_lifecycle(old_lifecycle)
+        new_key = _normalize_key_from_snapshot(current_snapshot)
+        return old_key == new_key
+
+    def _process_incomplete_signal(
+        self, raw_message_id: int, counters: _RebuildCounters
+    ) -> None:
+        """Handle one raw_message_id's incomplete-contract-identity
+        singleton, independently of every normal lifecycle key.
+
+        Never groups an incomplete signal into a normal key and never
+        guesses its missing option component. Idempotent: an existing,
+        exactly-matching current singleton is left completely untouched -
+        proven only from recorded evidence (old_lifecycle's own columns
+        plus its validated, decoded event snapshot(s)), never by
+        reconstructing that history from the current live trade_signals
+        row. Self-heals a stale singleton left over from before the
+        signal either became complete-shaped (its own new key is handled
+        separately by _rebuild_one_key()) or departed (no current signal
+        at all remains for this raw_message_id).
+
+        Every candidate stale singleton's membership is read and every one
+        of its persisted signal_snapshot values is decoded/validated via
+        _validate_and_decode_snapshot() before it is ever considered
+        idempotent or superseded - a malformed or zero-event generation
+        always aborts this entire rebuild call (propagating
+        LifecycleIntegrityError/LifecycleSnapshotError, rolled back by the
+        caller) rather than being silently superseded or trusted.
+        """
+        current_snapshot = get_current_signal_snapshot_for_raw_message(
+            self.conn, raw_message_id
+        )
+        old_ids = get_current_lifecycle_ids_for_raw_message_ids(self.conn, [raw_message_id])
+
+        stale_incomplete: list[tuple[int, object, list, list]] = []
+        for old_id in old_ids:
+            old_lifecycle = get_trade_lifecycle_by_id(self.conn, old_id)
+            if old_lifecycle is None or _is_complete_key_shape(
+                old_lifecycle.option_type, old_lifecycle.strike, old_lifecycle.expiration
+            ):
+                continue
+
+            events = get_trade_lifecycle_events(self.conn, old_id)
+            if not events:
+                raise LifecycleIntegrityError(
+                    [
+                        f"Lifecycle {old_id} (current, incomplete-identity "
+                        f"singleton for raw_message_id {raw_message_id}) has no "
+                        "membership events."
+                    ]
+                )
+            decoded_events = [
+                _validate_and_decode_snapshot(old_id, event) for event in events
+            ]
+            stale_incomplete.append((old_id, old_lifecycle, events, decoded_events))
+
+        is_currently_incomplete = current_snapshot is not None and not _is_complete_key_shape(
+            current_snapshot.option_type, current_snapshot.strike, current_snapshot.expiration
+        )
+
+        if is_currently_incomplete:
+            is_idempotent = False
+            if len(stale_incomplete) == 1:
+                old_id, old_lifecycle, events, decoded_events = stale_incomplete[0]
+                is_idempotent = self._is_unchanged_incomplete_singleton(
+                    old_lifecycle, events, decoded_events, current_snapshot, raw_message_id,
+                )
+
+            counters.keys_considered += 1
+            if is_idempotent:
+                counters.keys_unchanged += 1
+                return
+
+            counters.keys_changed += 1
+            for old_id, _, _, _ in stale_incomplete:
+                self._supersede_one(old_id, counters)
+
+            strike = (
+                Decimal(current_snapshot.strike) if current_snapshot.strike is not None else None
+            )
+            create_lifecycle_unresolved_singleton(
+                self.conn, current_snapshot.trader_id, current_snapshot.symbol,
+                current_snapshot.option_type, strike, current_snapshot.expiration,
+                current_snapshot, FLAG_INCOMPLETE_CONTRACT_IDENTITY,
+            )
+            counters.lifecycles_created += 1
+            counters.lifecycle_events_created += 1
+            counters.signal_pointers_assigned += 1
+            return
+
+        # Not currently incomplete: the signal either became complete
+        # (its own new key is rebuilt separately by _rebuild_one_key()) or
+        # departed entirely. Either way, any stale incomplete singleton
+        # left over from before must be superseded, with no replacement
+        # created here.
+        if not stale_incomplete:
+            return
+        counters.keys_considered += 1
+        counters.keys_changed += 1
+        for old_id, _, _, _ in stale_incomplete:
+            self._supersede_one(old_id, counters)
+
+    def rebuild_all_lifecycles(self) -> LifecycleRebuildResult:
+        """Rebuild every lifecycle generation in the database from scratch.
+
+        Owns one complete transaction (see _r5_write_transaction()):
+        every discovery, supersession, persistence, pointer update, and
+        the final integrity validation belong to this single transaction.
+        Commits once on success; any exception rolls back the entire call,
+        leaving every lifecycle row, membership row, and pointer exactly
+        as it was before the call.
+
+        Returns:
+            A LifecycleRebuildResult summarizing every change made.
+
+        Raises:
+            LifecycleIntegrityError: If validate_lifecycle_membership_integrity()
+                reports any violation after this call's writes. Rolled back
+                before propagating.
+            LifecycleSnapshotError: If any existing generation's persisted
+                signal_snapshot cannot be safely decoded/validated. Rolled
+                back before propagating.
+            RuntimeError: If self.conn already has unrelated pending work.
+            sqlite3.Error: On an unexpected database failure. Rolled back
+                before propagating.
+        """
+        with self._r5_write_transaction():
+            return self._rebuild_all_lifecycles_no_commit()
+
+    def _rebuild_all_lifecycles_no_commit(self) -> LifecycleRebuildResult:
+        """Private. Never begins, commits, or rolls back a transaction."""
+        counters = _RebuildCounters()
+
+        # Incomplete-identity singletons are processed first, so a signal
+        # that has become complete-shaped since its singleton was created
+        # is already freed (superseded, pointer cleared) by the time the
+        # normal per-key pass below considers its new key - never leaving
+        # the same signal a member of two current lifecycles at once.
+        incomplete_snapshots = get_current_incomplete_lifecycle_signal_snapshots(self.conn)
+        stale_singletons = get_current_incomplete_lifecycles(self.conn)
+        incomplete_raw_message_ids = {s.raw_message_id for s in incomplete_snapshots}
+        for singleton in stale_singletons:
+            incomplete_raw_message_ids.update(
+                get_trade_lifecycle_lineage_raw_message_ids(self.conn, singleton.id)
+            )
+        for raw_message_id in sorted(incomplete_raw_message_ids):
+            self._process_incomplete_signal(raw_message_id, counters)
+
+        all_signal_ids = get_all_current_lifecycle_eligible_signal_ids(self.conn)
+        signal_driven_keys = set(
+            get_distinct_lifecycle_keys_for_signal_ids(self.conn, all_signal_ids)
+        )
+        persisted_keys = {
+            key for key in get_all_current_lifecycle_keys(self.conn)
+            if _is_complete_key_shape(key[2], key[3], key[4])
+        }
+        all_keys = signal_driven_keys | persisted_keys
+
+        for key in sorted(all_keys, key=_key_sort_key):
+            self._rebuild_one_key(key, counters)
+
+        violations = validate_lifecycle_membership_integrity(self.conn)
+        if violations:
+            raise LifecycleIntegrityError(violations)
+
+        return counters.to_result()
+
+    def rebuild_lifecycles_for_raw_message_ids(
+        self, raw_message_ids: list[int]
+    ) -> LifecycleRebuildResult:
+        """Rebuild only the lifecycle keys affected by specific raw messages.
+
+        Discovers the union of every "old" lifecycle key whose immutable
+        lineage includes any of raw_message_ids, and every "new" complete
+        lifecycle key belonging to the current lifecycle-eligible signal
+        for each of raw_message_ids - so both a correction/reprocessing
+        event's old and new side are always rebuilt, each exactly once,
+        even when a key change means the old and new keys differ entirely.
+
+        An empty raw_message_ids performs no writes at all (this method
+        returns before ever opening a transaction) and returns a
+        zero-valued result.
+
+        Owns one complete transaction for a non-empty call (see
+        _r5_write_transaction()): every discovery, supersession,
+        persistence, pointer update, and the final integrity validation
+        belong to this single transaction. Commits once on success; any
+        exception rolls back the entire call.
+
+        Args:
+            raw_message_ids: The raw_messages.id values to rebuild the
+                affected lifecycle keys for. Duplicates are deduplicated
+                deterministically; order does not affect the result.
+
+        Returns:
+            A LifecycleRebuildResult summarizing every change made (all
+            zero if raw_message_ids is empty).
+
+        Raises:
+            ValueError: If any raw_message_id does not exist - names every
+                missing id, sorted. Raised before any write.
+            LifecycleIntegrityError: If validate_lifecycle_membership_integrity()
+                reports any violation after this call's writes. Rolled back
+                before propagating.
+            LifecycleSnapshotError: If any existing generation's persisted
+                signal_snapshot cannot be safely decoded/validated. Rolled
+                back before propagating.
+            RuntimeError: If self.conn already has unrelated pending work.
+            sqlite3.Error: On an unexpected database failure. Rolled back
+                before propagating.
+        """
+        if not raw_message_ids:
+            return _RebuildCounters().to_result()
+
+        with self._r5_write_transaction():
+            return self._rebuild_lifecycles_for_raw_message_ids_no_commit(raw_message_ids)
+
+    def _rebuild_lifecycles_for_raw_message_ids_no_commit(
+        self, raw_message_ids: list[int]
+    ) -> LifecycleRebuildResult:
+        """Private. Never begins, commits, or rolls back a transaction."""
+        counters = _RebuildCounters()
+
+        unique_ids = sorted(set(raw_message_ids))
+        # Fails closed with a ValueError naming every missing id, sorted -
+        # before any write. The returned positions mapping itself is not
+        # needed here; this call's only purpose at this point is the
+        # existence check it already performs.
+        get_chronological_positions_for_raw_messages(self.conn, unique_ids)
+
+        old_lifecycle_ids = get_current_lifecycle_ids_for_raw_message_ids(
+            self.conn, unique_ids
+        )
+        old_keys: set = set()
+        old_incomplete_lifecycle_ids: set = set()
+        for old_id in old_lifecycle_ids:
+            lifecycle = get_trade_lifecycle_by_id(self.conn, old_id)
+            if _is_complete_key_shape(
+                lifecycle.option_type, lifecycle.strike, lifecycle.expiration
+            ):
+                old_keys.add(_normalize_key_from_lifecycle(lifecycle))
+            else:
+                old_incomplete_lifecycle_ids.add(old_id)
+
+        new_keys: set = set()
+        new_incomplete_raw_message_ids: set = set()
+        for raw_message_id in unique_ids:
+            current_snapshot = get_current_signal_snapshot_for_raw_message(
+                self.conn, raw_message_id
+            )
+            if current_snapshot is None:
+                continue
+            if _is_complete_key_shape(
+                current_snapshot.option_type, current_snapshot.strike,
+                current_snapshot.expiration,
+            ):
+                new_keys.add(_normalize_key_from_snapshot(current_snapshot))
+            else:
+                new_incomplete_raw_message_ids.add(raw_message_id)
+
+        # Incomplete-identity singletons are processed first - see
+        # _rebuild_all_lifecycles_no_commit()'s equivalent comment for why.
+        incomplete_raw_message_ids = set(new_incomplete_raw_message_ids)
+        for old_id in old_incomplete_lifecycle_ids:
+            incomplete_raw_message_ids.update(
+                get_trade_lifecycle_lineage_raw_message_ids(self.conn, old_id)
+            )
+        for raw_message_id in sorted(incomplete_raw_message_ids):
+            self._process_incomplete_signal(raw_message_id, counters)
+
+        all_keys = old_keys | new_keys
+        for key in sorted(all_keys, key=_key_sort_key):
+            self._rebuild_one_key(key, counters)
+
+        violations = validate_lifecycle_membership_integrity(self.conn)
+        if violations:
+            raise LifecycleIntegrityError(violations)
+
+        return counters.to_result()

@@ -1934,6 +1934,110 @@ def get_distinct_lifecycle_keys_for_signal_ids(
     return sorted(keys, key=_lifecycle_key_sort_key)
 
 
+def get_all_current_lifecycle_eligible_signal_ids(conn: sqlite3.Connection) -> list[int]:
+    """List every current, lifecycle-eligible signal id in the database.
+
+    The unfiltered, whole-database sibling of get_current_trade_signals_for_key():
+    where that function scopes to one exact key, this scans every current
+    ("current" = extraction_id IS NULL OR message_extractions.is_current = 1)
+    and eligible (event_type IS NOT NULL) trade_signals row, with no key
+    filter at all. Feeds get_distinct_lifecycle_keys_for_signal_ids() so a
+    full-database rebuild can discover every complete lifecycle key
+    represented by current signals, without any caller needing to already
+    know which signal ids or keys exist.
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        Every matching trade_signals.id, ordered ascending. Empty list if
+        none match.
+    """
+    rows = conn.execute(
+        "SELECT ts.id AS id "
+        f"{_LIFECYCLE_SIGNAL_CURRENT_JOIN} "
+        f"WHERE {_LIFECYCLE_SIGNAL_CURRENT_AND_ELIGIBLE} "
+        "ORDER BY ts.id"
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def get_current_incomplete_lifecycle_signal_snapshots(
+    conn: sqlite3.Connection,
+) -> list[SignalSnapshot]:
+    """List every current, lifecycle-eligible signal whose own option
+    identity is incomplete (some but not all of option_type/strike/
+    expiration populated).
+
+    Companion to get_distinct_lifecycle_keys_for_signal_ids(), which
+    silently excludes exactly these same signals from its own result -
+    this function is the other half: it surfaces them directly so a
+    caller (R6.4) can route each one to its own unresolved singleton
+    (never grouped into a normal key, never guessed).
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        SignalSnapshots for every current, eligible, incomplete-key
+        signal, in deterministic chronological order (see
+        _order_signal_rows()) - using received_at ordering only when
+        every one of them has a resolved received_at, otherwise falling
+        back consistently to (raw_message_id, trade_signal_id) ordering
+        for all of them. Empty list if none exist.
+    """
+    rows = conn.execute(
+        f"SELECT {_LIFECYCLE_SIGNAL_SELECT} "
+        f"{_LIFECYCLE_SIGNAL_CURRENT_JOIN} "
+        f"WHERE {_LIFECYCLE_SIGNAL_CURRENT_AND_ELIGIBLE}"
+    ).fetchall()
+    incomplete_rows = [
+        row
+        for row in rows
+        if not _is_complete_lifecycle_key_shape(
+            row["option_type"], row["strike"], row["expiration"]
+        )
+    ]
+    return _order_signal_rows(incomplete_rows)
+
+
+def get_current_incomplete_lifecycles(conn: sqlite3.Connection) -> list[TradeLifecycle]:
+    """List every current (is_current=1) lifecycle generation whose own
+    (option_type, strike, expiration) shape is incomplete.
+
+    These are always standalone incomplete-contract-identity singletons
+    (see create_lifecycle_unresolved_singleton()) - never a normal,
+    signal-grouped generation. Unlike get_all_current_lifecycle_keys(),
+    which deduplicates by normalized key and would silently collapse two
+    distinct singleton rows that happen to share an identical incomplete
+    shape into one key, this returns every matching row individually, so
+    a caller (R6.4) can check and, if needed, supersede each singleton on
+    its own - including one whose member signal has since become
+    complete-shaped and must not be left stale alongside a new normal-key
+    generation for that same signal (which would otherwise violate
+    Invariant A: a signal belonging to two current lifecycles at once).
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        Every matching TradeLifecycle, ordered by id ascending. Empty
+        list if none exist.
+    """
+    rows = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles "
+        "WHERE is_current = 1 ORDER BY id"
+    ).fetchall()
+    lifecycles = [_row_to_trade_lifecycle(row) for row in rows]
+    return [
+        lifecycle
+        for lifecycle in lifecycles
+        if not _is_complete_lifecycle_key_shape(
+            lifecycle.option_type, lifecycle.strike, lifecycle.expiration
+        )
+    ]
+
+
 def get_current_signal_snapshot_for_raw_message(
     conn: sqlite3.Connection,
     raw_message_id: int,
@@ -2207,6 +2311,36 @@ def create_trade_lifecycle(
     return _row_to_trade_lifecycle(row)
 
 
+def get_trade_lifecycle_by_id(
+    conn: sqlite3.Connection,
+    trade_lifecycle_id: int,
+) -> TradeLifecycle | None:
+    """Look up a lifecycle generation by primary key.
+
+    The standard per-id getter every other entity in this module already
+    has (get_trade_signal_by_id(), get_raw_message_by_id(),
+    get_import_batch_by_id(), get_trader_by_id()) - trade_lifecycles was
+    missing its own until R6.4 needed to resolve a bare id (e.g. from
+    get_current_lifecycle_ids_for_raw_message_ids()) back into a full
+    TradeLifecycle.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trade_lifecycle_id: Primary key to look up.
+
+    Returns:
+        The matching TradeLifecycle (current or superseded), or None if
+        no row exists with this id.
+    """
+    row = conn.execute(
+        f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles WHERE id = ?",
+        (trade_lifecycle_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_trade_lifecycle(row)
+
+
 def supersede_trade_lifecycle(
     conn: sqlite3.Connection,
     trade_lifecycle_id: int,
@@ -2362,6 +2496,49 @@ def get_trade_lifecycle_lineage_raw_message_ids(
         (trade_lifecycle_id,),
     ).fetchall()
     return frozenset(row["raw_message_id"] for row in rows)
+
+
+def get_current_lifecycle_ids_for_raw_message_ids(
+    conn: sqlite3.Connection,
+    raw_message_ids: list[int],
+) -> list[int]:
+    """List every current lifecycle generation whose immutable lineage
+    includes any of the given raw_message_ids.
+
+    The reverse direction of get_trade_lifecycle_lineage_raw_message_ids()
+    (which goes one generation -> its raw_message_ids); this goes a set of
+    raw_message_ids -> every current generation touched by any of them.
+    This is what lets a targeted rebuild (R6.4) find the "old side" of a
+    key-changing correction or reprocessing event even when the affected
+    signal's current key/event_type/current-ness has already moved on -
+    the lineage recorded in trade_lifecycle_events never changes once
+    written, unlike the live trade_signals row it points at.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        raw_message_ids: The raw_messages.id values to check. Does not
+            validate that these ids exist - a nonexistent or currently-
+            unlinked raw_message_id simply contributes no results.
+
+    Returns:
+        Distinct current (is_current=1) trade_lifecycles.id values whose
+        lineage includes at least one of raw_message_ids, ordered
+        ascending. Empty list if raw_message_ids is empty or none match.
+    """
+    if not raw_message_ids:
+        return []
+
+    placeholders = ",".join("?" * len(raw_message_ids))
+    rows = conn.execute(
+        "SELECT DISTINCT tl.id "
+        "FROM trade_lifecycles tl "
+        "JOIN trade_lifecycle_events tle ON tle.trade_lifecycle_id = tl.id "
+        "JOIN trade_signals ts ON ts.id = tle.trade_signal_id "
+        f"WHERE tl.is_current = 1 AND ts.raw_message_id IN ({placeholders}) "
+        "ORDER BY tl.id",
+        list(raw_message_ids),
+    ).fetchall()
+    return [row["id"] for row in rows]
 
 
 def get_recorded_shape_for_generation(
@@ -2901,6 +3078,53 @@ def list_current_trade_lifecycles(
         )
         results.append(result)
     return results
+
+
+def get_all_current_lifecycle_keys(conn: sqlite3.Connection) -> list[tuple]:
+    """List every distinct normalized key among all current (is_current=1)
+    lifecycle generations - including a key whose generation(s) no longer
+    have any current eligible signal at all (e.g. every member was
+    reprocessed away, corrected to a different key, or became event_type
+    NULL).
+
+    Grouped in Python, exactly like _check_invariant_h_multiple_active_per_key():
+    strike must be compared via Decimal and symbol case-insensitively,
+    neither of which a raw SQL DISTINCT on the stored text/columns would
+    get right (two current generations logically at the same key can have
+    different stored strike text, e.g. "207.50" vs "207.5", if they were
+    created from signals whose own Decimal happened to print differently).
+
+    This is what lets a full rebuild (R6.4) discover a stale persisted key
+    that has zero current signals left at all - such a key would never
+    appear in get_distinct_lifecycle_keys_for_signal_ids()'s signal-driven
+    result, since that function only ever sees keys current signals still
+    claim.
+
+    Args:
+        conn: An open sqlite3.Connection.
+
+    Returns:
+        Distinct (trader_id, symbol_upper, option_type, strike,
+        expiration) tuples, one per normalized key with at least one
+        current lifecycle generation, in the same deterministic,
+        normalized order as get_distinct_lifecycle_keys_for_signal_ids()
+        (see _lifecycle_key_sort_key()). Empty list if no current
+        lifecycle generation exists.
+    """
+    rows = conn.execute(
+        "SELECT trader_id, symbol, option_type, strike, expiration "
+        "FROM trade_lifecycles WHERE is_current = 1"
+    ).fetchall()
+
+    keys: set = set()
+    for row in rows:
+        strike = Decimal(row["strike"]) if row["strike"] is not None else None
+        keys.add(
+            (row["trader_id"], row["symbol"].upper(), row["option_type"], strike,
+             row["expiration"])
+        )
+
+    return sorted(keys, key=_lifecycle_key_sort_key)
 
 
 def _check_invariant_h_multiple_active_per_key(conn: sqlite3.Connection) -> list[str]:

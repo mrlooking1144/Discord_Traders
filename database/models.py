@@ -566,3 +566,47 @@ class TradeLifecycleEvent:
     signal_snapshot: str
     id: Optional[int] = None
     created_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class LifecycleRebuildResult:
+    """Result of one TradeService.rebuild_all_lifecycles() or
+    TradeService.rebuild_lifecycles_for_raw_message_ids() call (Recovery
+    Milestone R6.4).
+
+    Every field is a plain, deterministic count - no wall-clock timing or
+    other non-reproducible value is ever included, so two rebuilds over
+    identical inputs always produce an identical result.
+
+    Attributes:
+        keys_considered: Total distinct normalized lifecycle keys examined
+            by this call (changed + unchanged).
+        keys_changed: Subset of keys_considered whose proposed generation
+            sequence differed from what was already recorded, and were
+            therefore replaced.
+        keys_unchanged: Subset of keys_considered whose proposed sequence
+            was identical to what was already recorded - no write occurred
+            for these keys.
+        lifecycles_superseded: Total trade_lifecycles rows marked
+            is_current=0 across every changed key (including the
+            "superseded with no replacement" case for a key with zero
+            remaining current signals).
+        lifecycles_created: Total new trade_lifecycles rows inserted
+            across every changed key and every incomplete-identity
+            singleton created.
+        lifecycle_events_created: Total new trade_lifecycle_events
+            membership rows inserted.
+        signal_pointers_cleared: Total trade_signals.lifecycle_id values
+            set to NULL.
+        signal_pointers_assigned: Total trade_signals.lifecycle_id values
+            set to a new (non-NULL) trade_lifecycles.id.
+    """
+
+    keys_considered: int
+    keys_changed: int
+    keys_unchanged: int
+    lifecycles_superseded: int
+    lifecycles_created: int
+    lifecycle_events_created: int
+    signal_pointers_cleared: int
+    signal_pointers_assigned: int

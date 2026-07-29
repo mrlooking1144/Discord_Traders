@@ -111,6 +111,7 @@ FLAG_PARTIAL_EXIT_FRACTION_NON_POSITIVE = "partial_exit_fraction_non_positive"
 FLAG_PARTIAL_EXIT_FRACTION_EXCEEDS_ONE = "partial_exit_fraction_exceeds_one"
 FLAG_FRACTION_EXCEEDS_REMAINING = "fraction_exceeds_remaining"
 FLAG_LIFECYCLE_EVENT_TYPE_UNRECOGNIZED = "lifecycle_event_type_unrecognized"
+FLAG_INCOMPLETE_CONTRACT_IDENTITY = "incomplete_contract_identity"
 
 
 @dataclass(frozen=True)

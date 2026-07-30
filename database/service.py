@@ -47,6 +47,7 @@ from database.models import (
     ReprocessBatchResult,
     ReprocessOutcome,
     TradeSignal,
+    TradeSignalCorrectionResult,
 )
 from database.repository import (
     clear_lifecycle_pointers_for_generation,
@@ -633,6 +634,31 @@ class _RebuildCounters:
             signal_pointers_cleared=self.signal_pointers_cleared,
             signal_pointers_assigned=self.signal_pointers_assigned,
         )
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R6.5a: lifecycle-safe trade-signal correction service
+# contract. Kept separate from the pre-existing R5/R6.4 sections above; the
+# actual TradeService methods (correct_trade_signal and its private
+# no-commit helper) are defined at the end of the TradeService class below.
+# The legacy/controlled TradeService.update_trade_signal() contract is
+# entirely unmodified - this is a new, additional public method, not a
+# replacement.
+# ---------------------------------------------------------------------------
+
+
+class LifecycleUnsafeCorrectionError(ValueError):
+    """Raised by TradeService.correct_trade_signal() when a requested
+    correction would change `action` on a lifecycle-managed trade signal
+    (event_type IS NOT NULL).
+
+    Rejected before any audit row, signal update, lifecycle mutation, or
+    commit - the entire correction is refused outright, never partially
+    applied. A ValueError subclass so it can still be caught broadly as a
+    ValueError, matching this module's existing convention for other
+    structured, catchable correction-rejection modes
+    (TradeSignalNotFoundError).
+    """
 
 
 def _current_correction_values(signal: TradeSignal) -> dict:
@@ -2550,3 +2576,186 @@ class TradeService:
             raise LifecycleIntegrityError(violations)
 
         return counters.to_result()
+
+    def correct_trade_signal(
+        self,
+        trade_signal_id: int,
+        expected_current_values: dict,
+        **changed_fields,
+    ) -> TradeSignalCorrectionResult:
+        """Lifecycle-safe controlled correction (Recovery Milestone R6.5a).
+
+        The lifecycle-aware counterpart to the pre-existing controlled-
+        correction mode of update_trade_signal() (Milestone 2D.5): that
+        method's legacy and controlled-correction contracts are completely
+        unmodified by this method's addition. This method additionally
+        integrates the correction with the R6 lifecycle system so a
+        correction can never leave lifecycle events, memberships,
+        pointers, audit records, or snapshots inconsistent.
+
+        Owns one complete transaction (see _r5_write_transaction()):
+        validating the correction, verifying expected_current_values,
+        writing the correction audit record, updating the trade signal,
+        rebuilding affected lifecycles when required, and the final
+        lifecycle-membership integrity validation all belong to this one
+        transaction. Commits exactly once on success; any exception rolls
+        back the entire operation.
+
+        changed_fields must contain exactly the six approved correction
+        fields (symbol, action, option_type, price, expiration,
+        position_size) - never raw_message_id, trader_id, strike,
+        event_type, lifecycle_id, or any other field.
+        expected_current_values must contain exactly the same six keys,
+        typed as symbol: str, action: str, option_type: str | None,
+        price: Decimal | None, expiration: str | None,
+        position_size: str | None - never a float, and never compared
+        against an unparsed price string.
+
+        Rebuild-decision rules:
+          - If the current signal is lifecycle-managed (event_type IS NOT
+            NULL) and symbol, option_type, or expiration would effectively
+            change, a targeted lifecycle rebuild is performed for the
+            signal's raw_message_id after the update.
+          - If the current signal is a legacy signal (event_type IS NULL)
+            that unexpectedly carries stale lifecycle state (a non-NULL
+            lifecycle_id pointer, or existing lifecycle-event lineage for
+            its raw_message_id), a targeted lifecycle rebuild is performed
+            for its raw_message_id regardless of which fields changed, so
+            the stale membership can be safely removed.
+          - Otherwise no rebuild is performed, but the final lifecycle-
+            membership integrity validation still runs before commit.
+
+        Action safety: if action would effectively change and the current
+        signal is lifecycle-managed (event_type IS NOT NULL), the entire
+        correction is rejected with LifecycleUnsafeCorrectionError before
+        any audit row, signal update, or lifecycle mutation - never
+        partially applied. A legacy signal (event_type IS NULL) may still
+        receive an action correction under the existing controlled-
+        correction rules. Supplying the same action as already stored is
+        treated as a no-op contribution, not an unsafe action change.
+
+        Args:
+            trade_signal_id: Primary key of the trade signal to correct.
+            expected_current_values: The canonical typed six-field
+                snapshot the caller believes is still current.
+            **changed_fields: The six approved correction fields' proposed
+                new values.
+
+        Returns:
+            A TradeSignalCorrectionResult with the authoritative, reloaded
+            corrected trade signal and the lifecycle rebuild outcome (a
+            zero-valued LifecycleRebuildResult when no rebuild occurred).
+
+        Raises:
+            ValueError: If changed_fields or expected_current_values does
+                not contain exactly the six approved fields, if
+                changed_fields fails the shared repository validation, or
+                if changed_fields is identical to the current persisted
+                values (a no-op).
+            TradeSignalNotFoundError: If no trade signal exists with
+                trade_signal_id. A ValueError subclass.
+            StaleTradeSignalError: If expected_current_values no longer
+                matches the actual persisted values.
+            LifecycleUnsafeCorrectionError: If action would effectively
+                change on a lifecycle-managed signal. A ValueError
+                subclass.
+            LifecycleIntegrityError: If validate_lifecycle_membership_integrity()
+                reports any violation after this call's writes. Rolled back
+                before propagating.
+            LifecycleSnapshotError: If any existing generation's persisted
+                signal_snapshot cannot be safely decoded/validated during a
+                required rebuild. Rolled back before propagating.
+            RuntimeError: If self.conn already has unrelated pending work.
+            TypeError: If price is supplied and is not a Decimal.
+            sqlite3.Error: On an unexpected database failure. Rolled back
+                before propagating.
+        """
+        if set(changed_fields) != _CORRECTION_FIELDS:
+            raise ValueError(
+                "A lifecycle-safe correction must supply exactly the "
+                f"approved correction fields: {sorted(_CORRECTION_FIELDS)}."
+            )
+        if set(expected_current_values) != _CORRECTION_FIELDS:
+            raise ValueError(
+                "expected_current_values must supply exactly the approved "
+                f"correction fields: {sorted(_CORRECTION_FIELDS)}."
+            )
+
+        validate_trade_signal_update_fields(changed_fields)
+
+        with self._r5_write_transaction():
+            return self._correct_trade_signal_no_commit(
+                trade_signal_id, expected_current_values, changed_fields
+            )
+
+    def _correct_trade_signal_no_commit(
+        self,
+        trade_signal_id: int,
+        expected_current_values: dict,
+        changed_fields: dict,
+    ) -> TradeSignalCorrectionResult:
+        """Private. Never begins, commits, or rolls back a transaction."""
+        existing = get_trade_signal_by_id(self.conn, trade_signal_id)
+        if existing is None:
+            raise TradeSignalNotFoundError(
+                f"No trade signal exists with id {trade_signal_id}."
+            )
+
+        current_values = _current_correction_values(existing)
+
+        if expected_current_values != current_values:
+            raise StaleTradeSignalError(
+                "The trade signal's current values no longer match the "
+                "values expected for this correction."
+            )
+
+        if changed_fields == current_values:
+            raise ValueError("A correction must change at least one field.")
+
+        changed_field_names = {
+            field for field, value in changed_fields.items()
+            if value != current_values[field]
+        }
+
+        if "action" in changed_field_names and existing.event_type is not None:
+            raise LifecycleUnsafeCorrectionError(
+                "Cannot change action on a lifecycle-managed trade signal "
+                f"(trade_signal_id {trade_signal_id}, event_type "
+                f"{existing.event_type!r}). Correct the underlying message "
+                "and reprocess instead."
+            )
+
+        create_trade_signal_edit(self.conn, trade_signal_id, asdict(existing))
+
+        _repository_update_trade_signal(self.conn, trade_signal_id, **changed_fields)
+
+        key_fields_changed = bool(
+            changed_field_names & {"symbol", "option_type", "expiration"}
+        )
+
+        if existing.event_type is not None:
+            needs_rebuild = key_fields_changed
+        else:
+            needs_rebuild = existing.lifecycle_id is not None or bool(
+                get_current_lifecycle_ids_for_raw_message_ids(
+                    self.conn, [existing.raw_message_id]
+                )
+            )
+
+        if needs_rebuild:
+            rebuild_result = self._rebuild_lifecycles_for_raw_message_ids_no_commit(
+                [existing.raw_message_id]
+            )
+        else:
+            violations = validate_lifecycle_membership_integrity(self.conn)
+            if violations:
+                raise LifecycleIntegrityError(violations)
+            rebuild_result = _RebuildCounters().to_result()
+
+        corrected_signal = get_trade_signal_by_id(self.conn, trade_signal_id)
+
+        return TradeSignalCorrectionResult(
+            trade_signal=corrected_signal,
+            lifecycle_rebuild_performed=needs_rebuild,
+            lifecycle_rebuild_result=rebuild_result,
+        )

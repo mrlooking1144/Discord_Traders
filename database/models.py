@@ -610,3 +610,26 @@ class LifecycleRebuildResult:
     lifecycle_events_created: int
     signal_pointers_cleared: int
     signal_pointers_assigned: int
+
+
+@dataclass(frozen=True)
+class TradeSignalCorrectionResult:
+    """Result of one TradeService.correct_trade_signal() call (Recovery
+    Milestone R6.5a).
+
+    Attributes:
+        trade_signal: The authoritative, corrected TradeSignal - reloaded
+            after any lifecycle rebuild performed as part of the same
+            correction, so trade_signal.lifecycle_id (if applicable)
+            always reflects the post-rebuild pointer, never a stale
+            pre-rebuild value.
+        lifecycle_rebuild_performed: Whether a targeted lifecycle rebuild
+            was performed as part of this correction.
+        lifecycle_rebuild_result: The LifecycleRebuildResult from the
+            targeted rebuild, or a zero-valued LifecycleRebuildResult (never
+            None) when lifecycle_rebuild_performed is False.
+    """
+
+    trade_signal: TradeSignal
+    lifecycle_rebuild_performed: bool
+    lifecycle_rebuild_result: LifecycleRebuildResult

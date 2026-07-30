@@ -1,0 +1,612 @@
+====================================================================
+Discord Traders - Recovery Milestone R6.5a Handoff
+Lifecycle-Safe Trade-Signal Correction Service Contract
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Project and Milestone Identification
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources - see the repository's
+CLAUDE.md).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R6.5a - "Lifecycle-Safe Trade-Signal
+Correction Service Contract." This is the first slice of Recovery
+Milestone R6.5 (correction-workflow integration with the R6 lifecycle
+system). R6.5a is service-layer only; R6.5b (UI migration) is separate,
+unstarted, and not authorized by this milestone.
+
+Preceding Recovery milestones (all complete and pushed before R6.5a
+began): R1 (schema/migration foundation), R2 (Discord adapter
+segmentation), R3 (extractor grammar extension), R4 (date/time
+resolution), R5 (metadata-rich ingestion, batch import, reprocessing,
+supersession, channel checkpoints), R6.1 (lifecycle schema foundation -
+`trade_lifecycles`/`trade_lifecycle_events`/`trade_signals.lifecycle_id`,
+see docs/DECISIONS/0002_trade_lifecycle_schema.md), R6.2 (the pure
+lifecycle-matching engine in `database/lifecycle.py`), R6.3 (the
+lifecycle repository/persistence layer in `database/repository.py`), and
+R6.4 (`TradeService.rebuild_all_lifecycles()` /
+`TradeService.rebuild_lifecycles_for_raw_message_ids()` lifecycle rebuild
+orchestration).
+
+# 2. Completion Status
+
+Recovery Milestone R6.5a is COMPLETE: implemented, tested (focused and
+full regression), independently quality-reviewed (twice - an initial
+review and a follow-up review after one approved test-only addition and
+one approved test-only correction), committed locally, and pushed to
+`origin/main`. Nothing from R6.5b, R6.6, or R6.7 was started at any point
+during this milestone.
+
+# 3. Repository State
+
+Branch: main
+Local HEAD and origin/main are synchronized at the R6.5a commit (see
+section 4). Ahead/behind: 0/0.
+Nothing is staged. No tracked file outside the three files listed in
+section 5 was modified by this milestone.
+No tag was created or moved by this milestone. The pre-existing
+annotated tag `v0.1.0` (pointing to commit
+`6e9350b5866c594ee4998f938459ac3db6056c1e`, the released Phase 2D/v0.1.0
+manual-entry track) remains unrelated and unchanged.
+
+All pre-existing untracked files/directories were preserved unchanged
+throughout this milestone: `CLAUDE.md`, `R6.4_quality_review_bundle.txt`,
+`app/__pycache__/`, `database/__pycache__/`,
+`docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/DECISION_TEMPLATE.md`,
+`docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and `tests/__pycache__/`.
+
+# 4. Exact Commit Information
+
+Full commit hash:
+    2018f2bb97a4c695c13cfd83f6245a7cd85aa57e
+
+Exact commit message (single line, no body, no trailer of any kind):
+    Implement lifecycle-safe trade signal correction
+
+Parent commit (the approved baseline immediately before this milestone):
+    4ac71a3bde3a06ebfc9be3bdef2a0cae03f9e68e
+    ("Implement lifecycle rebuild orchestration" - Recovery Milestone
+    R6.4's implementation commit)
+
+This commit was pushed to `origin/main` as a normal fast-forward
+(`4ac71a3..2018f2b`). No force-push was used. No amend, squash, or
+rebase occurred at any point in this milestone - this is the single
+commit that was created and reviewed.
+
+# 5. Exact Committed Files
+
+    database/models.py                         |  23 +
+    database/service.py                        | 209 ++++++++
+    tests/test_service_correction_lifecycle.py | 743 +++++++++++++++++++++++++++++
+    3 files changed, 975 insertions(+), 0 deletions(-)
+
+No other file is part of this commit. `database/repository.py`,
+`database/lifecycle.py`, `database/schema.sql`, any file under
+`database/migrations/`, `app/streamlit_app.py`, and every documentation
+file (including this one and `docs/PROJECT_STATUS.md`) were NOT part of
+the R6.5a implementation commit - this handoff and the corresponding
+`docs/PROJECT_STATUS.md` update are a separate, later, still-unstaged
+documentation change.
+
+# 6. R6.5a Objective
+
+Integrate the existing controlled trade-signal correction workflow
+(Milestone 2D.5's `TradeService.update_trade_signal()` controlled-
+correction mode) with the R6 lifecycle system, so that a correction can
+never leave lifecycle generations, membership events, signal pointers,
+audit records, or immutable snapshots inconsistent with each other. The
+entire operation - validation, the audit insert, the signal update, any
+required lifecycle rebuild, and final membership-integrity validation -
+had to become a single atomic, service-owned transaction.
+
+# 7. Public API Added
+
+New method on `database.service.TradeService`:
+
+    TradeService.correct_trade_signal(
+        trade_signal_id,
+        expected_current_values,
+        **changed_fields,
+    ) -> TradeSignalCorrectionResult
+
+This is a new, additional public method - it does not replace, wrap, or
+change the signature of anything that existed before R6.5a.
+
+# 8. Result Model Added
+
+New immutable (`@dataclass(frozen=True)`) model in `database/models.py`:
+
+    TradeSignalCorrectionResult
+        trade_signal: TradeSignal
+            The authoritative, corrected TradeSignal - reloaded from the
+            database AFTER any lifecycle rebuild performed as part of
+            the same correction, so trade_signal.lifecycle_id (when
+            applicable) always reflects the post-rebuild pointer, never
+            a stale pre-rebuild value.
+        lifecycle_rebuild_performed: bool
+            Whether a targeted lifecycle rebuild was performed as part
+            of this correction.
+        lifecycle_rebuild_result: LifecycleRebuildResult
+            The existing R6.4 LifecycleRebuildResult model (reused, not
+            duplicated) from the targeted rebuild, or a zero-valued
+            LifecycleRebuildResult (never None) when
+            lifecycle_rebuild_performed is False.
+
+# 9. Exception Added
+
+New exception in `database/service.py`:
+
+    LifecycleUnsafeCorrectionError(ValueError)
+
+Raised when a requested correction would change `action` on a
+lifecycle-managed trade signal (`event_type IS NOT NULL`). Rejected
+before any audit row, signal update, lifecycle mutation, or commit - the
+entire correction is refused outright, never partially applied. A
+ValueError subclass (matching this module's existing convention, e.g.
+`TradeSignalNotFoundError`), so it can still be caught broadly as a
+ValueError.
+
+# 10. Approved Correction Fields
+
+`correct_trade_signal()`'s `changed_fields` and `expected_current_values`
+must each contain exactly these six fields - the same six approved by
+Milestone 2D.5 for the legacy controlled-correction mode, unchanged by
+R6.5a:
+
+    symbol
+    action
+    option_type
+    price
+    expiration
+    position_size
+
+These are explicitly NOT part of the correction surface and are
+rejected if supplied: `raw_message_id`, `trader_id`, `strike`,
+`event_type`, `lifecycle_id`, any lifecycle metadata, any parser
+metadata, any source identity. Strike correction was explicitly out of
+scope for R6.5a.
+
+# 11. Field-by-Field Lifecycle Behavior
+
+- symbol / option_type / expiration (lifecycle-key fields): for a
+  lifecycle-managed signal (`event_type IS NOT NULL`), an effective
+  change to any of these triggers a targeted lifecycle rebuild. The
+  lifecycle key itself
+  (trader_id, symbol.upper(), option_type, strike, expiration) is
+  unchanged - R6.5a never redefines lifecycle-key semantics.
+- action: if the current signal is lifecycle-managed
+  (`event_type IS NOT NULL`) and `action` would effectively change, the
+  entire correction is rejected with `LifecycleUnsafeCorrectionError`
+  (see section 9) - `event_type` is never reinterpreted or rewritten. If
+  the current signal is legacy (`event_type IS NULL`), an action
+  correction remains allowed under the existing controlled-correction
+  rules. Supplying the same action value as already stored is treated
+  as simply "not a changed field," not as an unsafe action change - it
+  never trips `LifecycleUnsafeCorrectionError` by itself.
+- price / position_size (non-key fields): corrections are allowed and
+  never trigger a rebuild on their own, but still require stale-value
+  protection, exactly one correction-audit record, atomic transaction
+  handling, and the final lifecycle-membership integrity validation
+  (run directly when no rebuild occurs).
+- No-op: a correction whose six proposed values are identical to the
+  six currently persisted values is rejected with a plain `ValueError`
+  before any write - the existing Milestone 2D.5 no-op contract is
+  reused unchanged.
+
+# 12. Atomic Transaction Sequence
+
+`correct_trade_signal()` performs pure, DB-free validation (field-name
+shape checks and the shared `validate_trade_signal_update_fields()`
+type/required-field validation) BEFORE opening any transaction. It then
+opens exactly one transaction via the existing
+`TradeService._r5_write_transaction()` context manager (the same R5/R6.4
+transaction primitive - BEGIN IMMEDIATE, one COMMIT on success, full
+rollback via `.rollback()` -> fallback SQL ROLLBACK -> connection close
+on any failure) and, inside that single transaction:
+
+    1. Fetch the authoritative current trade signal.
+    2. Reject (TradeSignalNotFoundError) if it does not exist.
+    3. Build the canonical current six-field snapshot.
+    4. Compare it to expected_current_values; reject
+       (StaleTradeSignalError) on any mismatch.
+    5. Reject (ValueError) if changed_fields is identical to the
+       current snapshot (a no-op).
+    6. Classify which of the six fields actually differ.
+    7. If `action` differs and event_type IS NOT NULL, reject
+       (LifecycleUnsafeCorrectionError) - nothing has been written yet.
+    8. Write exactly one trade_signal_edits audit row (pre-correction
+       values, via the existing create_trade_signal_edit()).
+    9. Apply the update via the existing repository primitive
+       (update_trade_signal()).
+    10. Decide whether a targeted lifecycle rebuild is required (see
+        section 13).
+    11a. If required: invoke the existing PRIVATE no-commit rebuild
+         helper, TradeService._rebuild_lifecycles_for_raw_message_ids_
+         no_commit([raw_message_id]) - this already performs its own
+         final lifecycle-membership integrity validation internally and
+         raises LifecycleIntegrityError/LifecycleSnapshotError on
+         failure.
+    11b. If not required: call
+         database.repository.validate_lifecycle_membership_integrity()
+         directly and raise LifecycleIntegrityError if it reports any
+         violation.
+    12. Reload the authoritative trade signal (post-rebuild, if any).
+    13. Return a TradeSignalCorrectionResult.
+
+On normal completion, _r5_write_transaction() commits exactly once. Any
+exception anywhere in steps 1-13 rolls back the entire transaction -
+the audit row, the signal update, and any lifecycle writes are all
+undone together; there is no partial-success state.
+
+IMPORTANT: correct_trade_signal() never calls the PUBLIC
+rebuild_lifecycles_for_raw_message_ids() - that method opens its own
+_r5_write_transaction() and would raise RuntimeError (or worse, nest
+incorrectly) if called from inside an already-open transaction. It calls
+only the private _no_commit variant, which never begins, commits, or
+rolls back a transaction of its own.
+
+# 13. Lifecycle Rebuild Decision Rules
+
+A targeted rebuild (via the corrected signal's own raw_message_id) is
+performed when EITHER:
+
+  (a) The signal is lifecycle-managed (event_type IS NOT NULL) AND an
+      effective change occurred to symbol, option_type, or expiration.
+
+  (b) The signal is legacy (event_type IS NULL) AND it unexpectedly
+      carries stale lifecycle state - a non-NULL trade_signals.
+      lifecycle_id pointer, and/or existing current lifecycle-event
+      lineage referencing its raw_message_id (discovered via the
+      existing get_current_lifecycle_ids_for_raw_message_ids()). This
+      should never arise through the approved API surface (ingestion
+      never sets event_type on a legacy signal; the lifecycle engine
+      never links an ineligible signal), but if found, R6.5a
+      self-heals it via the same targeted rebuild path regardless of
+      which of the six fields was actually being corrected.
+
+Otherwise, no rebuild is performed - the final membership-integrity
+validation still runs directly (step 11b above) before commit. Every
+affected lifecycle key is rebuilt at most once per correction; unrelated
+lifecycle keys/signals are never touched. No broad
+(rebuild_all_lifecycles()-style) rebuild is ever triggered by a
+correction.
+
+# 14. Complete/Incomplete Contract Handling
+
+Lifecycle-key completeness is exactly the existing R6 engine's rule,
+unchanged by R6.5a: option_type/strike/expiration must be either all
+None (equity identity) or all present (complete option identity); any
+other combination is an incomplete contract identity, handled by the
+existing incomplete-singleton machinery (an unresolved singleton
+generation, status "unresolved", remaining_fraction "0", ambiguity flag
+"incomplete_contract_identity").
+
+Because strike is not part of the approved correction surface (section
+10), R6.5a can only move a signal between complete and incomplete via
+option_type/expiration:
+
+  - Incomplete -> complete: the stored signal already has a strike, and
+    the correction supplies the missing option_type and/or expiration.
+    Handled by the same targeted rebuild that discovers the old
+    (incomplete-singleton) key from lineage and the new (complete) key
+    from the corrected signal - the old singleton is superseded and a
+    normal keyed lifecycle generation is created.
+  - Complete -> incomplete: option_type or expiration is cleared while
+    strike remains present. The old complete-key generation is
+    superseded and a fresh incomplete-identity singleton is created for
+    the corrected signal.
+  - Equity -> complete option identity is impossible in R6.5a, since
+    strike cannot be introduced via correction.
+  - A partially populated option identity is always handled by the
+    existing incomplete-singleton behavior - R6.5a introduces no new
+    completeness rule of any kind; it only decides WHEN to invoke the
+    existing rebuild that already implements this.
+
+# 15. Rollback Guarantees
+
+Any exception raised at any point in the sequence in section 12 - a
+pure-engine failure inside build_lifecycle_sequence(), a repository/
+SQLite failure during persist_lifecycle_builds(), a
+LifecycleIntegrityError from either the internal rebuild-path validation
+or the direct no-rebuild-path validation, or a LifecycleSnapshotError
+from decoding a corrupted historical snapshot mid-rebuild - rolls back
+the ENTIRE transaction: the trade_signal_edits audit row, the
+trade_signals column update, every trade_lifecycles supersession/
+creation, every trade_lifecycle_events insert, and every
+trade_signals.lifecycle_id pointer change made during that call are all
+undone together. This was proven with real SQLite writes (not mocks of
+the transaction machinery itself) in every rollback test - see section
+16.
+
+# 16. Test Coverage
+
+New test module: tests/test_service_correction_lifecycle.py (26 tests,
+one test class per concern, all using real temporary SQLite databases
+via database.config.DatabaseConfig / database.db.get_connection /
+database.db.initialize_database - no in-memory fakes, no mocking of
+sqlite3.Connection.commit/rollback/execute).
+
+Test classes:
+  - BasicCorrectionTests: price-only and position-size-only corrections
+    succeed; a non-key correction on a lifecycle-managed signal never
+    rebuilds; exactly one audit record is created (with its previous_
+    values JSON verified); the returned result carries the corrected
+    authoritative signal; a FRESH database connection observes the
+    committed correction (service-owned commit durability).
+  - LifecycleKeyCorrectionTests: symbol/option_type/expiration
+    corrections each trigger a targeted rebuild; old lifecycle
+    membership is superseded and its pointer cleared; new lifecycle
+    membership is created and pointed to correctly; a deliberately
+    created UNRELATED lifecycle/signal is proven byte-for-byte
+    untouched; old and new keys are each rebuilt exactly once
+    (keys_considered == 2, keys_changed == 2 for a full key swap); the
+    old generation's own membership event remains as immutable audit
+    history even though the live pointer no longer targets it.
+  - CompleteIncompleteTransitionTests: incomplete-to-complete (supplying
+    the missing option_type/expiration where strike already exists) and
+    complete-to-incomplete (clearing option_type) transitions, each
+    asserting the resulting generation's status/shape and its exactly-
+    one membership event.
+  - ActionRuleTests: a managed signal's effective action change is
+    rejected with LifecycleUnsafeCorrectionError, with the pre-call
+    full lifecycle state and audit count proven byte-for-byte unchanged
+    afterward; a legacy signal can still receive an action correction;
+    supplying the same action alongside a genuine other-field change is
+    proven NOT to trip the unsafe-action check.
+  - StaleAndNoOpProtectionTests: stale expected_current_values, a
+    missing trade_signal_id, a full no-op, a wrong-shape changed_fields/
+    expected_current_values dict, and a non-Decimal price are all
+    rejected before any write (verified via unchanged audit counts and/
+    or unchanged persisted values).
+  - TransactionRollbackTests (four tests, each forcing a REAL failure
+    only after the audit insert and signal update already happened for
+    real in the same transaction):
+      * a pure-engine failure (build_lifecycle_sequence patched to
+        raise) during a required rebuild;
+      * a repository/persistence failure (persist_lifecycle_builds
+        wrapped to call the REAL function first, then raise
+        sqlite3.OperationalError) after real rebuild writes already
+        occurred;
+      * a membership-integrity failure (validate_lifecycle_membership_
+        integrity patched to return violations) on the NO-rebuild path;
+      * a LifecycleSnapshotError from a real corrupted
+        trade_lifecycle_events.signal_snapshot row, hit during a
+        required rebuild.
+    Each test verifies, after the exception: the signal's persisted
+    columns and lifecycle_id pointer are back to their pre-call values,
+    the pre-call lifecycle generation is still is_current, no new
+    lifecycles/AVGO-symbol rows exist, the audit-row count is unchanged,
+    and self.connection.in_transaction is False.
+  - LegacyStaleLifecycleStateTests (added in a dedicated follow-up
+    review round): test_legacy_signal_with_stale_lifecycle_state_
+    triggers_cleanup_rebuild - builds a real legacy signal
+    (event_type=None), then manually creates a REAL stale
+    trade_lifecycles row, a real trade_lifecycle_events membership row,
+    and a real trade_signals.lifecycle_id pointer referencing it (the
+    only way to reach this defensive branch, since it cannot arise
+    through the approved API), then calls ONLY the public
+    correct_trade_signal() with a price-only correction. Asserts
+    lifecycle_rebuild_performed is True, lifecycles_superseded == 1,
+    signal_pointers_cleared == 1, lifecycles_created == 0, the stale
+    generation is no longer is_current, the pointer is cleared to None,
+    the price is committed, exactly one new audit record exists, no
+    current lifecycle membership remains for that raw_message_id,
+    validate_lifecycle_membership_integrity() reports zero violations,
+    and - critically - a FRESH database connection observes all of this
+    with NO self.connection.commit() call anywhere after the
+    correct_trade_signal() call in the test, proving the public service
+    API owns and completes its own commit.
+  - CoexistenceWithLegacyApiTests: the pre-existing
+    TradeService.update_trade_signal() (legacy sparse-update mode) and
+    the new correct_trade_signal() are exercised on distinct signals on
+    the same connection, proving no interference.
+
+# 17. Quality-Review Findings
+
+Two independent, dedicated quality-review passes were performed against
+the committed diff (database/models.py, database/service.py,
+tests/test_service_correction_lifecycle.py), each re-reading the actual
+diff rather than relying on prior summaries, and each explicitly
+checking: update_trade_signal() is genuinely byte-for-byte unchanged;
+correct_trade_signal() owns exactly one transaction and never calls the
+public rebuild_lifecycles_for_raw_message_ids(); the unsafe-action check
+runs before the audit insert; symbol/option_type/expiration corrections
+route only through the private targeted no-commit rebuild path; price/
+position_size corrections skip rebuilding but still validate membership
+integrity; legacy signals with stale lifecycle state trigger the
+approved targeted rebuild (verified via a real, throwaway, temporary-
+database script during the first review, then covered permanently by
+the dedicated test added afterward - see section 16); the authoritative
+signal is reloaded after rebuilding; every failure after the audit/
+update rolls back everything; no test mocks bypass real SQLite
+transaction behavior; no test relies on exhausted iterators, EOF
+behavior, execution order, or another test's database state; and no
+unapproved repository/lifecycle-engine/UI/migration/documentation change
+exists in the diff.
+
+ZERO CONFIRMED DEFECTS were found in database/models.py or
+database/service.py across both review rounds. The only finding was a
+test-coverage gap (the legacy-stale-state branch had no dedicated
+automated test in the first review round) - not a production-code
+defect - which was closed by the Product Owner-approved
+LegacyStaleLifecycleStateTests addition (section 16), followed by one
+further approved test-only correction (removing a redundant caller-side
+self.connection.commit() from that new test, so its fresh-connection
+assertions prove the SERVICE's own commit rather than a caller's). No
+production code was modified as a result of either round.
+
+# 18. Final Test Results
+
+Focused command:
+    python -m unittest tests.test_service_correction_lifecycle -v
+Result: 26 tests, OK (0 failures, 0 errors)
+
+Full regression command:
+    python -m unittest discover -s tests -v
+Result: 1126 tests, OK (0 failures, 0 errors)
+
+Baseline immediately before R6.5a (end of R6.4): 1100 tests, OK. R6.5a
+added exactly 26 new tests (25 in the original implementation pass, 1
+more - the legacy-stale-state test - in the dedicated follow-up review
+round) with zero regressions across the entire existing suite (R1-R6.4
+lifecycle/service/repository/UI/integration tests, and every pre-
+Recovery 2B.x/2C.x/2D.x test).
+
+`git diff --check` was run after every change in this milestone and
+returned clean each time (only benign CRLF-normalization warnings on
+Windows, no whitespace or conflict-marker errors).
+
+# 19. Compatibility Guarantees
+
+- TradeService.update_trade_signal() (both its legacy sparse-update mode
+  and its own Milestone 2D.5 controlled-correction mode) is completely
+  unmodified - confirmed by direct diff inspection (zero lines touched
+  within that method across the entire R6.5a diff) and by every pre-
+  existing test in tests/test_service.py and
+  tests/test_correction_integration.py passing unmodified.
+- The lifecycle key definition, event ordering, lifecycle-engine
+  interpretation (database/lifecycle.py), and R6.4's targeted-rebuild
+  semantics (rebuild_all_lifecycles()/rebuild_lifecycles_for_raw_
+  message_ids() and their private helpers) are all unchanged - R6.5a
+  only decides WHEN to call the existing private rebuild helper, never
+  reimplementing or altering its logic.
+- The existing Milestone 2D.5 approved correction messages, the schema,
+  every migration, the parser/extractor, and the correction UI are all
+  unchanged.
+- event_type is never derived or rewritten from a corrected action.
+- No lifecycle rebuilding was added to the lower-level repository
+  update primitive (database.repository.update_trade_signal()) - the
+  lifecycle-safe behavior lives entirely in the new service
+  orchestration method, per the approved design.
+
+# 20. Explicitly Unchanged Areas
+
+database/repository.py, database/lifecycle.py, database/schema.sql,
+every file under database/migrations/, app/streamlit_app.py, and every
+pre-existing documentation file (this handoff and the corresponding
+docs/PROJECT_STATUS.md update are new/updated, but no other
+documentation file was touched) were not modified by the R6.5a
+implementation commit. The R6.5a implementation required no new
+repository primitive, no lifecycle-engine change, no schema/migration
+change, and no UI change - every capability it needed already existed
+from R6.1-R6.4.
+
+# 21. Current Stopping Point
+
+R6.5a is fully implemented, tested, reviewed (twice), committed, and
+pushed to origin/main at commit 2018f2bb97a4c695c13cfd83f6245a7cd85aa57e.
+Local main and origin/main are synchronized at that commit, 0 ahead / 0
+behind. No tag was created or moved. This documentation update
+(docs/PROJECT_STATUS.md and this handoff) is itself not yet staged,
+committed, or pushed as of the writing of this file - it is pending its
+own Product Owner / Technical Architect (ChatGPT) review, per this
+project's standard documentation workflow (see docs/REVIEW_RULES.md).
+
+The existing manual v0.1.0 application (app/streamlit_app.py) remains
+the only user-facing workflow and is completely unaffected by R6.5a. Its
+existing "Correct Signal" UI still calls the pre-existing
+TradeService.update_trade_signal() controlled-correction mode - it has
+NOT been migrated to the new lifecycle-safe correct_trade_signal() API.
+The Product Owner cannot yet correct a lifecycle-managed signal through
+the UI in a way that also keeps its lifecycle generation consistent;
+that requires R6.5b.
+
+# 22. Exact Next Milestone
+
+Recovery Milestone R6.5b has a reviewed design but has not been approved
+for implementation and has not started. The R6.5b correction UI
+integration design was reviewed as part of the original R6.5 planning
+work (the same planning round that produced this R6.5a implementation
+contract), before R6.5a implementation began. It is NOT unplanned or
+unscoped - it is reviewed and awaiting an implementation-approval step,
+which itself requires first verifying the reviewed design against the
+current committed repository (this handoff and the code at commit
+2018f2bb97a4c695c13cfd83f6245a7cd85aa57e), since the repository has
+changed since that design review took place.
+
+Per the reviewed design, R6.5b:
+
+  - Migrates app/streamlit_app.py's existing "Correct Signal" workflow
+    from TradeService.update_trade_signal()'s controlled-correction
+    mode to the new TradeService.correct_trade_signal().
+  - Removes the caller-side correction commit and rollback handling that
+    the old (caller-owned-transaction) pattern currently requires in
+    the UI, since correct_trade_signal() now owns its own transaction.
+  - Preserves every existing approved user-visible correction message
+    exactly, unchanged (see Milestone 2D.5's fixed message set in
+    docs/PROJECT_STATUS.md).
+  - Preserves the correction form state after EVERY rejected save -
+    never clearing it in any of these cases:
+      * a validation failure;
+      * a no-op correction;
+      * a lifecycle-unsafe action correction
+        (LifecycleUnsafeCorrectionError);
+      * a stale-value conflict (StaleTradeSignalError);
+      * a signal-not-found conflict (TradeSignalNotFoundError);
+      * a lifecycle-integrity failure (LifecycleIntegrityError);
+      * a snapshot failure (LifecycleSnapshotError);
+      * a database failure (e.g. sqlite3.Error);
+      * any other unexpected failure.
+    In every one of these cases the form stays open with the user's
+    input intact.
+  - Clears correction form state ONLY after: a successful save; an
+    explicit Cancel; a change of the selected signal; or a filter
+    change that removes the signal from view. No other event may clear
+    the form.
+  - Adds new UI and integration test coverage for the migrated
+    workflow.
+  - Stops before Recovery Milestone R6.6 (real-corpus acceptance).
+
+This handoff intentionally does NOT re-derive or re-design R6.5b from
+scratch - the design already exists and was already reviewed. The
+remaining gate before implementation is verification of that reviewed
+design against the current committed repository, followed by explicit
+Product Owner approval to begin implementation.
+
+# 23. Governance and Safety Reminders
+
+- Per CLAUDE.md: Claude Code implements approved designs; it does not
+  design or approve features on its own. Never implement a new feature
+  before the design has been reviewed and approved. Before writing code,
+  explain the implementation plan and wait for approval.
+- Per docs/REVIEW_RULES.md and this project's established practice:
+  every milestone requires its own explicit design approval before
+  implementation, its own quality review after implementation, and its
+  own explicit approval before staging/committing and before pushing.
+  R6.5a followed this pattern through four separately approved steps
+  (implement -> quality review -> one approved test-only addition/
+  correction round -> commit -> push), each individually authorized.
+- Do not begin Recovery Milestone R6.5b implementation without first
+  verifying its already-reviewed design (section 22) against the
+  current committed repository and obtaining explicit Product Owner
+  implementation approval. Do not begin R6.6 or R6.7 without a
+  separate, explicit, Product-Owner-approved design for each,
+  respectively - unlike R6.5b, neither R6.6 nor R6.7 has a reviewed
+  design yet. Do not begin R7 (trader-performance analytics) or R8
+  (UI) - both remain far out of scope and unapproved.
+- Never stage, commit, push, or tag without explicit, scoped
+  authorization for that exact action.
+- This project's Git Safety Protocol (see CLAUDE.md) applies at every
+  step: no force-push, no history rewriting, no skipped hooks, no
+  destructive git operation without explicit authorization.
+- No Co-Authored-By trailer is used in this project's commits (per this
+  project's established convention).
+
+# 24. Recommended Next-Session Starting Prompt
+
+Review the R6.5a TXT handoff, the previously reviewed R6.5b correction
+UI integration design, and the current committed repository state.
+Verify the R6.5b design against the current code and prepare the R6.5b
+implementation prompt for Product Owner approval. Do not modify files or
+begin R6.6 or R6.7.

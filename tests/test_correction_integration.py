@@ -492,5 +492,298 @@ class RollbackAndDurabilityIntegrationTests(_CorrectionIntegrationTestCase):
         self.assertEqual(edit_count, 1)
 
 
+class LifecycleAwareUiCorrectionIntegrationTests(_CorrectionIntegrationTestCase):
+    """Real-SQLite integration coverage for Recovery Milestone R6.5b: the
+    shipped "Correct Signal" UI now calls TradeService.correct_trade_signal()
+    for every signal, including lifecycle-managed ones. Signals here are
+    seeded directly through the repository/service layer (rather than the
+    Manual Message Entry UI, which never sets event_type) so that a real
+    lifecycle generation exists before the UI drives a correction against
+    it. No mocking of the lifecycle rebuild, transaction context,
+    repository writes, or integrity validator - every write below is a
+    real SQLite write."""
+
+    def _seed_lifecycle_managed_signal(self, conn, action="BOUGHT", symbol="IBM"):
+        from database.repository import (
+            create_raw_message,
+            create_trade_signal,
+            create_trader,
+            get_or_create_source,
+        )
+
+        source = get_or_create_source(conn, "discord")
+        trader = create_trader(conn, source.id, "frank")
+        raw_message = create_raw_message(
+            conn, source.id, f"{action} {symbol} 100C 12/19/2026 @2.50"
+        )
+        signal = create_trade_signal(
+            conn,
+            raw_message.id,
+            trader.id,
+            symbol,
+            action,
+            option_type="call",
+            price=Decimal("2.50"),
+            expiration="2026-12-19",
+            strike=Decimal("100"),
+            event_type="ENTRY",
+        )
+        conn.commit()
+        TradeService(conn).rebuild_all_lifecycles()
+        conn.commit()
+
+        from database.repository import get_trade_signal_by_id
+
+        return get_trade_signal_by_id(conn, signal.id)
+
+    def _open_review_and_select(self, at, signal_id):
+        at.run()
+        at = self._open_review(at)
+        at = at.selectbox[0].set_value(signal_id).run()
+        at = next(b for b in at.button if b.label == "Correct Signal").click().run()
+        return at
+
+    def test_legacy_signal_correctable_through_ui_via_correct_trade_signal(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        self._ingest(at, _SAMPLE_MESSAGE, "alice", "disc-123")
+        at = self._open_review(at)
+        df = at.dataframe[0].value
+        signal_id = int(df.iloc[0]["ID"])
+
+        with patch.object(
+            TradeService,
+            "correct_trade_signal",
+            autospec=True,
+            side_effect=TradeService.correct_trade_signal,
+        ) as spy_correct, patch.object(
+            TradeService,
+            "update_trade_signal",
+            autospec=True,
+            side_effect=AssertionError(
+                "legacy update_trade_signal() must not be called by the UI"
+            ),
+        ):
+            at = at.selectbox[0].set_value(signal_id).run()
+            at = next(b for b in at.button if b.label == "Correct Signal").click().run()
+            price_input = next(w for w in at.text_input if w.label == "Corrected price")
+            at = price_input.input("5.00").run()
+            confirm = next(
+                w for w in at.checkbox if w.label == "I confirm this correction"
+            )
+            at = confirm.set_value(True).run()
+            save_btn = next(b for b in at.button if b.label == "Save Correction")
+            at = save_btn.click().run()
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(at.success[0].value, "Trade signal correction saved.")
+        spy_correct.assert_called_once()
+
+        # Neither the UI nor this test calls conn.commit() after the click
+        # above - correct_trade_signal() owns and completes its own
+        # commit. Durability is proven only via a brand new connection.
+        fresh = get_connection(self._config())
+        try:
+            row = fresh.execute(
+                "SELECT price FROM trade_signals WHERE id = ?", (signal_id,)
+            ).fetchone()
+            edit_count = fresh.execute(
+                "SELECT COUNT(*) FROM trade_signal_edits WHERE trade_signal_id = ?",
+                (signal_id,),
+            ).fetchone()[0]
+        finally:
+            fresh.close()
+
+        self.assertEqual(row["price"], "5.00")
+        self.assertEqual(edit_count, 1)
+
+    def test_lifecycle_managed_signal_accepts_price_only_ui_correction(self):
+        conn = self._real_connection()
+        try:
+            signal = self._seed_lifecycle_managed_signal(conn)
+            self.assertIsNotNone(signal.lifecycle_id)
+        finally:
+            conn.close()
+
+        at = AppTest.from_file("app/streamlit_app.py")
+        at = self._open_review_and_select(at, signal.id)
+        price_input = next(w for w in at.text_input if w.label == "Corrected price")
+        at = price_input.input("3.75").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(at.success[0].value, "Trade signal correction saved.")
+
+        fresh = get_connection(self._config())
+        try:
+            row = fresh.execute(
+                "SELECT price, lifecycle_id FROM trade_signals WHERE id = ?",
+                (signal.id,),
+            ).fetchone()
+        finally:
+            fresh.close()
+
+        self.assertEqual(row["price"], "3.75")
+        # A non-key correction never rebuilds - the signal keeps pointing
+        # to the same lifecycle generation it started with.
+        self.assertEqual(row["lifecycle_id"], signal.lifecycle_id)
+
+    def test_bought_action_lifecycle_managed_price_only_correction_preserves_action(
+        self,
+    ):
+        conn = self._real_connection()
+        try:
+            signal = self._seed_lifecycle_managed_signal(conn, action="BOUGHT")
+        finally:
+            conn.close()
+
+        at = AppTest.from_file("app/streamlit_app.py")
+        at = self._open_review_and_select(at, signal.id)
+        action_box = next(w for w in at.selectbox if w.label == "Corrected action")
+        self.assertEqual(action_box.value, "BOUGHT")
+
+        price_input = next(w for w in at.text_input if w.label == "Corrected price")
+        at = price_input.input("6.25").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(at.success[0].value, "Trade signal correction saved.")
+
+        fresh = get_connection(self._config())
+        try:
+            row = fresh.execute(
+                "SELECT action, price FROM trade_signals WHERE id = ?", (signal.id,)
+            ).fetchone()
+        finally:
+            fresh.close()
+
+        self.assertEqual(row["action"], "BOUGHT")
+        self.assertEqual(row["price"], "6.25")
+
+    def test_symbol_correction_through_ui_triggers_targeted_lifecycle_replacement(self):
+        from database.repository import (
+            get_current_lifecycle_ids_for_raw_message_ids,
+            get_trade_lifecycle_by_id,
+            get_trade_signal_by_id,
+            validate_lifecycle_membership_integrity,
+        )
+
+        conn = self._real_connection()
+        try:
+            signal = self._seed_lifecycle_managed_signal(conn, symbol="IBM")
+            old_lifecycle_id = signal.lifecycle_id
+            self.assertIsNotNone(old_lifecycle_id)
+        finally:
+            conn.close()
+
+        at = AppTest.from_file("app/streamlit_app.py")
+        at = self._open_review_and_select(at, signal.id)
+        symbol_input = next(w for w in at.text_input if w.label == "Corrected symbol")
+        at = symbol_input.input("AVGO").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(len(at.error), 0)
+        self.assertEqual(at.success[0].value, "Trade signal correction saved.")
+
+        fresh = get_connection(self._config())
+        try:
+            old_lifecycle = get_trade_lifecycle_by_id(fresh, old_lifecycle_id)
+            self.assertFalse(old_lifecycle.is_current)
+
+            corrected = get_trade_signal_by_id(fresh, signal.id)
+            self.assertIsNotNone(corrected.lifecycle_id)
+            self.assertNotEqual(corrected.lifecycle_id, old_lifecycle_id)
+
+            new_lifecycle = get_trade_lifecycle_by_id(fresh, corrected.lifecycle_id)
+            self.assertEqual(new_lifecycle.symbol, "AVGO")
+            self.assertTrue(new_lifecycle.is_current)
+
+            # No dual current membership: exactly one current lifecycle id
+            # is associated with this raw message.
+            current_ids = get_current_lifecycle_ids_for_raw_message_ids(
+                fresh, [signal.raw_message_id]
+            )
+            self.assertEqual(current_ids, [corrected.lifecycle_id])
+
+            self.assertEqual(validate_lifecycle_membership_integrity(fresh), [])
+        finally:
+            fresh.close()
+
+    def test_managed_action_change_through_ui_is_rejected_atomically_and_form_stays_open(
+        self,
+    ):
+        from database.repository import get_trade_lifecycle_by_id, get_trade_signal_by_id
+
+        conn = self._real_connection()
+        try:
+            signal = self._seed_lifecycle_managed_signal(conn, action="BOUGHT")
+        finally:
+            conn.close()
+
+        pre_conn = self._real_connection()
+        try:
+            pre_signal = get_trade_signal_by_id(pre_conn, signal.id)
+            pre_edit_count = pre_conn.execute(
+                "SELECT COUNT(*) FROM trade_signal_edits"
+            ).fetchone()[0]
+            pre_lifecycle_count = pre_conn.execute(
+                "SELECT COUNT(*) FROM trade_lifecycles"
+            ).fetchone()[0]
+            pre_event_count = pre_conn.execute(
+                "SELECT COUNT(*) FROM trade_lifecycle_events"
+            ).fetchone()[0]
+        finally:
+            pre_conn.close()
+
+        at = AppTest.from_file("app/streamlit_app.py")
+        at = self._open_review_and_select(at, signal.id)
+        action_box = next(w for w in at.selectbox if w.label == "Corrected action")
+        at = action_box.set_value("STC").run()
+        confirm = next(w for w in at.checkbox if w.label == "I confirm this correction")
+        at = confirm.set_value(True).run()
+        save_btn = next(b for b in at.button if b.label == "Save Correction")
+        at = save_btn.click().run()
+
+        self.assertEqual(
+            at.error[0].value,
+            "Please enter a valid correction that changes at least one field.",
+        )
+        self.assertIn("Save Correction", {b.label for b in at.button})
+        action_box_after = next(w for w in at.selectbox if w.label == "Corrected action")
+        self.assertEqual(action_box_after.value, "STC")
+
+        fresh = get_connection(self._config())
+        try:
+            post_signal = get_trade_signal_by_id(fresh, signal.id)
+            self.assertEqual(post_signal.action, "BOUGHT")
+            self.assertEqual(post_signal.lifecycle_id, pre_signal.lifecycle_id)
+            self.assertTrue(
+                get_trade_lifecycle_by_id(fresh, pre_signal.lifecycle_id).is_current
+            )
+            post_edit_count = fresh.execute(
+                "SELECT COUNT(*) FROM trade_signal_edits"
+            ).fetchone()[0]
+            post_lifecycle_count = fresh.execute(
+                "SELECT COUNT(*) FROM trade_lifecycles"
+            ).fetchone()[0]
+            post_event_count = fresh.execute(
+                "SELECT COUNT(*) FROM trade_lifecycle_events"
+            ).fetchone()[0]
+        finally:
+            fresh.close()
+
+        self.assertEqual(post_edit_count, pre_edit_count)
+        self.assertEqual(post_lifecycle_count, pre_lifecycle_count)
+        self.assertEqual(post_event_count, pre_event_count)
+
+
 if __name__ == "__main__":
     unittest.main()

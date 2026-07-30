@@ -30,19 +30,40 @@ here. The Review workflow never calls initialize_database() and never
 opens a connection when the configured database file does not already
 exist, so merely viewing the review screen can never create the database.
 
-Milestone 2D.5: a "Correct Signal" control inside Review Signals, routed
-through database.service.TradeService.update_trade_signal()'s controlled-
-correction mode (expected_current_values), plus a read-only "Correction
-History" section via TradeService.list_trade_signal_audit_history(). Both
-share the same connection already opened for the review list/detail
-within this rerun - no extra connection is opened and the database is
-never initialized here. Only the six approved fields (symbol, action,
-option_type, price, expiration, position_size) are ever editable; action
-and option type use fixed select controls, not free text. Client-side
-syntactic validation (parsing price/expiration, requiring the
-confirmation checkbox) happens before the correction service call, not
-before any connection is opened, since one is already open for the
-review list at that point.
+Milestone 2D.5: a "Correct Signal" control inside Review Signals, originally
+routed through database.service.TradeService.update_trade_signal()'s
+controlled-correction mode (expected_current_values), plus a read-only
+"Correction History" section via TradeService.list_trade_signal_audit_history().
+Only the six approved fields (symbol, action, option_type, price, expiration,
+position_size) are ever editable; action and option type use fixed select
+controls, not free text. Client-side syntactic validation (parsing
+price/expiration, requiring the confirmation checkbox) happens before the
+correction service call, not before any connection is opened, since one is
+already open for the review list at that point. Both the correction form and
+the Correction History section share the same connection already opened for
+the review list/detail within this rerun - no extra connection is opened and
+the database is never initialized here.
+
+Recovery Milestone R6.5b: the shipped "Correct Signal" save path is migrated
+from TradeService.update_trade_signal()'s controlled-correction mode to the
+lifecycle-safe TradeService.correct_trade_signal() - the only correction
+method this module calls. correct_trade_signal() owns its correction
+transaction end to end (commit on success, rollback on any failure); this
+module never calls conn.commit()/conn.rollback() on the correction-save path
+itself (Manual Message Entry's own Submit-workflow commit/rollback is
+unrelated and unchanged). TradeService.update_trade_signal() remains
+available on TradeService for backward compatibility but is not called by
+this shipped UI. The six editable fields, the fixed correction/conflict/
+success/failure messages, and the read-only Correction History behavior are
+all unchanged by this migration. Every rejected save (validation failure,
+no-op, a lifecycle-unsafe action change, a stale-value or not-found conflict,
+a lifecycle-integrity or snapshot failure, or any other unexpected failure)
+leaves the correction form and its entered values in place; the form is
+cleared only on a successful save, an explicit Cancel, a change of the
+selected signal, or a filter change that removes the signal from view. A
+persisted action or option_type value outside the standard fixed choices
+(e.g. the Recovery extractor's BOUGHT/SOLD actions) is appended to that
+field's selectbox options and selected by default, never silently replaced.
 """
 
 from __future__ import annotations
@@ -66,6 +87,9 @@ from database.config import DatabaseConfig, resolve_database_path
 from database.db import get_connection, initialize_database
 from database.service import (
     AuditHistoryError,
+    LifecycleIntegrityError,
+    LifecycleSnapshotError,
+    LifecycleUnsafeCorrectionError,
     StaleTradeSignalError,
     TradeService,
     TradeSignalNotFoundError,
@@ -87,6 +111,21 @@ _CORRECTION_CONFLICT_MESSAGE = (
 _CORRECTION_FAILURE_MESSAGE = "Could not save the trade signal correction."
 _CORRECTION_SUCCESS_MESSAGE = "Trade signal correction saved."
 _AUDIT_HISTORY_FAILURE_MESSAGE = "Could not load correction history."
+
+
+def _correction_selectbox_choices(base_choices: list[str], current_value: str) -> list[str]:
+    """Build one correction-form selectbox's option list: a fresh copy of
+    base_choices, with current_value appended when it is not already
+    present - so a persisted value outside the standard set (e.g. an
+    extractor-produced "BOUGHT"/"SOLD" action) is always selectable and
+    always the default, never silently replaced by index 0. Never mutates
+    base_choices, and never normalizes or substitutes current_value.
+    """
+    choices = list(base_choices)
+    if current_value not in choices:
+        choices.append(current_value)
+    return choices
+
 
 logger = logging.getLogger("discord_traders.app")
 
@@ -346,24 +385,22 @@ elif workflow == "Review Signals":
                         "Corrected symbol", value=expected_values["symbol"]
                     )
                     current_action = expected_values["action"]
-                    action_index = (
-                        _ACTION_CHOICES.index(current_action)
-                        if current_action in _ACTION_CHOICES
-                        else 0
+                    action_choices = _correction_selectbox_choices(
+                        _ACTION_CHOICES, current_action
                     )
                     action_input = st.selectbox(
-                        "Corrected action", _ACTION_CHOICES, index=action_index
+                        "Corrected action",
+                        action_choices,
+                        index=action_choices.index(current_action),
                     )
                     current_option_type = expected_values["option_type"] or ""
-                    option_type_index = (
-                        _OPTION_TYPE_CHOICES.index(current_option_type)
-                        if current_option_type in _OPTION_TYPE_CHOICES
-                        else 0
+                    option_type_choices = _correction_selectbox_choices(
+                        _OPTION_TYPE_CHOICES, current_option_type
                     )
                     option_type_input = st.selectbox(
                         "Corrected option type",
-                        _OPTION_TYPE_CHOICES,
-                        index=option_type_index,
+                        option_type_choices,
+                        index=option_type_choices.index(current_option_type),
                     )
                     price_input = st.text_input(
                         "Corrected price",
@@ -432,39 +469,42 @@ elif workflow == "Review Signals":
                                 }
                                 configure_file_logging()
                                 try:
-                                    service.update_trade_signal(
+                                    service.correct_trade_signal(
                                         selected["id"],
                                         expected_current_values=expected_values,
                                         **changed_fields,
                                     )
-                                    conn.commit()
                                 except (
                                     StaleTradeSignalError,
                                     TradeSignalNotFoundError,
                                 ) as exc:
-                                    conn.rollback()
                                     log_operation_failure(
                                         logger, "trade signal correction", exc
                                     )
-                                    st.session_state.pop("correction_signal_id", None)
-                                    st.session_state.pop(
-                                        "correction_expected_values", None
-                                    )
                                     st.error(_CORRECTION_CONFLICT_MESSAGE)
-                                except ValueError as exc:
-                                    conn.rollback()
+                                except LifecycleUnsafeCorrectionError as exc:
                                     log_operation_failure(
                                         logger, "trade signal correction", exc
                                     )
                                     st.error(_CORRECTION_VALIDATION_MESSAGE)
-                                except (TypeError, sqlite3.Error, OSError) as exc:
-                                    conn.rollback()
+                                except ValueError as exc:
+                                    log_operation_failure(
+                                        logger, "trade signal correction", exc
+                                    )
+                                    st.error(_CORRECTION_VALIDATION_MESSAGE)
+                                except (
+                                    LifecycleIntegrityError,
+                                    LifecycleSnapshotError,
+                                    TypeError,
+                                    sqlite3.Error,
+                                    OSError,
+                                    RuntimeError,
+                                ) as exc:
                                     log_operation_failure(
                                         logger, "trade signal correction", exc
                                     )
                                     st.error(_CORRECTION_FAILURE_MESSAGE)
                                 except Exception as exc:
-                                    conn.rollback()
                                     log_operation_failure(
                                         logger, "trade signal correction", exc
                                     )

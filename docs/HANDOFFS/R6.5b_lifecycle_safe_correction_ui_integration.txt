@@ -1,0 +1,586 @@
+====================================================================
+Discord Traders - Recovery Milestone R6.5b Handoff
+Lifecycle-Safe Correction UI Integration
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources - see the repository's
+CLAUDE.md).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R6.5b - "Lifecycle-Safe Correction UI
+Integration." This is the second and final slice of Recovery Milestone
+R6.5 (correction-workflow integration with the R6 lifecycle system),
+following R6.5a's lifecycle-safe service contract.
+
+Status: R6.5b is COMPLETE - implemented, tested (focused and full
+regression), independently quality-reviewed, committed locally, and
+pushed to `origin/main`. Nothing from R6.6 or R6.7 was started at any
+point during this milestone.
+
+Preceding milestones (all complete and pushed before R6.5b began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), and
+R6.5a (the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract - see docs/HANDOFFS/R6.5a_lifecycle_safe_trade_signal_correction.txt).
+
+# 2. Exact Repository State
+
+Branch: main
+HEAD: bd911ac04c12e45e3501202f45124d7233ebe723
+origin/main: bd911ac04c12e45e3501202f45124d7233ebe723
+Ahead/behind: 0/0
+
+Nothing is staged. No tracked file outside the three files listed in
+section 4 was modified by the R6.5b implementation commit. No tag was
+created or moved by this milestone. The pre-existing annotated tag
+`v0.1.0` (pointing to commit `6e9350b5866c594ee4998f938459ac3db6056c1e`,
+the released Phase 2D/v0.1.0 manual-entry track) remains unrelated and
+unchanged.
+
+All pre-existing untracked files/directories were preserved unchanged
+throughout this milestone: `CLAUDE.md`, `R6.4_quality_review_bundle.txt`,
+`app/__pycache__/`, `database/__pycache__/`,
+`docs/DATABASE_DESIGN_V1.md`, `docs/DECISIONS/DECISION_TEMPLATE.md`,
+`docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and `tests/__pycache__/`.
+
+# 3. Exact Implementation Commit
+
+Commit: bd911ac04c12e45e3501202f45124d7233ebe723
+Message: Implement lifecycle-safe correction UI integration
+
+(Single-line commit message, no body, no trailer of any kind - no
+`Co-Authored-By` or other trailer exists.)
+
+Parent commit (the approved baseline immediately before this milestone):
+    a87fb9afac1b87cd3fcfbf330749c2ce47c354b8
+    ("Update documentation for Recovery Milestone R6.5a")
+
+This commit was pushed to `origin/main` as a normal fast-forward
+(`a87fb9a..bd911ac`). No force-push was used. No amend, squash, or
+rebase occurred at any point in this milestone.
+
+# 4. Exact Committed Files
+
+    app/streamlit_app.py                 | 110 ++++++---
+    tests/test_app.py                    | 448 ++++++++++++++++++++++++++++-------
+    tests/test_correction_integration.py | 293 +++++++++++++++++++++++
+    3 files changed, 729 insertions(+), 122 deletions(-)
+
+No other file is part of this commit. `database/service.py`,
+`database/models.py`, `database/repository.py`, `database/lifecycle.py`,
+every file under `database/migrations/`, `database/schema.sql`, and
+every documentation file (including this one and
+`docs/PROJECT_STATUS.md`) were NOT part of the R6.5b implementation
+commit - this handoff and the corresponding `docs/PROJECT_STATUS.md`
+update are a separate, later, still-unstaged documentation change.
+
+# 5. Commit Statistics
+
+    3 files changed
+    729 insertions(+)
+    122 deletions(-)
+
+# 6. Service Migration
+
+The shipped correction UI's Save-Correction path now calls exactly:
+
+    TradeService.correct_trade_signal(
+        selected["id"],
+        expected_current_values=expected_values,
+        **changed_fields,
+    )
+
+and no longer calls:
+
+    TradeService.update_trade_signal(...)
+
+`correct_trade_signal()` is the R6.5a lifecycle-safe API (see
+docs/HANDOFFS/R6.5a_lifecycle_safe_trade_signal_correction.txt) -
+unmodified by R6.5b. The legacy `TradeService.update_trade_signal()` API
+(both its Milestone 2B.6b legacy sparse-update mode and its Milestone
+2D.5 controlled-correction mode) remains fully available on `TradeService`
+for backward compatibility. It is simply no longer called by the shipped
+UI. Its own direct tests - `tests/test_service.py`'s legacy-mode
+coverage, and `tests/test_correction_integration.py`'s
+`LegacyServiceBehaviorTests`, `StaleConflictIntegrationTests`, and
+`RollbackAndDurabilityIntegrationTests` (all of which call
+`update_trade_signal()` directly, never through the UI) - remain
+completely intact and unmodified by this milestone.
+
+Verified via static search: exactly one application call to
+`service.correct_trade_signal(` exists in `app/streamlit_app.py`
+(the Save-Correction branch); zero calls to
+`service.update_trade_signal(` remain anywhere in that file.
+
+# 7. Transaction Ownership
+
+`correct_trade_signal()` owns the complete correction transaction end to
+end via the pre-existing `TradeService._r5_write_transaction()` context
+manager (unchanged from R6.5a): it commits exactly once on success and
+rolls back the entire operation on any failure.
+
+The correction-save branch in `app/streamlit_app.py` no longer calls
+`conn.commit()` or `conn.rollback()` at any point - all four such calls
+that existed in the pre-R6.5b UI (one success-path commit, three
+per-exception-branch rollbacks) were removed. Verified via static
+search: the only executable `conn.commit()`/`conn.rollback()` calls
+remaining in `app/streamlit_app.py` are the three inside the Manual
+Message Entry Submit workflow (its own separate, caller-owned ingestion
+transaction, entirely unrelated to and unchanged by this milestone). A
+fourth textual match exists only inside this module's own docstring
+prose describing this exact invariant - not executable code.
+
+# 8. Exception-to-Message Mapping
+
+Validation message (form remains open, state preserved):
+
+    Please enter a valid correction that changes at least one field.
+
+Used for:
+    - missing confirmation (client-side, before any service call);
+    - malformed client input - unparseable price or expiration
+      (client-side, before any service call);
+    - a no-op correction rejected by the service (plain `ValueError`);
+    - `LifecycleUnsafeCorrectionError` (a new R6.5a exception - raised
+      when a requested correction would change `action` on a
+      lifecycle-managed signal);
+    - any other expected correction-validation `ValueError` case.
+
+Conflict message (form remains open, state preserved):
+
+    This trade signal changed or is no longer available. Reload it
+    before correcting.
+
+Used for:
+    - `StaleTradeSignalError`;
+    - `TradeSignalNotFoundError`.
+
+    (This is the one message whose state-clearing behavior CHANGED in
+    R6.5b - see section 9.)
+
+Generic failure message (form remains open, state preserved; the UI
+never calls `conn.rollback()` for any of these, since
+`correct_trade_signal()` has already rolled back internally before this
+exception propagates):
+
+    Could not save the trade signal correction.
+
+Used for:
+    - `LifecycleIntegrityError` (a new R6.5a exception);
+    - `LifecycleSnapshotError` (a new R6.5a exception);
+    - `TypeError`;
+    - `sqlite3.Error`;
+    - `OSError`;
+    - `RuntimeError`;
+    - any other unexpected exception (bare `except Exception`).
+
+Success message:
+
+    Trade signal correction saved.
+
+Audit-history failure message (unchanged, unrelated to the Save-
+Correction path - covers `list_trade_signal_audit_history()` failures):
+
+    Could not load correction history.
+
+All five messages are byte-for-byte identical to their pre-R6.5b
+(Milestone 2D.5) text - none of the approved user-facing strings were
+altered.
+
+Exception-catch ordering in the implementation (most specific first, so
+no subclass is swallowed by a broader `except`): `(StaleTradeSignalError,
+TradeSignalNotFoundError)` -> `LifecycleUnsafeCorrectionError` -> plain
+`ValueError` -> `(LifecycleIntegrityError, LifecycleSnapshotError,
+TypeError, sqlite3.Error, OSError, RuntimeError)` -> bare `Exception`.
+
+# 9. Correction-State Behavior
+
+Correction form state and every entered widget value are now preserved
+after EVERY rejected save:
+
+    - missing confirmation;
+    - malformed client-side input (symbol, price, or expiration);
+    - a no-op correction;
+    - a lifecycle-unsafe action correction (`LifecycleUnsafeCorrectionError`);
+    - a stale-value conflict (`StaleTradeSignalError`);
+    - a signal-not-found conflict (`TradeSignalNotFoundError`);
+    - a lifecycle-integrity failure (`LifecycleIntegrityError`);
+    - a lifecycle-snapshot failure (`LifecycleSnapshotError`);
+    - a type failure (`TypeError`);
+    - a database failure (`sqlite3.Error`);
+    - an OS failure (`OSError`);
+    - a runtime failure (`RuntimeError`);
+    - any other unexpected failure.
+
+This is a deliberate behavior CHANGE from the pre-R6.5b (Milestone 2D.5)
+UI for exactly one category: a stale-value or not-found conflict
+previously cleared `correction_signal_id`/`correction_expected_values`
+from `st.session_state` (forcing the user to re-open the form from
+scratch); R6.5b removes those two `st.session_state.pop()` calls from
+that exception branch, so a conflict now behaves like every other
+rejection - the form and the user's in-progress edits stay exactly as
+entered.
+
+Correction state clears ONLY after:
+
+    1. A successful save.
+    2. An explicit Cancel.
+    3. A change of the selected signal (a different signal ID chosen in
+       the review selectbox).
+    4. A filter change that removes the currently-selected signal from
+       the visible result set.
+
+No other event clears correction state. These four clearing paths were
+already correctly implemented before R6.5b for cases 2-4 (Cancel,
+signal-selection change, filter-removal all predate this milestone
+unchanged); R6.5b's only state-management change is removing the
+premature clearing from the conflict branch described above.
+
+# 10. Fixed-Choice Compatibility Correction
+
+Confirmed prior defect: the Recovery-track extractor
+(`app/parser.py`'s `extract_trade_event()`, used by
+`TradeService.ingest_channel_message()`/`ingest_batch()`) persists
+actions including `BOUGHT` and `SOLD`
+(`_EXTRACTOR_ACTION_RE = r"^(BOUGHT|SOLD|BTO|STC|BTC|STO|BUY|SELL)$"`),
+stored verbatim and never aliased
+(`TradeSignal.action`'s own docstring: "stored exactly as supplied and
+never aliased"). The pre-R6.5b UI's fixed `_ACTION_CHOICES = ["BTO",
+"STC", "BTC", "STO", "BUY", "SELL"]` list omitted both. Its selectbox
+index-selection logic fell back to index 0 whenever the persisted action
+was not in that list:
+
+    action_index = (
+        _ACTION_CHOICES.index(current_action)
+        if current_action in _ACTION_CHOICES
+        else 0
+    )
+
+For a persisted `"BOUGHT"` signal, this rendered `"BTO"` as the visibly
+selected action with no indication the true stored value differed. A
+user correcting only price, expiration, or another unrelated field -
+without touching the action dropdown - would submit `action_input ==
+"BTO"` as part of `changed_fields`, silently converting `BOUGHT` -> `BTO`
+(or, symmetrically, `SOLD` -> `STC`) on save.
+
+Implemented solution: a new pure helper,
+`_correction_selectbox_choices(base_choices, current_value)`, builds a
+FRESH copy of `base_choices` and appends `current_value` only when it is
+not already present:
+
+    def _correction_selectbox_choices(base_choices, current_value):
+        choices = list(base_choices)
+        if current_value not in choices:
+            choices.append(current_value)
+        return choices
+
+The action selectbox's options and default index are now built from
+this helper's fresh list, with `index=action_choices.index(current_action)`
+(guaranteed present, since the helper appended it if absent) -
+eliminating the index-0 fallback entirely. The standard six action
+choices remain unchanged and always present; `_ACTION_CHOICES` itself is
+never mutated (`list(base_choices)` always creates a fresh copy). No
+normalization or aliasing was introduced - `BOUGHT` is never mapped to
+`BTO`, `SOLD` is never mapped to `STC` - and no free-text action entry
+was added; the field remains a fixed `st.selectbox`.
+
+The identical defensive pattern is applied to `option_type`
+(`_OPTION_TYPE_CHOICES = ["", "call", "put"]`): a persisted `option_type`
+outside that set is appended and selected by default, never silently
+replaced. `option_type` is documented as free-text
+(`TradeSignal.option_type`'s docstring: "Free-text call/put, or None for
+non-option trades") and is not constrained to an enum by
+`validate_trade_signal_update_fields()` at the repository layer, so
+while today's extractor grammars only ever produce `None`/`"call"`/
+`"put"`, this defensive branch guards against a value outside that set
+reaching the UI through any future write path.
+
+Verified via real signals in both the AppTest suite (`tests/test_app.py`)
+and the real-SQLite integration suite
+(`tests/test_correction_integration.py`): a persisted `BOUGHT` action is
+offered in the selectbox, selected by default, and submitted unchanged
+on a price-only correction (`call.kwargs["action"] == "BOUGHT"`, never
+`"BTO"`); identical coverage exists for `SOLD` and for an out-of-list
+`option_type` value.
+
+# 11. Lifecycle Behavior
+
+All lifecycle behavior below is exactly the R6.5a `correct_trade_signal()`
+contract (unmodified by R6.5b) - R6.5b only changes how the UI invokes
+it. Verified through the UI this milestone via real-SQLite integration
+tests (`LifecycleAwareUiCorrectionIntegrationTests`), not merely at the
+service layer:
+
+    - A price-only (or other non-key-field) correction of a lifecycle-
+      managed signal is supported through the UI and never triggers a
+      rebuild.
+    - A lifecycle-key correction (symbol, option_type, or expiration)
+      submitted through the UI triggers a targeted lifecycle rebuild for
+      the corrected signal's raw_message_id.
+    - The old lifecycle generation is superseded (`is_current` cleared)
+      as part of that rebuild.
+    - The corrected signal's `lifecycle_id` pointer is reloaded post-
+      rebuild and points to the new (replacement) lifecycle generation.
+    - No dual current lifecycle membership remains for the affected
+      raw_message_id after a UI-driven correction -
+      `get_current_lifecycle_ids_for_raw_message_ids()` returns exactly
+      one id (the new generation's).
+    - `validate_lifecycle_membership_integrity()` reports zero
+      violations after every UI-driven correction in the test suite.
+    - A managed `action` change submitted through the UI (i.e. `action`
+      would effectively change on a signal with `event_type IS NOT
+      NULL`) is rejected atomically with `LifecycleUnsafeCorrectionError`,
+      surfaced through the UI as the validation message.
+    - A rejected correction (of any kind, including the managed-action
+      case) creates no partial mutation whatsoever - no signal-column
+      change, no audit row, no lifecycle supersession, no lifecycle
+      creation, no lifecycle-event insert, and no lifecycle-id pointer
+      change - proven via full before/after state snapshots
+      (`trade_signals`, `trade_signal_edits`, `trade_lifecycles`,
+      `trade_lifecycle_events` row counts and content, all byte-for-byte
+      unchanged) in the real-SQLite rejection test.
+
+# 12. Logging and Privacy
+
+Correction failures continue to route through the existing sanitized
+`log_operation_failure(logger, "trade signal correction", exc)` contract
+(unchanged) for every one of the new exception categories introduced by
+R6.5b, exactly as they did before. Verified this milestone (both by
+direct code inspection and by `assertLogs`-based tests) that no log
+record produced by the correction path ever contains:
+
+    - raw message text;
+    - entered correction values (symbol, price, expiration, position
+      size, action, or option type text the user typed);
+    - trader identifiers;
+    - database or log paths;
+    - exception message text (only the exception CLASS NAME appears in
+      sanitized diagnostics, per the existing, unchanged
+      `app/logging_config.py` contract);
+    - lifecycle IDs, lifecycle rebuild counters, or any other internal
+      lifecycle detail.
+
+No lifecycle rebuild counters, lifecycle generation IDs, lifecycle
+events, or other internal lifecycle information are exposed anywhere in
+the UI - the returned `TradeSignalCorrectionResult`'s
+`lifecycle_rebuild_performed`/`lifecycle_rebuild_result` fields are never
+read by `app/streamlit_app.py`, which discards the method's return value
+entirely.
+
+# 13. AppTest Coverage
+
+    tests.test_app: 102 passing (37 of which are in `CorrectSignalWorkflowTests`,
+    up from 22 pre-R6.5b)
+
+Summary of what `CorrectSignalWorkflowTests` proves:
+
+    - Exact `correct_trade_signal()` call arguments: the exact selected
+      signal ID (positional), the exact six-field canonical
+      `expected_current_values` snapshot, and exactly the six approved
+      proposed fields as keyword arguments - nothing more, nothing less.
+    - `update_trade_signal()` is never called by the shipped UI (assert
+      `assert_not_called()` alongside every relevant scenario).
+    - The correction branch never calls `mock_conn.commit()` or
+      `mock_conn.rollback()`, on both the success path and every failure
+      path.
+    - All five approved fixed messages appear unchanged.
+    - Every state-preservation path (13 distinct rejection scenarios -
+      missing confirmation, malformed price, malformed expiration, a
+      service-side no-op `ValueError`, `LifecycleUnsafeCorrectionError`,
+      `StaleTradeSignalError`, `TradeSignalNotFoundError`,
+      `LifecycleIntegrityError`, `LifecycleSnapshotError`, `TypeError`,
+      `sqlite3.Error`, `OSError`, `RuntimeError`, and an unexpected
+      `KeyError`) asserts both the correct fixed message AND that the
+      correction form (`"Save Correction"` button, entered widget
+      values) remains present/unchanged afterward.
+    - Every state-clearing path (success, Cancel, selected-signal
+      change, filter removal) asserts the form disappears on the next
+      steady-state rerun.
+    - `BOUGHT` and `SOLD`: each appears in the action selectbox's
+      options, is selected by default, and is proven to survive a
+      price-only correction unchanged (never becoming `BTO`/`STC`).
+    - An out-of-list `option_type` (a synthetic `"spread"` fixture)
+      appears, is selected by default, and survives a price-only
+      correction unchanged.
+    - A standard-action/standard-option-type signal still offers exactly
+      the original six/three fixed choices, with nothing extra appended.
+    - The raw message text area remains `disabled=True` in correction
+      mode.
+    - No `"Delete"` button exists anywhere in correction mode.
+    - Parser, ingestion (`ingest_message`), and backup
+      (`create_backup`) are never invoked during a correction save.
+
+# 14. Real-SQLite Integration Coverage
+
+    tests.test_correction_integration: 17 passing (5 new in
+    `LifecycleAwareUiCorrectionIntegrationTests`, plus the 12 pre-existing
+    tests in `LegacyServiceBehaviorTests`, `UiCorrectionIntegrationTests`,
+    `StaleConflictIntegrationTests`, and `RollbackAndDurabilityIntegrationTests`,
+    all left unmodified)
+
+New coverage in `LifecycleAwareUiCorrectionIntegrationTests` (real,
+unique temporary SQLite databases; no mocking of the lifecycle rebuild,
+transaction context, repository writes, or integrity validator):
+
+    - UI-driven lifecycle-safe correction: `TradeService.correct_trade_signal`
+      is spied on (via `patch.object(..., autospec=True,
+      side_effect=TradeService.correct_trade_signal)`, so the REAL
+      implementation still runs) while `update_trade_signal` is patched to
+      raise `AssertionError` if ever called - proving the UI calls only
+      the new method, for a real signal driven entirely through the
+      "Correct Signal" button.
+    - Service-owned commit durability through a fresh connection: neither
+      the UI nor the test itself calls `conn.commit()` after the Save
+      Correction click; a brand-new `get_connection()` call afterward
+      observes the corrected price.
+    - Exactly one previous-value audit record persisted per correction
+      (verified via a direct `trade_signal_edits` row count).
+    - A lifecycle-managed signal accepts a price-only UI correction with
+      no rebuild (`lifecycle_id` unchanged after the save).
+    - A `BOUGHT`-action lifecycle-managed signal's price-only UI
+      correction preserves the `BOUGHT` action exactly (never becomes
+      `BTO`).
+    - A symbol correction submitted through the UI triggers targeted
+      lifecycle replacement: the old generation is superseded, the
+      corrected signal points to a new current generation with the new
+      symbol, exactly one current lifecycle id is associated with the
+      raw message (no dual membership), and
+      `validate_lifecycle_membership_integrity()` reports zero
+      violations.
+    - A managed action-change attempt submitted through the UI is
+      rejected atomically: the validation message is shown, the form
+      remains open with the attempted (rejected) action value still
+      selected, and a fresh-connection check confirms zero mutation to
+      the signal's action/lifecycle_id, zero new audit rows, zero new/
+      removed lifecycle rows, and zero new/removed lifecycle-event rows.
+
+# 15. R6.5a Service Tests
+
+    tests.test_service_correction_lifecycle: 26 passing (unchanged from
+    R6.5a - zero new, zero removed, zero modified; this module tests only
+    `database/service.py`'s `correct_trade_signal()`, which R6.5b does not
+    touch)
+
+# 16. Full Regression Result
+
+    python -m unittest discover -s tests -v
+    Ran 1146 tests in ~100s
+    OK (0 failures, 0 errors)
+
+Baseline immediately before R6.5b (end of R6.5a): 1126 tests, OK. R6.5b
+added exactly 20 new tests (15 in `tests/test_app.py`'s
+`CorrectSignalWorkflowTests`, 5 in `tests/test_correction_integration.py`'s
+new `LifecycleAwareUiCorrectionIntegrationTests`) with zero regressions
+across the entire existing suite.
+
+`git diff --check` was run after every change in this milestone and
+returned clean each time (only benign CRLF-normalization warnings on
+Windows, no whitespace or conflict-marker errors).
+
+# 17. Static Bypass Results
+
+    rg -n "service\.update_trade_signal\(" app/streamlit_app.py
+    -> no matches
+
+    rg -n "service\.correct_trade_signal\(" app/streamlit_app.py
+    -> exactly one match (the Save-Correction branch)
+
+    rg -n "conn\.(commit|rollback)\(" app/streamlit_app.py
+    -> exactly three executable matches, all inside the Manual Message
+       Entry Submit workflow; a fourth textual match exists only in this
+       module's own docstring prose (not executable code)
+
+# 18. Governance Confirmation
+
+    - Nothing was force-pushed; `git push origin main` completed as a
+      normal fast-forward (`a87fb9a..bd911ac`).
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+    - No `Co-Authored-By` trailer, or any other trailer, exists on the
+      R6.5b implementation commit (per this project's established
+      convention - `git log -1 --format="%(trailers)"` returns empty).
+    - All 12 pre-existing untracked files/directories were confirmed
+      present and untouched before, during, and after this milestone.
+    - Recovery Milestone R6.6 and R6.7 were not started - no code, test,
+      or documentation file related to either was created or modified at
+      any point during R6.5b.
+
+# 19. Current Stopping Point
+
+Recovery Milestone R6.5b is fully complete: implemented, tested (focused
+and full regression - 1146/1146), reviewed (including a correction pass
+that fixed a stale module-docstring paragraph before commit), committed
+locally, and pushed to `origin/main` at commit
+`bd911ac04c12e45e3501202f45124d7233ebe723`. Local `main` and
+`origin/main` are synchronized at that commit, 0 ahead / 0 behind.
+
+The lifecycle-safe correction UI is now available to the Product Owner:
+a trade signal - including one carrying a persisted `BOUGHT`/`SOLD`
+action or an out-of-list `option_type` - can be corrected through the
+Review Signals UI in a way that keeps its lifecycle generation
+consistent, with the correction transaction fully owned by the service
+and the form preserving entered values on every rejection.
+
+Recovery Milestone R6.6 (real-corpus acceptance) is the next candidate
+milestone. It has no reviewed design yet in the committed repository and
+must not begin without one, followed by a separate, explicit Product
+Owner approval to begin implementation - exactly the same two-step gate
+(design review, then implementation approval) that R6.5b itself passed
+through before this milestone began. R6.7, R7 (trader-performance
+analytics), and R8 (UI/dashboard) also remain unstarted with no reviewed
+design.
+
+This handoff (and the corresponding `docs/PROJECT_STATUS.md` update) are
+themselves new/updated but NOT YET staged, committed, or pushed as of
+the writing of this file - they are pending their own Product Owner /
+Technical Architect (ChatGPT) review, per this project's standard
+documentation workflow (see docs/REVIEW_RULES.md).
+
+# 20. Recommended Next-Session Starting Prompt
+
+Review the R6.5b TXT handoff and the current committed repository state.
+Plan Recovery Milestone R6.6 real-corpus acceptance only. Do not modify
+files until the R6.6 plan has been reviewed and approved. Do not begin
+R6.7, R7, or R8.
+
+# 21. Governance and Safety Reminders
+
+    - Per CLAUDE.md: Claude Code implements approved designs; it does
+      not design or approve features on its own. Never implement a new
+      feature before the design has been reviewed and approved. Before
+      writing code, explain the implementation plan and wait for
+      approval.
+    - Per docs/REVIEW_RULES.md and this project's established practice:
+      every milestone requires its own explicit design approval before
+      implementation, its own quality review after implementation, and
+      its own explicit approval before staging/committing and before
+      pushing. R6.5b followed this pattern through separately authorized
+      steps (verify the reviewed design against the committed repository
+      -> implement -> quality review -> correct one reviewer-identified
+      docstring contradiction -> commit -> push -> this documentation
+      pass), each individually authorized.
+    - Do not begin Recovery Milestone R6.6 without first producing a
+      reviewed design and obtaining explicit Product Owner implementation
+      approval. Do not begin R6.7, R7, or R8 - none has a reviewed
+      design yet and all remain far out of scope and unapproved.
+    - Never stage, commit, push, or tag without explicit, scoped
+      authorization for that exact action.
+    - This project's Git Safety Protocol (see CLAUDE.md) applies at
+      every step: no force-push, no history rewriting, no skipped hooks,
+      no destructive git operation without explicit authorization.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).

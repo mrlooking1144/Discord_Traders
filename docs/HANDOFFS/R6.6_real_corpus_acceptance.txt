@@ -1,0 +1,520 @@
+====================================================================
+Discord Traders - Recovery Milestone R6.6 Handoff
+Real-Corpus Lifecycle Acceptance
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources - see the repository's
+CLAUDE.md).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R6.6 - "Real-Corpus Lifecycle Acceptance."
+
+Status: R6.6 is COMPLETE - implemented, tested (focused and full
+regression), independently quality-reviewed (with corrections applied
+before commit), committed, and pushed to `origin/main`. Nothing from
+R6.7, R7, or R8 was started at any point during this milestone.
+
+Preceding milestones (all complete and pushed before R6.6 began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), R6.5a
+(the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract), and R6.5b (migrating the shipped "Correct Signal" UI to that
+API - see docs/HANDOFFS/R6.5b_lifecycle_safe_correction_ui_integration.txt).
+
+# 2. Exact Repository State
+
+Branch: main
+HEAD: 1cd09a1b29eb8e1cc9abd4dde4d865dea0b8adf4
+origin/main: 1cd09a1b29eb8e1cc9abd4dde4d865dea0b8adf4
+Ahead/behind: 0/0
+
+Nothing is staged. No tracked file outside the one file listed in section
+4 was modified by the R6.6 implementation commit. No tag was created or
+moved by this milestone. The pre-existing annotated tag `v0.1.0` remains
+unrelated and unchanged.
+
+The same 12 pre-existing untracked files/directories were preserved
+unchanged throughout this milestone: `CLAUDE.md`,
+`R6.4_quality_review_bundle.txt`, `app/__pycache__/`,
+`database/__pycache__/`, `docs/DATABASE_DESIGN_V1.md`,
+`docs/DECISIONS/DECISION_TEMPLATE.md`, `docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and `tests/__pycache__/`.
+
+# 3. Exact Implementation Commit
+
+Commit: 1cd09a1b29eb8e1cc9abd4dde4d865dea0b8adf4
+Message: Add real-corpus lifecycle acceptance tests
+
+(Single-line commit message, no body, no trailer of any kind - no
+`Co-Authored-By` or other trailer exists.)
+
+Parent commit (the approved baseline immediately before this milestone):
+    33d77e17928334074d51b7be1dcfbc6012126b2d
+    ("Update documentation for Recovery Milestone R6.5b")
+
+This commit was pushed to `origin/main` as a normal fast-forward
+(`33d77e1..1cd09a1`). No force-push was used. No amend, squash, or
+rebase occurred at any point in this milestone.
+
+# 4. Exact Committed File
+
+    tests/test_lifecycle_corpus_acceptance.py | 801 +++++++++++++++++++
+    1 file changed, 801 insertions(+)
+
+No other file is part of this commit. `app/discord_adapter.py`,
+`app/parser.py`, `app/datetime_resolution.py`, `app/streamlit_app.py`,
+`database/service.py`, `database/repository.py`, `database/lifecycle.py`,
+`database/models.py`, `database/schema.sql`, every file under
+`database/migrations/`, `tests/discord_corpus_fixture.py`,
+`tests/test_batch_ingestion_integration.py`, and every documentation file
+(including this one and `docs/PROJECT_STATUS.md`) were NOT part of the
+R6.6 implementation commit - this handoff and the corresponding
+`docs/PROJECT_STATUS.md` update are a separate, later, still-unstaged
+documentation change.
+
+# 5. Commit Statistics
+
+    1 file changed
+    801 insertions(+)
+    0 deletions(-)
+
+# 6. Milestone Purpose
+
+R6.6 adds acceptance testing only. It does not add or change:
+
+    - parser behavior (`app/parser.py` is unchanged);
+    - date/time resolution (`app/datetime_resolution.py` is unchanged);
+    - ingestion behavior (`TradeService.ingest_batch()` and its supporting
+      repository functions are unchanged);
+    - lifecycle-engine behavior (`database/lifecycle.py` is unchanged);
+    - repository APIs (`database/repository.py` is unchanged);
+    - service APIs (`database/service.py` is unchanged);
+    - database schema (`database/schema.sql` is unchanged);
+    - migrations (no new file under `database/migrations/`);
+    - UI behavior (`app/streamlit_app.py` is unchanged);
+    - trader-performance calculations (no such calculation exists yet -
+      that is Recovery Milestone R7's job, not this one's).
+
+R6.6 proves - for the first time in this codebase, against the real
+68-message Discord corpus rather than small synthetic fixtures - that the
+already-built R1-R6.5 pipeline correctly ingests, segments, extracts,
+resolves dates/times, and links every alert into the exact lifecycle
+outcome a human can verify by reading the corpus text itself, including
+its hardest cases: an `[ADD]` with no opener, exits with no opener at all
+(orphans), and a stop-out followed by a genuine re-entry in the same
+contract that must become two separate lifecycle generations.
+
+# 7. Production Pipeline Exercised
+
+    tests.discord_corpus_fixture.CORPUS
+    -> app.discord_adapter (segment_discord_batch())
+    -> app.parser.extract_trade_event()
+    -> app.datetime_resolution (resolve_expiration(), resolve_footer_timestamp())
+    -> TradeService.ingest_batch()
+    -> TradeService.rebuild_all_lifecycles()
+    -> persisted trade_lifecycles / trade_lifecycle_events
+    -> validate_lifecycle_membership_integrity()
+
+No lifecycle, parser, transaction, repository, or ingestion component was
+mocked anywhere in this test file. Every step above is the real,
+already-committed production code path, run against a real (temporary)
+SQLite database file.
+
+# 8. Temporary Database Isolation
+
+    - Every test uses a unique, file-backed temporary SQLite database
+      (`tempfile.mkstemp(prefix="r6_6_corpus_", suffix=".db")`) - never
+      an in-memory database, never a shared/reused one.
+    - Production `DatabaseConfig`, `initialize_database()`, and
+      `get_connection()` are used exactly as the real application uses
+      them - no test-only initialization path exists.
+    - Each of the four test classes
+      (`CorpusIngestionAndGlobalInvariantTests`, `CorpusLifecycleOracleTests`,
+      `CorpusAmbiguityFlagTests`, `CorpusLifecycleIdempotencyTests`) owns
+      its own independently created database via its own `setUpClass`,
+      under its own channel identifier
+      (`r6-6-ingestion-invariants`/`r6-6-oracle`/`r6-6-ambiguity`/
+      `r6-6-idempotency`); no class shares a database or a connection
+      with another.
+    - Cleanup (`os.remove()` of the temp file) is registered via
+      `addClassCleanup()` immediately after the temp file is created and
+      before `initialize_database()` or any other database operation
+      runs, so a failure at any point during setup still deletes the
+      file - no test run can leave a persistent temp database behind.
+    - The normal application database (the real `%LOCALAPPDATA%\
+      DiscordTraders\discord_traders.db`) is never accessed, created, or
+      modified by this suite.
+
+# 9. Transaction Ownership Correction (Quality-Review Finding)
+
+The first implementation draft's shared fixture helper
+(`_create_corpus_database()`) and the second-rebuild idempotency test
+each called an explicit `conn.commit()`/`write_conn.commit()` immediately
+after `TradeService.ingest_batch()` and after
+`TradeService.rebuild_all_lifecycles()`. The final quality-review pass
+identified this as a defect in test design, not merely a style
+preference: both service methods already own and commit their complete
+transaction internally via the pre-existing `_r5_write_transaction()`
+context manager (`database/service.py`) - issuing `BEGIN IMMEDIATE` and
+`COMMIT` themselves on success. A redundant caller-side commit could
+silently mask a future regression in which a service method stopped
+committing internally, since the test's own commit would paper over the
+missing one and every "fresh connection" durability assertion would keep
+passing for the wrong reason.
+
+All three such calls were removed before the commit described in Section
+3. The acceptance tests' fresh-connection durability proof now depends
+solely on `TradeService.ingest_batch()`'s and
+`TradeService.rebuild_all_lifecycles()`'s own internal commit behavior.
+The final committed test file
+(`tests/test_lifecycle_corpus_acceptance.py`) contains no executable
+caller-side `commit()` or `rollback()` call anywhere - verified via
+`rg -n "\.commit\(|\.rollback\("`, which matches only explanatory comment
+text, never executable code. All 35 focused tests were rerun after this
+correction with identical results (35/35 passing), confirming the
+removed calls were pure no-ops against the current, correctly-implemented
+production code.
+
+# 10. Ingestion Acceptance Result
+
+    total_segmented: 68
+    stored_count: 68
+    duplicate_count: 0
+    unrecognized_count: 0
+    failed_count: 0
+
+    raw_messages: 68
+    current message_extractions: 68
+    current trade_signals: 68
+    traders: 5
+
+# 11. First Lifecycle Rebuild Counters
+
+Exact `LifecycleRebuildResult` from the first `rebuild_all_lifecycles()`
+call against the freshly-ingested corpus:
+
+    keys_considered: 18
+    keys_changed: 18
+    keys_unchanged: 0
+    lifecycles_superseded: 0
+    lifecycles_created: 20
+    lifecycle_events_created: 68
+    signal_pointers_cleared: 0
+    signal_pointers_assigned: 68
+
+# 12. Global Lifecycle Invariants
+
+Proven through a fresh connection after the first rebuild:
+
+    Current lifecycle rows: 20
+    Distinct complete lifecycle keys: 18
+    Current lifecycle-event memberships: 68
+    Distinct current signals with lifecycle pointers: 68
+    Eligible current signals without lifecycle pointers: 0
+    Signals in more than one current lifecycle: 0
+    Membership integrity violations: []
+
+Also proven:
+
+    - all corpus sequences 1..68 appear exactly once across current
+      lifecycle memberships;
+    - no sequence is missing;
+    - no sequence is duplicated;
+    - every current lifecycle has at least one event;
+    - every lifecycle's event sequence_index values begin at 1 and are
+      contiguous (1, 2, 3, ... with no gap);
+    - every trade_lifecycle_events row's trade_signal_id agrees with that
+      same signal's trade_signals.lifecycle_id pointer, for every current
+      lifecycle.
+
+# 13. Exact Status Distribution
+
+    closed: 12
+    partially_closed: 4
+    open: 1
+    orphan: 2
+    unresolved: 1
+    invalid: 0
+
+# 14. Verified Lifecycle Oracle
+
+All 20 lifecycle generations across all 18 distinct lifecycle keys have
+their own focused test assertion. Every case is identified by its
+complete lifecycle key - trader, symbol, option type, Decimal-equivalent
+strike (so "380" and "380.0" can never cause a false mismatch), and
+expiration (every case resolves to "2026-07-24", since every corpus
+expiration token is a bare "07/24"/"7/24" resolved against the batch's
+`reference_date="2026-07-24"`) - plus the ordered `sequence_in_batch`
+values of its members, never by any database-generated ID. A dedicated
+cross-check test additionally proves all 20 named cases resolve to 20
+distinct `trade_lifecycles.id` values, so no two named cases are
+accidentally matching the same underlying row.
+
+Bdorts:
+    AVGO 380P - partially_closed, remaining 1/8, sequences [1,6,9,14,15]
+    AVGO 377.5P - closed, sequences [30,34]
+
+TC (all seven generations covered):
+    IBM 207.5C - closed, sequences [2,3,4,8,26,45]
+    NVDA 207.5C - closed, sequences [10,11,13]
+    QQQ 685P ADD - unresolved singleton, sequence [16]
+    QQQ 685P ALL OUT - orphan singleton, sequence [17]
+    QQQ 687C - closed, sequences [20,21,23,24]
+    MU 950C - partially_closed, remaining 1/4, sequences [50,51,54]
+    MU 955C - open, remaining 1, sequence [57]
+
+spacemonkey:
+    IBM 210C - orphan, sequences [5,7,35]
+    SPX 7440C - closed, sequences [22,28]
+    TSLA 310C - closed, sequences [31,32,33,36]
+    SPX 7450C - closed, sequences [37,38,39,40,44]
+    SPX 7470C - closed, sequences [46,48,49,56]
+    NVDA 210C - closed, sequences [58,59,60,61]
+    SPX 7430P first generation - closed, sequences [62,63]
+    SPX 7430P re-entry generation - closed, sequences [64,65,66,67,68]
+
+Matae:
+    TSLA 312.5P - closed, sequences [12,19,25,27,29]
+
+Sarang:
+    QQQ 690C - partially_closed, remaining 1/6, sequences [18,41,42,43,55]
+    JPM 352.5C - partially_closed, remaining 11/16, sequences [47,52,53]
+
+The TC QQQ 685P pair and the spacemonkey SPX 7430P pair (the two keys
+that each produced two generations) are disambiguated purely by their
+first member's `sequence_in_batch` (16 vs. 17; 62 vs. 64) - never by
+`lifecycle_id` ordering or value.
+
+# 15. Extraction-Layer Ambiguity Flags
+
+Exactly corpus sequences 13 and 34 have a current `message_extractions`
+row whose complete decoded `ambiguity_flags` list is:
+
+    ["expiration_year_missing", "stated_return_missing"]
+
+(Every one of the 68 extractions carries "expiration_year_missing" -
+every corpus expiration token is a bare "07/24"/"7/24" with no year;
+these two additionally lack a "$OLD -> $NEW (+NN%)" stated-return line.)
+
+`stated_return_missing` is asserted only at this extraction layer
+(`message_extractions.ambiguity_flags`, reached via
+`get_current_extraction()`), never as a `trade_lifecycles` ambiguity
+flag. The tests do not claim these are the only extraction flags
+anywhere in the corpus - they only prove the complete flag set for
+exactly the two rows that carry `stated_return_missing`.
+
+# 16. Lifecycle-Layer Ambiguity Flags
+
+    - Exactly one current lifecycle has a non-empty ambiguity flag list:
+      the TC QQQ 685P unresolved ADD singleton, member sequence [16].
+    - Its exact flags: ["ambiguous_add_no_open_position"]
+    - No current lifecycle contains "fraction_exceeds_remaining".
+    - Every other current lifecycle (19 of the 20) has semantic empty
+      flags - proven both via the normalized comparison used throughout
+      the oracle tests, and via a dedicated test confirming the raw
+      repository-level representation for those 19 rows is SQL NULL,
+      correctly decoded by `list_current_trade_lifecycles()` to Python
+      `None` (not an empty-list literal) - the storage representation and
+      its semantic meaning are never conflated.
+
+# 17. Strong Second-Rebuild Idempotency
+
+A second `rebuild_all_lifecycles()` call against the already-rebuilt
+corpus (in its own independently isolated database - never shared with
+any other test class) returns exactly:
+
+    keys_considered: 18
+    keys_changed: 0
+    keys_unchanged: 18
+    lifecycles_superseded: 0
+    lifecycles_created: 0
+    lifecycle_events_created: 0
+    signal_pointers_cleared: 0
+    signal_pointers_assigned: 0
+
+The tests compare, via fresh connections before and after this second
+call:
+
+    - current lifecycle IDs (identical);
+    - total lifecycle rows, including any historical/superseded rows
+      (identical - 20 before, 20 after, not merely "still 20 current");
+    - total lifecycle-event rows (identical - 68 before, 68 after);
+    - every signal's lifecycle_id pointer (identical, dict-for-dict);
+    - complete lifecycle shapes - key, status, remaining fraction,
+      opened-by/closed-by signal, decoded ambiguity flags, and ordered
+      member sequence tuple (identical);
+    - the immutable per-event `signal_snapshot` audit JSON, compared
+      verbatim alongside each event's `sequence_index` (identical);
+    - `validate_lifecycle_membership_integrity()` (still `[]` after the
+      second rebuild).
+
+The second rebuild performs zero writes of any kind - proven by counters
+and by direct before/after row-level comparison, not inferred from
+counters alone.
+
+# 18. Test Organization
+
+    _LifecycleCorpusAcceptanceTestCase   (shared temp-database plumbing)
+    CorpusIngestionAndGlobalInvariantTests
+    CorpusLifecycleOracleTests
+    CorpusAmbiguityFlagTests
+    CorpusLifecycleIdempotencyTests
+
+35 focused R6.6 tests passing. No test's correctness depends on
+unittest's method execution order - every class either opens a fresh
+connection per test method, or (for the read-only oracle class) reads a
+frozen class-level snapshot computed once in `setUpClass` and never
+mutated by any test method.
+
+# 19. Full Regression Result
+
+    python -m unittest discover -s tests -v
+    Ran 1181 tests in ~94-99s
+    OK (0 failures, 0 errors)
+
+Baseline immediately before R6.6 (end of R6.5b): 1146 tests, OK. R6.6
+added exactly 35 new tests with zero regressions across the entire
+existing suite. The full suite passed on the first final run with no
+Streamlit `AppTest` timeout (an isolated, previously-observed transient
+timeout pattern from an earlier milestone did not recur during this
+milestone's final validation passes).
+
+`git diff --no-index --check -- /dev/null tests/test_lifecycle_corpus_acceptance.py`
+returned exit code 1 (expected, since the file differs from empty) with
+only a benign CRLF-normalization notice - no actual trailing-whitespace,
+indentation, or conflict-marker error. `python -m py_compile` and
+`git diff --cached --check` both returned clean.
+
+# 20. Quality-Review Corrections
+
+Two corrections were made during this milestone's review pass, both
+before the commit in Section 3:
+
+    1. The implementation report initially stated "TC x6" lifecycle
+       cases. The actual test file always correctly contained all seven
+       TC lifecycle generation tests (IBM 207.5C, NVDA 207.5C, the QQQ
+       685P ADD/orphan singleton pair, QQQ 687C, MU 950C, MU 955C) - this
+       was a reporting arithmetic error in a prose summary, not a missing
+       test. No code change was required or made for this finding.
+    2. Three redundant caller-side `commit()` calls (see Section 9) were
+       discovered and removed before commit, since they could have masked
+       a future service-level transaction-commit regression.
+
+All 35 focused tests, the four directly-related pre-existing test
+modules (`tests.test_batch_ingestion_integration`, `tests.test_lifecycle`,
+`tests.test_service_lifecycle`, `tests.test_service_correction_lifecycle`),
+and the full 1181-test suite were rerun after both corrections, with
+identical (fully passing) results each time.
+
+# 21. Governance Confirmation
+
+    - Exactly one implementation file was committed:
+      `tests/test_lifecycle_corpus_acceptance.py`.
+    - No production file, schema file, migration file, or existing test
+      file was changed by this milestone's implementation commit.
+    - `git push origin main` completed as a normal fast-forward
+      (`33d77e1..1cd09a1`); no force-push occurred.
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+    - No `Co-Authored-By` trailer, or any other trailer, exists on the
+      R6.6 implementation commit (`git log -1 --format="%(trailers)"`
+      returns empty).
+    - The same 12 pre-existing unrelated untracked files/directories were
+      confirmed present and untouched before, during, and after the R6.6
+      implementation commit. All 12 pre-existing unrelated untracked
+      entries remain present and untouched. During this documentation
+      update, `git status --short` shows 13 untracked entries total: the
+      same 12 pre-existing entries plus the new, unstaged
+      `docs/HANDOFFS/R6.6_real_corpus_acceptance.txt` file (this file
+      itself) - not a change to any pre-existing entry.
+    - Recovery Milestone R6.7, R7, and R8 were not started - no code,
+      test, or documentation file related to any of them was created or
+      modified at any point during R6.6.
+
+# 22. Current Stopping Point
+
+Recovery Milestone R6.6 is fully complete: implemented, tested (focused
+and full regression - 1181/1181), reviewed (including the two corrections
+in Section 20, applied and re-verified before commit), committed, and
+pushed to `origin/main` at commit
+`1cd09a1b29eb8e1cc9abd4dde4d865dea0b8adf4` ("Add real-corpus lifecycle
+acceptance tests"). Local `main` and `origin/main` are synchronized at
+that commit, 0 ahead / 0 behind.
+
+R6.6 proves that the real 68-message Discord corpus is correctly
+ingested, segmented, extracted, date/time-resolved, and linked into
+exactly the lifecycle outcome a human can verify by reading the corpus -
+including its hardest cases (the unmatched ADD, the orphan exits, and the
+stop-out-then-re-entry pair). Trader-performance calculations are
+explicitly not part of R6.6: Recovery Milestone R7 (trader-performance
+analytics) and R8 (trader-performance dashboard/UI) remain necessary
+before the Product Owner can view and compare every trader's performance
+in the completed application.
+
+The next candidate milestone is Recovery Milestone R6.7 - scope requires
+separate planning. No committed roadmap document defines R6.7's specific
+title or scope as of this handoff; every existing reference to it in this
+repository (docs/DECISIONS/0002_trade_lifecycle_schema.md,
+docs/HANDOFFS/R6.5a_lifecycle_safe_trade_signal_correction.txt,
+docs/HANDOFFS/R6.5b_lifecycle_safe_correction_ui_integration.txt, and
+docs/PROJECT_STATUS.md itself) names it only as a placeholder identifier,
+never with a descriptive title. R6.7 must not begin without its own
+design review and explicit Product Owner approval - exactly the same
+two-step gate every prior Recovery milestone in this project has passed
+through before implementation began.
+
+This handoff (and the corresponding `docs/PROJECT_STATUS.md` update) are
+themselves new/updated but NOT YET staged, committed, or pushed as of the
+writing of this file - they are pending their own Product Owner /
+Technical Architect (ChatGPT) review, per this project's standard
+documentation workflow (see docs/REVIEW_RULES.md).
+
+# 23. Recommended Next-Session Starting Prompt
+
+Review the R6.6 TXT handoff and the current committed repository state.
+Determine the exact committed roadmap scope for Recovery Milestone R6.7
+and plan R6.7 only. Do not modify files until the R6.7 plan has been
+reviewed and approved. Do not begin R7 or R8.
+
+# 24. Governance and Safety Reminders
+
+    - Per CLAUDE.md: Claude Code implements approved designs; it does
+      not design or approve features on its own. Never implement a new
+      feature before the design has been reviewed and approved. Before
+      writing code, explain the implementation plan and wait for
+      approval.
+    - Per docs/REVIEW_RULES.md and this project's established practice:
+      every milestone requires its own explicit design approval before
+      implementation, its own quality review after implementation, and
+      its own explicit approval before staging/committing and before
+      pushing. R6.6 followed this pattern through separately authorized
+      steps (verify the proposed oracle against the committed engine ->
+      implement -> quality review -> correct the transaction-ownership
+      finding -> commit -> push -> this documentation pass), each
+      individually authorized.
+    - Do not begin Recovery Milestone R6.7 without first confirming its
+      exact scope from the committed roadmap (or, if none exists,
+      producing a newly reviewed design for it) and obtaining explicit
+      Product Owner implementation approval. Do not begin R7 or R8 -
+      neither has a reviewed design yet and both remain out of scope and
+      unapproved.
+    - Never stage, commit, push, or tag without explicit, scoped
+      authorization for that exact action.
+    - This project's Git Safety Protocol (see CLAUDE.md) applies at every
+      step: no force-push, no history rewriting, no skipped hooks, no
+      destructive git operation without explicit authorization.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).

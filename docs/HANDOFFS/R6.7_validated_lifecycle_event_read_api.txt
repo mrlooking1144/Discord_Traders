@@ -1,0 +1,449 @@
+====================================================================
+Discord Traders - Recovery Milestone R6.7 Handoff
+Validated Lifecycle Event Read API
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R6.7 - "Validated Lifecycle Event Read
+API."
+
+Status: R6.7 implementation is COMPLETE LOCALLY - implemented, tested
+(focused and full regression), independently quality-reviewed (with two
+correction passes applied before commit, see Section 13), and committed
+locally. Documentation for this milestone is NOT YET committed as of
+this handoff, and the implementation commit has not yet been pushed to
+`origin/main`. Recovery Milestone R6.7 is not considered fully complete
+until the documentation commit is reviewed, approved, committed, and
+both commits are pushed. Nothing from R7 or R8 was started at any point
+during this milestone.
+
+Preceding milestones (all complete and pushed before R6.7 began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), R6.5a
+(the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract), R6.5b (migrating the shipped "Correct Signal" UI to that
+API), and R6.6 (real-corpus lifecycle acceptance testing against the
+real 68-message Discord corpus - see
+docs/HANDOFFS/R6.6_real_corpus_acceptance.txt).
+
+# 2. Purpose
+
+Recovery Milestone R6.6 proved that the real 68-message Discord corpus
+is correctly ingested, segmented, extracted, date/time-resolved, and
+linked into lifecycle generations. Trader-performance analytics (R7)
+will eventually need to read that persisted lifecycle-event evidence,
+but no such read path existed anywhere above the repository layer:
+`database.repository.get_trade_lifecycle_events()` deliberately returns
+its `TradeLifecycleEvent.signal_snapshot` field as raw, undecoded JSON
+text by design - its own docstring assigns decoding responsibility to
+`TradeService`, matching the existing precedent of
+`trade_signal_edits.previous_values` being decoded only by
+`TradeService.list_trade_signal_audit_history()`, never by the
+repository layer itself.
+
+R6.7 closes exactly this one missing boundary:
+
+    - Expose one new public `TradeService` method that returns a
+      lifecycle generation's persisted event history.
+    - Validate and decode every event's immutable `signal_snapshot`
+      before it is ever returned, reusing the existing, already-proven
+      validator - never a second, parallel decoding implementation.
+    - Guarantee that no public caller of this new method can ever
+      receive raw, undecoded `signal_snapshot` JSON text - only a
+      structurally validated Python dict.
+
+R6.7 adds no aggregation, no return/P&L calculation, no trader-ranking
+logic, and no UI. It is a narrow, provider-independent service-boundary
+prerequisite, not R7 itself.
+
+# 3. Repository Baseline
+
+Repository: Discord_Traders (mrlooking1144/Discord_Traders)
+Branch: main
+
+Parent synchronized commit (the approved baseline immediately before
+this milestone):
+    8535da58cc06ab5cf5eba23e893e820cb96da538
+    ("Update documentation for Recovery Milestone R6.6")
+
+R6.7 implementation commit:
+    8329b81f0fc0a06ddc1cd840de0a8f8dd59a0d54
+    ("Add validated lifecycle event read API")
+
+State immediately before this documentation commit: local `main` is one
+commit ahead of `origin/main` (the R6.7 implementation commit only);
+`origin/main` remains at `8535da58cc06ab5cf5eba23e893e820cb96da538`.
+Nothing has been pushed yet. No tag was created or moved. The
+pre-existing annotated tag `v0.1.0` remains unrelated and unchanged.
+
+The same 12 pre-existing untracked files/directories were preserved
+unchanged throughout this milestone: `CLAUDE.md`,
+`R6.4_quality_review_bundle.txt`, `app/__pycache__/`,
+`database/__pycache__/`, `docs/DATABASE_DESIGN_V1.md`,
+`docs/DECISIONS/DECISION_TEMPLATE.md`, `docs/DECISIONS/README.md`,
+`docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt`,
+`docs/HANDOFFS/HANDOFF_TEMPLATE.md`, `docs/HANDOFFS/README.md`,
+`docs/REVIEW_RULES.md`, and `tests/__pycache__/`.
+
+# 4. Exact Implementation Files
+
+    database/service.py   |  63 +++++++++-
+    tests/test_service.py | 317 ++++++++++++++++++++++++++++++++++++++++++++++++++
+    2 files changed, 376 insertions(+), 4 deletions(-)
+
+No other file is part of the R6.7 implementation commit. `database/
+repository.py`, `database/lifecycle.py`, `database/models.py`,
+`database/schema.sql`, every file under `database/migrations/`, `app/
+streamlit_app.py`, `app/parser.py`, `app/discord_adapter.py`, and every
+documentation file were NOT part of the R6.7 implementation commit -
+this handoff and the corresponding `docs/PROJECT_STATUS.md` update are a
+separate, later, still-unstaged documentation change.
+
+# 5. Exact Production Change
+
+New public method on `database.service.TradeService`:
+
+    TradeService.list_trade_lifecycle_events(
+        self,
+        trade_lifecycle_id: int,
+    ) -> list[dict]
+
+Behavior:
+
+    - Calls `database.repository.get_trade_lifecycle_events(self.conn,
+      trade_lifecycle_id)` to retrieve one lifecycle generation's
+      membership, already ordered by `sequence_index` ascending at the
+      SQL layer.
+    - Preserves the repository-provided order exactly - no re-sorting
+      of any kind is performed inside the service method.
+    - Validates and decodes every event's `signal_snapshot` by calling
+      the existing, completely unmodified private
+      `_validate_and_decode_snapshot(trade_lifecycle_id, event)` - the
+      same validator `rebuild_all_lifecycles()`/
+      `rebuild_lifecycles_for_raw_message_ids()` already use internally.
+      No second decoding or validation implementation exists anywhere in
+      this codebase.
+    - Returns a list of plain dicts, one per event, each containing
+      exactly these six keys:
+          id
+          trade_lifecycle_id
+          trade_signal_id
+          sequence_index
+          created_at
+          snapshot
+      where `snapshot` is the decoded dict returned by
+      `_validate_and_decode_snapshot()` - never the raw JSON text. No
+      extra key is ever added.
+    - Returns `[]` when the repository returns no events for the given
+      `trade_lifecycle_id` (a generation with no members, or a
+      nonexistent id) - matching the wrapped repository function's own
+      empty-list contract exactly.
+    - Raises `LifecycleSnapshotError`, propagated completely unchanged
+      from `_validate_and_decode_snapshot()`, for any malformed or
+      contradictory snapshot evidence - never caught, wrapped,
+      suppressed, or reinterpreted by this method.
+    - Performs no write of any kind.
+    - Opens no transaction.
+    - Calls neither `commit()` nor `rollback()` anywhere in its body.
+
+# 6. LifecycleSnapshotError Clarification
+
+`LifecycleSnapshotError`'s class docstring (`database/service.py`) was
+corrected as part of this milestone. Before R6.7, the docstring stated
+this exception fires "while rebuilding a lifecycle key" and "always
+aborts the entire rebuild call (rolled back by the caller)" - both
+became inaccurate the moment a pure read call could also raise it, since
+a read has no rebuild to abort and nothing was ever written to roll
+back.
+
+The corrected docstring now states, once and without contradiction, that
+`LifecycleSnapshotError` is raised when persisted lifecycle-event
+snapshot evidence cannot be safely decoded or validated; that this may
+occur either during a lifecycle rebuild or during
+`TradeService.list_trade_lifecycle_events()`; that malformed or
+contradictory evidence is never silently accepted; that during a
+rebuild, propagation causes the owning rebuild transaction to roll back;
+and that during a read-only query, no write was ever attempted, so there
+is nothing to roll back - the caller simply receives the exception
+instead of a result.
+
+The exception's constructor (`__init__(self, trade_lifecycle_id,
+trade_lifecycle_event_id, reason)`) and its runtime behavior (the exact
+message it builds, its attributes) are completely unchanged - this was a
+documentation-only correction to an existing, unmodified exception type.
+
+# 7. Snapshot Validation Contract
+
+`_validate_and_decode_snapshot()` (unchanged by R6.7 - see Section 9)
+enforces, in order:
+
+    - `signal_snapshot` must be valid JSON (a `json.JSONDecodeError` or
+      `TypeError` is caught and re-raised as `LifecycleSnapshotError`).
+    - The decoded value must be a JSON object (a Python `dict`) - a JSON
+      array, scalar, or string is rejected.
+    - The decoded `trade_signal_id` must be present and a plain integer
+      (booleans explicitly rejected, even though `bool` is a Python
+      `int` subclass and `True == 1`).
+    - The decoded `trade_signal_id` must equal the event row's own
+      `trade_signal_id` column exactly.
+    - The decoded `raw_message_id` must be present and a plain integer.
+    - `ordering_key` must be present and a JSON array in one of exactly
+      two canonical shapes:
+          [raw_message_id, trade_signal_id]                  (2 elements)
+          [received_at, raw_message_id, trade_signal_id]     (3 elements,
+              received_at a non-empty string)
+      with both trailing elements plain integers (never bool) in either
+      shape.
+    - `ordering_key`'s embedded `raw_message_id` must equal the
+      snapshot's own `raw_message_id`, and its embedded
+      `trade_signal_id` must equal the snapshot's own (already-verified)
+      `trade_signal_id`.
+    - Every field in `_REQUIRED_SNAPSHOT_FIELDS` must be present:
+      `trade_signal_id`, `raw_message_id`, `trader_id`, `symbol`,
+      `option_type`, `strike`, `expiration`, `event_type`, `qualifier`,
+      `action`, `price`, `stated_entry_price`, `stated_return_pct`,
+      `notes`, `extraction_id`, `ordering_key`.
+
+Any violation raises `LifecycleSnapshotError`, identically whether
+encountered during a rebuild or during
+`TradeService.list_trade_lifecycle_events()`.
+
+# 8. Test Coverage
+
+New test class: `TradeServiceLifecycleReadTests`, added to
+`tests/test_service.py` immediately after the existing
+`TradeServiceListTradeSignalsForReviewTests` class (this project's
+established precedent location for `TradeService` read-delegation
+tests).
+
+19 focused tests, covering:
+
+    - Repository delegation: exact positional call arguments
+      (`self.connection, trade_lifecycle_id`).
+    - Empty repository result returns `[]`.
+    - The returned `snapshot` value is a decoded dict, never a raw JSON
+      string, and contains exactly the `_REQUIRED_SNAPSHOT_FIELDS` keys.
+    - Each returned entry contains exactly the six approved metadata
+      keys, with values matching the source event.
+    - Order preservation: events fed to the (mocked) repository call out
+      of `sequence_index` numeric order are returned in that exact same
+      order, proving no re-sort is applied anywhere in the method.
+    - Invalid JSON raises `LifecycleSnapshotError`.
+    - Non-object JSON (a JSON array, a JSON scalar, and a JSON string)
+      each raise `LifecycleSnapshotError`.
+    - A snapshot missing a required field raises `LifecycleSnapshotError`.
+    - A decoded `trade_signal_id` that disagrees with the event row's
+      own `trade_signal_id` column raises `LifecycleSnapshotError`.
+    - `ordering_key` validation: wrong type, wrong length, and mismatched
+      `raw_message_id`/`trade_signal_id` identities in both the
+      two-element and three-element canonical forms, plus a blank
+      `received_at` in the three-element form.
+    - Caller-owned transaction preservation: using a real, file-backed
+      temporary SQLite database, an uncommitted probe write is made on
+      the connection before calling the new method; after the call,
+      `connection.in_transaction` is confirmed still `True`, and a
+      second, independent connection to the same database file confirms
+      the uncommitted probe row is not visible (proving the read never
+      triggered an implicit commit); the original connection is then
+      explicitly rolled back and the row's continued absence is
+      reconfirmed.
+
+Quality-review correction to this test suite (see Section 13 for the
+full review history): the initial `test_ordering_key_wrong_type_raises`
+test passed the Python string `"not-a-list"` through the same
+`SignalSnapshot`/`build_signal_snapshot_json()` construction helper used
+by the other ordering-key tests. That serializer stores
+`list(snapshot.ordering_key)` - so `list("not-a-list")` silently became
+a 10-element JSON array of individual characters, not a JSON string,
+meaning the test was actually (and only accidentally) re-exercising the
+"wrong length" validator branch rather than the intended "ordering_key
+is not a JSON array" branch. The corrected test instead decodes an
+otherwise-valid snapshot's JSON, directly overwrites the decoded dict's
+`ordering_key` value with the genuine string `"not-a-list"`, and
+re-serializes with plain `json.dumps()` before constructing the test
+`TradeLifecycleEvent` - so the persisted raw JSON actually contains a
+JSON string value for `ordering_key`, correctly exercising the intended
+branch. The separate `test_ordering_key_wrong_length_raises` test (a
+genuine one-element list, `[99]`) was left unchanged, so wrong-type and
+wrong-length now remain two independently, correctly targeted tests. The
+other five ordering-key mismatch/blank tests -
+`test_ordering_key_two_element_mismatched_raw_message_id_raises`,
+`test_ordering_key_two_element_mismatched_trade_signal_id_raises`,
+`test_ordering_key_three_element_mismatched_raw_message_id_raises`,
+`test_ordering_key_three_element_mismatched_trade_signal_id_raises`,
+and `test_ordering_key_three_element_blank_received_at_raises` - were
+reviewed and confirmed to already pass genuine Python lists through the
+same construction path unaffected by this issue - their names were
+confirmed to already match the exact validator branch each one
+exercises.
+
+# 9. Test Results
+
+    TradeServiceLifecycleReadTests:              19/19 passing
+    tests/test_service.py (full):                190/190 passing
+    tests/test_service_lifecycle.py (unchanged):  74/74 passing
+    tests/test_service_correction_lifecycle.py
+        (unchanged):                              26/26 passing
+    tests/test_repository_recovery.py (unchanged): 149/149 passing
+    tests/test_lifecycle_corpus_acceptance.py
+        (unchanged):                               35/35 passing
+
+    Full suite: 1200/1200 passing, 0 failures, 0 errors
+    (1181 pre-existing + 19 new)
+
+    `git diff --check`: passed (only benign CRLF-normalization warnings
+    on Windows, no whitespace or conflict-marker errors)
+
+# 10. Initial Transient Full-Suite Event
+
+One initial full-suite run during this milestone's verification
+encountered a single error: `RuntimeError: AppTest script run timed out
+after 3(s)` inside `tests/test_app.py`'s
+`CorrectSignalWorkflowTests.test_action_choices_exactly_approved_for_standard_action`
+- a file completely untouched by the R6.7 implementation commit
+(confirmed via `git status --porcelain -- tests/test_app.py` showing no
+change). This is the same class of transient Streamlit `AppTest` timeout
+previously documented as having occurred in earlier milestones (see
+docs/HANDOFFS/R6.6_real_corpus_acceptance.txt, Section 19). The same
+test was immediately rerun in isolation and passed in 0.714 seconds
+(well under the 3-second ceiling it hit under full-suite load). A full
+confirming rerun of the entire suite afterward passed all 1200 tests
+with 0 failures and 0 errors. No R6.7 implementation file or test file
+caused this timeout, and it did not recur on the confirming rerun.
+
+# 11. Explicit Out of Scope
+
+The following were explicitly excluded from R6.7 and remain unstarted:
+
+    - A `list_current_trade_lifecycles` service wrapper (or any bounded/
+      unbounded lifecycle-listing service method).
+    - Lifecycle pagination or any analytics-complete lifecycle query
+      contract.
+    - Trader-performance analytics of any kind.
+    - Realized or unrealized return/P&L calculation.
+    - Fraction/quantity calculation.
+    - Trader ranking or comparison.
+    - Any UI or dashboard work (R8).
+    - Any repository-query change (`database/repository.py` is
+      completely unmodified by this milestone).
+    - Any schema or migration change.
+    - Any parser or Discord-adapter change.
+    - Any lifecycle-engine (`database/lifecycle.py`) change.
+    - Recovery Milestone R7 and Recovery Milestone R8, in full.
+
+# 12. Architecture Notes
+
+    - `database/repository.py`'s `get_trade_lifecycle_events()` and
+      `_row_to_trade_lifecycle_event()` continue to return
+      `signal_snapshot` as raw, undecoded JSON text, exactly as before -
+      the repository layer's contract is completely unchanged.
+    - `TradeService` is now the sole owner of public decoding/validation
+      for lifecycle-event snapshots, matching the same layering already
+      established for `trade_signal_edits.previous_values` via
+      `list_trade_signal_audit_history()`. No raw JSON is ever returned
+      by the new public method.
+    - The immutable per-event `signal_snapshot` remains completely
+      independent of any later correction to the live `trade_signals`
+      row it was built from (per `docs/DECISIONS/0002_trade_lifecycle_schema.md`'s
+      original auditability design) - R6.7 exposes this existing
+      guarantee through the service boundary; it does not alter it in
+      any way.
+    - The architecture remains modular and provider-independent: this
+      change touches only the service layer's read surface for a
+      Discord-sourced (or any future source's) lifecycle already
+      persisted through the existing, source-independent
+      `trade_lifecycles`/`trade_lifecycle_events` tables.
+
+# 13. Quality-Review History
+
+R6.7 went through three planning/review rounds before implementation was
+approved, then one implementation-stage review round:
+
+    1. Initial planning proposed a broader read surface (multiple
+       repository wrappers, including a bounded `list_current_
+       trade_lifecycles` listing method). A correction pass narrowed
+       this: a raw pass-through of `TradeLifecycleEvent.signal_snapshot`
+       was rejected outright, since `get_trade_lifecycle_events()`'s own
+       docstring explicitly assigns decoding responsibility to
+       `TradeService`, never to a bare pass-through consumer.
+    2. A second correction pass removed the bounded `list_current_
+       trade_lifecycles` listing wrapper from R6.7's scope entirely
+       (deferring any lifecycle-listing/analytics-query contract to
+       R7's own future design), narrowing the approved milestone to
+       exactly one method: `list_trade_lifecycle_events()`.
+    3. A third correction pass verified the `LifecycleSnapshotError`
+       docstring accurately covered both rebuild-time and read-time use
+       (Section 6) and confirmed no duplicate/contradictory wording
+       existed in the implemented file.
+    4. After implementation, a quality-review pass identified the
+       ineffective `test_ordering_key_wrong_type_raises` test (Section
+       8) and it was corrected before this documentation was prepared.
+
+The final design and implementation - exactly one new `TradeService`
+method, zero repository changes, zero lifecycle-engine changes, 19
+focused tests, full 1200-test regression passing - passed this review
+process.
+
+# 14. Git and Governance State
+
+    - No `Co-Authored-By` trailer exists on the R6.7 implementation
+      commit (`git log -1 --format="%(trailers)"` returns empty; the
+      commit message body contains no such text).
+    - The implementation commit has NOT been pushed to `origin/main` as
+      of this handoff; local `main` is one commit ahead.
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+    - All 12 pre-existing unrelated untracked files/directories were
+      confirmed present and untouched throughout this milestone (see
+      Section 3 for the complete list).
+    - Recovery Milestone R7 and R8 were not started - no code, test, or
+      documentation file related to either was created or modified at
+      any point during R6.7.
+
+# 15. Next Action
+
+    1. Review and commit this documentation update (this handoff plus
+       the corresponding `docs/PROJECT_STATUS.md` update) - not yet
+       staged or committed as of this handoff.
+    2. Push the R6.7 implementation commit
+       (`8329b81f0fc0a06ddc1cd840de0a8f8dd59a0d54`) and the documentation
+       commit to `origin/main` only after explicit Product Owner
+       approval.
+    3. Verify local `main` and `origin/main` become identical (0 ahead /
+       0 behind) after that push.
+    4. Recovery Milestone R7 (trader-performance analytics) planning
+       remains separately gated: it has no reviewed design yet and must
+       not begin without its own explicit Product Owner / Technical
+       Architect (ChatGPT) approval, exactly as every prior milestone in
+       this project (most recently R6.7 itself) required before its own
+       implementation began. Recovery Milestone R8 remains equally
+       unstarted and unapproved.
+
+# 16. Governance and Safety Reminders
+
+    - Per this project's established practice: every milestone requires
+      its own explicit design approval before implementation, its own
+      quality review after implementation, and its own explicit approval
+      before staging/committing and before pushing. R6.7 followed this
+      pattern through separately authorized steps (plan -> narrow scope
+      twice -> implement -> quality review -> correct one test defect ->
+      commit locally -> this documentation pass), each individually
+      authorized.
+    - Do not push this milestone's commits, and do not begin Recovery
+      Milestone R7 or R8, without a separate, explicit Product Owner
+      approval for each of those distinct actions.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).

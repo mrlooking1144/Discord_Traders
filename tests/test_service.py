@@ -27,14 +27,17 @@ from app.discord_adapter import segment_discord_batch
 from database import repository
 from database.config import DatabaseConfig
 from database.db import get_connection, initialize_database
+from database.lifecycle import SignalSnapshot
 from database.models import (
     BatchIngestResult,
     ChannelCheckpoint,
     MessageIngestOutcome,
     ReprocessBatchResult,
     ReprocessOutcome,
+    TradeLifecycleEvent,
 )
 from database.repository import (
+    build_signal_snapshot_json,
     create_raw_message,
     create_trade_signal,
     create_trader,
@@ -51,10 +54,12 @@ from database.service import (
     AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING,
     DUPLICATE_WINDOW_MINUTES,
     AuditHistoryError,
+    LifecycleSnapshotError,
     ReprocessingNotSupportedError,
     StaleTradeSignalError,
     TradeService,
     TradeSignalNotFoundError,
+    _REQUIRED_SNAPSHOT_FIELDS,
     _resolve_external_id,
 )
 from tests.discord_corpus_fixture import CORPUS
@@ -977,6 +982,318 @@ class TradeServiceListTradeSignalsForReviewTests(unittest.TestCase):
             date="2026-01-01",
             limit=100,
         )
+
+
+class TradeServiceLifecycleReadTests(unittest.TestCase):
+    """Covers Recovery Milestone R6.7:
+    TradeService.list_trade_lifecycle_events()."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+        self.service = TradeService(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    @staticmethod
+    def _snapshot_json(trade_signal_id, raw_message_id, ordering_key=None):
+        """Build byte-correct canonical snapshot JSON via the real
+        production serializer (database.repository.build_signal_snapshot_json()),
+        never hand-rolled, so these fixtures can never silently drift from
+        what production code actually persists."""
+        if ordering_key is None:
+            ordering_key = (raw_message_id, trade_signal_id)
+        snapshot = SignalSnapshot(
+            trade_signal_id=trade_signal_id,
+            raw_message_id=raw_message_id,
+            trader_id=1,
+            symbol="SPY",
+            option_type="call",
+            strike="500",
+            expiration="2026-12-18",
+            event_type="ENTRY",
+            qualifier=None,
+            action="BTO",
+            price="3.25",
+            stated_entry_price=None,
+            stated_return_pct=None,
+            notes=None,
+            extraction_id=None,
+            ordering_key=ordering_key,
+        )
+        return build_signal_snapshot_json(snapshot)
+
+    def _valid_event(
+        self, *, id=1, trade_lifecycle_id=42, trade_signal_id=7,
+        sequence_index=1, raw_message_id=99, created_at="2026-07-24 04:30:00",
+        ordering_key=None,
+    ):
+        return TradeLifecycleEvent(
+            id=id,
+            trade_lifecycle_id=trade_lifecycle_id,
+            trade_signal_id=trade_signal_id,
+            sequence_index=sequence_index,
+            signal_snapshot=self._snapshot_json(
+                trade_signal_id, raw_message_id, ordering_key
+            ),
+            created_at=created_at,
+        )
+
+    # -- 1. Repository delegation -----------------------------------
+
+    def test_delegates_to_repository_function_with_given_arguments(self):
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[],
+        ) as mock_get:
+            self.service.list_trade_lifecycle_events(42)
+
+        mock_get.assert_called_once_with(self.connection, 42)
+
+    # -- 2. Empty result ----------------------------------------------
+
+    def test_empty_repository_result_returns_empty_list(self):
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[],
+        ):
+            result = self.service.list_trade_lifecycle_events(42)
+
+        self.assertEqual(result, [])
+
+    # -- 3. Decoded snapshot result -----------------------------------
+
+    def test_snapshot_is_decoded_dict_not_raw_json(self):
+        event = self._valid_event()
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            result = self.service.list_trade_lifecycle_events(event.trade_lifecycle_id)
+
+        snapshot = result[0]["snapshot"]
+        self.assertIsInstance(snapshot, dict)
+        self.assertNotIsInstance(snapshot, str)
+        self.assertEqual(set(snapshot.keys()), set(_REQUIRED_SNAPSHOT_FIELDS))
+
+    # -- 4. Exact event metadata ---------------------------------------
+
+    def test_result_contains_exactly_the_approved_metadata_keys(self):
+        event = self._valid_event(
+            id=5, trade_lifecycle_id=42, trade_signal_id=7, sequence_index=3,
+            created_at="2026-07-24 05:00:00",
+        )
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            result = self.service.list_trade_lifecycle_events(42)
+
+        self.assertEqual(len(result), 1)
+        entry = result[0]
+        self.assertEqual(
+            set(entry.keys()),
+            {"id", "trade_lifecycle_id", "trade_signal_id", "sequence_index",
+             "created_at", "snapshot"},
+        )
+        self.assertEqual(entry["id"], event.id)
+        self.assertEqual(entry["trade_lifecycle_id"], event.trade_lifecycle_id)
+        self.assertEqual(entry["trade_signal_id"], event.trade_signal_id)
+        self.assertEqual(entry["sequence_index"], event.sequence_index)
+        self.assertEqual(entry["created_at"], event.created_at)
+
+    # -- 5. Ordering preservation ---------------------------------------
+
+    def test_returned_order_matches_repository_order_exactly(self):
+        # Deliberately fed out of sequence_index numeric order (5, 1, 3),
+        # so a test that merely checked "ascending order" could not
+        # distinguish "preserved" from "silently re-sorted." The service
+        # must return exactly this order, proving no sort is applied.
+        event_a = self._valid_event(id=1, trade_signal_id=10, sequence_index=5)
+        event_b = self._valid_event(id=2, trade_signal_id=11, sequence_index=1)
+        event_c = self._valid_event(id=3, trade_signal_id=12, sequence_index=3)
+        with patch(
+            "database.service.get_trade_lifecycle_events",
+            return_value=[event_a, event_b, event_c],
+        ):
+            result = self.service.list_trade_lifecycle_events(42)
+
+        self.assertEqual(
+            [entry["sequence_index"] for entry in result], [5, 1, 3],
+        )
+        self.assertEqual(
+            [entry["id"] for entry in result], [1, 2, 3],
+        )
+
+    # -- 6. Invalid JSON --------------------------------------------------
+
+    def test_invalid_json_raises_lifecycle_snapshot_error(self):
+        event = self._valid_event()
+        event = TradeLifecycleEvent(
+            id=event.id, trade_lifecycle_id=event.trade_lifecycle_id,
+            trade_signal_id=event.trade_signal_id,
+            sequence_index=event.sequence_index,
+            signal_snapshot="not json at all", created_at=event.created_at,
+        )
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(event.trade_lifecycle_id)
+
+    # -- 7. Non-object JSON -------------------------------------------------
+
+    def _event_with_raw_snapshot(self, raw_text):
+        return TradeLifecycleEvent(
+            id=1, trade_lifecycle_id=42, trade_signal_id=7,
+            sequence_index=1, signal_snapshot=raw_text,
+            created_at="2026-07-24 04:30:00",
+        )
+
+    def test_json_array_raises_lifecycle_snapshot_error(self):
+        event = self._event_with_raw_snapshot(json.dumps([1, 2, 3]))
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    def test_json_scalar_raises_lifecycle_snapshot_error(self):
+        event = self._event_with_raw_snapshot(json.dumps(42))
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    def test_json_string_raises_lifecycle_snapshot_error(self):
+        event = self._event_with_raw_snapshot(json.dumps("just a string"))
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    # -- 8. Missing required field --------------------------------------
+
+    def test_missing_required_field_raises_lifecycle_snapshot_error(self):
+        decoded = json.loads(self._snapshot_json(7, 99))
+        del decoded["price"]
+        event = self._event_with_raw_snapshot(json.dumps(decoded))
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    # -- 9. trade_signal_id mismatch --------------------------------------
+
+    def test_mismatched_trade_signal_id_raises_lifecycle_snapshot_error(self):
+        # The snapshot's own embedded trade_signal_id (7) must match the
+        # event row's trade_signal_id column - here the event column is a
+        # different value (8), which the validator must reject.
+        event = TradeLifecycleEvent(
+            id=1, trade_lifecycle_id=42, trade_signal_id=8,
+            sequence_index=1, signal_snapshot=self._snapshot_json(7, 99),
+            created_at="2026-07-24 04:30:00",
+        )
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    # -- 10. ordering_key validation --------------------------------------
+
+    def _assert_ordering_key_rejected(self, ordering_key):
+        event = self._valid_event(ordering_key=ordering_key)
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(event.trade_lifecycle_id)
+
+    def test_ordering_key_wrong_type_raises(self):
+        # _assert_ordering_key_rejected() cannot express this case: it
+        # passes ordering_key through SignalSnapshot ->
+        # build_signal_snapshot_json(), whose serializer stores
+        # list(snapshot.ordering_key) - so a string would silently become
+        # a JSON array of individual characters (wrong length, not wrong
+        # type). Building and mutating the decoded dict directly, then
+        # re-serializing with plain json.dumps(), is the only way to
+        # persist a genuinely non-array ordering_key value and exercise
+        # the validator's "ordering_key is not a JSON array" branch.
+        decoded = json.loads(self._snapshot_json(7, 99))
+        decoded["ordering_key"] = "not-a-list"
+        event = self._event_with_raw_snapshot(json.dumps(decoded))
+        with patch(
+            "database.service.get_trade_lifecycle_events", return_value=[event],
+        ):
+            with self.assertRaises(LifecycleSnapshotError):
+                self.service.list_trade_lifecycle_events(42)
+
+    def test_ordering_key_wrong_length_raises(self):
+        self._assert_ordering_key_rejected([99])
+
+    def test_ordering_key_two_element_mismatched_raw_message_id_raises(self):
+        # Canonical two-element form: [raw_message_id, trade_signal_id].
+        self._assert_ordering_key_rejected([99 + 999999, 7])
+
+    def test_ordering_key_two_element_mismatched_trade_signal_id_raises(self):
+        self._assert_ordering_key_rejected([99, 7 + 999999])
+
+    def test_ordering_key_three_element_mismatched_raw_message_id_raises(self):
+        # Canonical three-element form:
+        # [received_at, raw_message_id, trade_signal_id].
+        self._assert_ordering_key_rejected(
+            ["2026-07-24T04:30:00+00:00", 99 + 999999, 7]
+        )
+
+    def test_ordering_key_three_element_mismatched_trade_signal_id_raises(self):
+        self._assert_ordering_key_rejected(
+            ["2026-07-24T04:30:00+00:00", 99, 7 + 999999]
+        )
+
+    def test_ordering_key_three_element_blank_received_at_raises(self):
+        self._assert_ordering_key_rejected(["   ", 99, 7])
+
+    # -- 11. Caller-owned transaction preservation ------------------------
+
+    def test_read_neither_commits_nor_rolls_back_caller_owned_work(self):
+        self.connection.execute(
+            "INSERT INTO sources (name) VALUES ('r6_7_probe')"
+        )
+        self.assertTrue(self.connection.in_transaction)
+
+        result = self.service.list_trade_lifecycle_events(999999)
+        self.assertEqual(result, [])
+
+        self.assertTrue(
+            self.connection.in_transaction,
+            "list_trade_lifecycle_events() must not implicitly commit or "
+            "roll back the caller's own pending transaction.",
+        )
+
+        other_connection = get_connection(self.config)
+        try:
+            row = other_connection.execute(
+                "SELECT 1 FROM sources WHERE name = 'r6_7_probe'"
+            ).fetchone()
+            self.assertIsNone(
+                row,
+                "The uncommitted probe row must not be visible on a "
+                "second connection - visibility here would prove the "
+                "read silently committed the caller's pending work.",
+            )
+        finally:
+            self.connection.rollback()
+            row_after_rollback = other_connection.execute(
+                "SELECT 1 FROM sources WHERE name = 'r6_7_probe'"
+            ).fetchone()
+            self.assertIsNone(row_after_rollback)
+            other_connection.close()
 
 
 class TradeServiceControlledCorrectionTests(unittest.TestCase):

@@ -386,12 +386,16 @@ class LifecycleIntegrityError(Exception):
 
 class LifecycleSnapshotError(Exception):
     """Raised when a persisted trade_lifecycle_events.signal_snapshot
-    cannot be safely decoded or validated while rebuilding a lifecycle key.
+    cannot be safely decoded or validated - during a lifecycle rebuild, or
+    during a read-only lifecycle-event query
+    (TradeService.list_trade_lifecycle_events(), Recovery Milestone R6.7).
 
     Malformed or contradictory snapshot evidence is never silently
-    reconstructed or replaced - this always aborts the entire rebuild call
-    (rolled back by the caller) before any write occurs for the key being
-    compared.
+    reconstructed or replaced. During a rebuild, this always aborts the
+    entire rebuild call (rolled back by the caller) before any write
+    occurs for the key being compared. During a read-only query, no write
+    was ever attempted, so there is nothing to roll back - the caller
+    simply receives this exception instead of a result.
     """
 
     def __init__(
@@ -1143,6 +1147,57 @@ class TradeService:
 
         history.reverse()
         return history
+
+    def list_trade_lifecycle_events(
+        self,
+        trade_lifecycle_id: int,
+    ) -> list[dict]:
+        """List one lifecycle generation's membership, in chronological
+        order, with each member's immutable signal_snapshot validated and
+        decoded (Recovery Milestone R6.7).
+
+        A thin, read-only delegation to
+        database.repository.get_trade_lifecycle_events(): performs no
+        write, opens no transaction, and calls neither commit nor
+        rollback. Repository-provided event order (sequence_index
+        ascending) is preserved unchanged. Each event's signal_snapshot is
+        validated and decoded via the existing, unmodified
+        _validate_and_decode_snapshot() - the same private validator
+        rebuild_all_lifecycles()/rebuild_lifecycles_for_raw_message_ids()
+        already use internally - so a malformed snapshot is rejected
+        identically whether encountered during a rebuild or during this
+        read. No second decoding or validation implementation exists.
+
+        Args:
+            trade_lifecycle_id: FK to trade_lifecycles.id.
+
+        Returns:
+            A list of plain dicts, ordered by sequence_index ascending,
+            each with exactly: id, trade_lifecycle_id, trade_signal_id,
+            sequence_index, created_at, snapshot (the decoded
+            signal_snapshot dict - never the raw JSON text). Empty list
+            if the generation has no members or does not exist.
+
+        Raises:
+            LifecycleSnapshotError: If any member's signal_snapshot is not
+                valid JSON, does not decode to a JSON object, is missing a
+                required field, or has a trade_signal_id/ordering_key that
+                does not match its own event row - propagated unchanged
+                from _validate_and_decode_snapshot(), never caught,
+                wrapped, suppressed, or reinterpreted here.
+        """
+        events = get_trade_lifecycle_events(self.conn, trade_lifecycle_id)
+        return [
+            {
+                "id": event.id,
+                "trade_lifecycle_id": event.trade_lifecycle_id,
+                "trade_signal_id": event.trade_signal_id,
+                "sequence_index": event.sequence_index,
+                "created_at": event.created_at,
+                "snapshot": _validate_and_decode_snapshot(trade_lifecycle_id, event),
+            }
+            for event in events
+        ]
 
     # -----------------------------------------------------------------
     # Recovery Milestone R5

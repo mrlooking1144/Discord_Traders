@@ -1,0 +1,531 @@
+====================================================================
+Discord Traders - Recovery Milestone R7 Handoff
+Trader-Performance Analytics
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R7 - "Trader-Performance Analytics."
+
+Status: R7 implementation is COMPLETE LOCALLY and independently verified
+(focused and full regression), but IS NOT YET STAGED OR COMMITTED. This
+documentation pass (this handoff plus the corresponding
+`docs/PROJECT_STATUS.md` update) is also NOT YET STAGED OR COMMITTED.
+Nothing under R7 or R8 has been pushed to `origin/main`. Recovery
+Milestone R7 is not considered complete until this documentation is
+reviewed and approved, the implementation and documentation are staged
+and committed, and both commits are pushed with explicit Product Owner
+approval. Recovery Milestone R8 (trader-performance dashboard/UI) was not
+started at any point during this milestone.
+
+Preceding milestones (all complete and pushed before R7 began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), R6.5a
+(the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract), R6.5b (migrating the shipped "Correct Signal" UI to that
+API), R6.6 (real-corpus lifecycle acceptance testing against the real
+68-message Discord corpus), and R6.7 (the validated, decoded
+`TradeService.list_trade_lifecycle_events()` read API - see
+docs/HANDOFFS/R6.7_validated_lifecycle_event_read_api.txt). R6.7 is
+fully complete and pushed at commit
+`6be3856604bd8bd158af6e94ecdad48e04d3b180` ("Update documentation for
+Recovery Milestone R6.7").
+
+# 2. Purpose
+
+R6.7 exposed persisted lifecycle-event evidence through a validated,
+decoded read API, but no method anywhere above the repository layer
+could compute a return, classify a win/loss outcome, or summarize one
+trader's performance across every current lifecycle. The Product Owner's
+target workflow - pasting Discord messages into the application and
+viewing performance by trader - still had no analytics layer to draw on.
+
+R7 closes exactly that gap:
+
+    - A pure, database-independent analytics engine
+      (`database/analytics.py`) that computes one lifecycle generation's
+      price-return outcome, and reduces many such results into one
+      trader's performance summary.
+    - One new unbounded (no `LIMIT`) repository reader
+      (`database.repository.get_all_current_trade_lifecycles()`) so an
+      analytics-completeness query can never silently truncate.
+    - Three new public, read-only `TradeService` methods that fetch,
+      validate/decode, and translate the pure engine's results into
+      plain dicts at the service boundary - one strict (raises on bad
+      evidence) and two tolerant (never abort on one bad lifecycle).
+
+R7 adds no schema change, no migration, no lifecycle-engine change, no
+model change, and no UI. It is the analytics layer only; R8 (the
+trader-performance dashboard/UI) remains separate, unstarted, future
+work.
+
+# 3. Repository Baseline
+
+Repository: Discord_Traders (mrlooking1144/Discord_Traders)
+Branch: main
+
+Parent synchronized commit (the approved baseline immediately before
+this milestone, and the current `HEAD`/`origin/main` as of this
+handoff):
+    6be3856604bd8bd158af6e94ecdad48e04d3b180
+    ("Update documentation for Recovery Milestone R6.7")
+
+Local `main` and `origin/main` are identical at that commit (0 ahead / 0
+behind) both before and throughout this milestone - R7's implementation
+and this documentation exist only as uncommitted working-tree changes as
+of this handoff; no implementation commit exists yet.
+
+# 4. Exact Implementation and Test Files
+
+Six files changed, all in the working tree, none staged:
+
+    database/repository.py             |  43 ++++++
+    database/service.py                | 377 +++++++++++++++++++
+    database/analytics.py              | 650 ++++++++++++++++++++++++++++ (new)
+    tests/test_repository_recovery.py  | 108 +++++++
+    tests/test_service.py              | 310 +++++++++++++
+    tests/test_analytics.py            | 508 +++++++++++++++++++++++ (new)
+    6 files changed, 1996 insertions(+), 0 deletions(-)
+
+No other file is part of the R7 implementation. `database/lifecycle.py`,
+`database/models.py`, `database/schema.sql`, every file under
+`database/migrations/`, `app/streamlit_app.py`, `app/parser.py`,
+`app/discord_adapter.py`, and every documentation file (other than this
+handoff and the corresponding `docs/PROJECT_STATUS.md` update, prepared
+separately) are unchanged by R7's implementation.
+
+# 5. Exact Production Change
+
+## 5a. `database/repository.py` (additive only)
+
+New function:
+
+    get_all_current_trade_lifecycles(
+        conn: sqlite3.Connection,
+        *,
+        trader_id: int | None = None,
+    ) -> list[TradeLifecycle]
+
+An unbounded (no `LIMIT` of any kind) reader of every current
+(`is_current = 1`) lifecycle generation, optionally scoped to one
+`trader_id`. Deliberately distinct from the pre-existing
+`list_current_trade_lifecycles()`, which is a bounded (default `LIMIT
+100`), newest-first *display* reader for the Review UI and offers no way
+for a caller to detect truncation - it must never be repurposed to back
+an analytics-completeness guarantee. This new function instead follows
+the same unbounded-scan precedent already established by
+`get_all_current_lifecycle_keys()` (used by `rebuild_all_lifecycles()`
+for whole-database correctness), returning full `TradeLifecycle` rows
+ordered by `id` ascending (deterministic, not a "newest first"
+convention).
+
+## 5b. `database/analytics.py` (new, pure module)
+
+Contains no database access whatsoever - no `sqlite3` import, no import
+of `database.repository` or `database.service` - mirroring
+`database/lifecycle.py`'s proven pure-module precedent. Every function
+takes already-fetched, already-validated data and returns deterministic,
+database-independent results. Scope boundary (approved R7 planning
+review): price-return analytics only - no dollar P&L, no contract
+multipliers, no position quantity, since none of that evidence exists
+anywhere in the committed schema; `trade_signals.stated_return_pct` is
+never read for any calculation (audit-only field).
+
+Public surface:
+
+    ExitLeg (frozen dataclass) - one exit event's contribution
+        (trade_lifecycle_event_id, trade_signal_id, sequence_index,
+        event_type, consumed_fraction as an exact fractions.Fraction
+        string, exit_price).
+
+    LifecycleAnalyticsResult (frozen dataclass) - one lifecycle
+        generation's complete result: identity/status fields,
+        outcome/direction, entry/exit prices, exit_legs,
+        gross_price_return_pct, eligibility flags, ambiguity/exclusion
+        reasons, and source_event_ids. Every Decimal-valued field is a
+        plain string, never a float.
+
+    build_data_error_result(...) -> LifecycleAnalyticsResult
+        Builds a 'data_error' result for a lifecycle whose evidence is
+        structurally broken (zero membership events, or a
+        signal_snapshot that failed validation/decoding). No return or
+        outcome metric is ever computed or fabricated; source_event_ids
+        reflects whatever event ids were actually found, never assumed
+        empty.
+
+    compute_lifecycle_analytics(...) -> LifecycleAnalyticsResult
+        Computes one lifecycle's complete result from already-decoded,
+        already-ordered member events plus already-resolved
+        opened_at/closed_at timestamps. Never raises for any input shape
+        it can receive under its documented precondition (events
+        non-empty and pre-validated).
+
+    summarize_trader_performance(...) -> TraderPerformanceSummary
+        Reduces a list of LifecycleAnalyticsResults for one trader into
+        one summary - status-partition counts, eligible/not-scored/
+        data-error counts, win/loss/breakeven counts and rates, average
+        and median gross_price_return_pct, average winner/loser return,
+        sorted id lists per category, and an exclusion-reason frequency
+        count. No snapshot is read or decoded again; every rate/average
+        is None (never 0) when its denominator is zero.
+
+## 5c. `database/service.py` (additive only)
+
+Two new exceptions:
+
+    TradeLifecycleNotFoundError(ValueError) - raised by
+        get_trade_lifecycle_analytics() when trade_lifecycle_id
+        references no trade_lifecycles row at all, current or
+        superseded. Matches this project's existing not-found
+        convention (TradeSignalNotFoundError).
+
+    LifecycleAnalyticsError(Exception) - raised by
+        get_trade_lifecycle_analytics() when a trade_lifecycles row
+        exists but has zero trade_lifecycle_events membership rows.
+        Distinct from LifecycleSnapshotError (malformed snapshot
+        content); never raised by the tolerant read paths, which
+        instead surface this same condition as a per-lifecycle
+        'data_error' result.
+
+Three new public, read-only `TradeService` methods (no write, no
+transaction, no commit/rollback in any of the three - the same
+caller-owned-connection convention as R6.7's
+`list_trade_lifecycle_events()`):
+
+    get_trade_lifecycle_analytics(self, trade_lifecycle_id: int) -> dict
+        Strict. Accepts any id, current or superseded. Fetches the
+        lifecycle and its membership, decodes every snapshot via the
+        existing, unmodified `_validate_and_decode_snapshot()`, resolves
+        opened_at/closed_at from the immutable raw_messages evidence
+        behind the opener/closer signal, and returns the complete
+        LifecycleAnalyticsResult as a plain dict. Raises
+        TradeLifecycleNotFoundError, LifecycleAnalyticsError, or a
+        propagated-unchanged LifecycleSnapshotError - never a silently
+        substituted result.
+
+    list_current_trade_lifecycle_analytics(self, *, trader_id=None)
+        -> list[dict]
+        Tolerant per lifecycle, no truncating limit. Built on
+        get_all_current_trade_lifecycles() (Section 5a), so it can never
+        silently omit a current lifecycle. A malformed snapshot or a
+        zero-event lifecycle never aborts the call - it produces an
+        explicit 'data_error' result in its place instead. Ordered by
+        trade_lifecycle_id ascending.
+
+    list_trader_performance_summaries(self, *, trader_id=None)
+        -> list[dict]
+        One summary per trader, aggregated strictly from current-
+        lifecycle analytics results. Shares its underlying per-lifecycle
+        computation with list_current_trade_lifecycle_analytics() via
+        the same private _lifecycle_analytics_or_error() helper, so no
+        signal_snapshot is ever decoded twice and the two public methods
+        can never disagree about one lifecycle's own result. Never ranks
+        or sorts by any performance metric - trader_id ascending only,
+        leaving any ranking/comparison-display decision to R8. Ordered
+        by trader_id ascending.
+
+Supporting private helpers added to `database/service.py`:
+`_resolve_event_timestamp()` (resolves a member signal's canonical UTC
+timestamp by reading `get_raw_message_by_id()` live, since
+`raw_messages.received_at` is never updated once written),
+`_build_lifecycle_analytics()`, `_lifecycle_analytics_or_error()` (the
+tolerant wrapper), `_lifecycle_analytics_result_to_dict()`, and
+`_trader_performance_summary_to_dict()` (both dict-conversion helpers
+convert every tuple-typed field to a list for the public, JSON-friendly
+boundary, matching R6.7's plain-dict convention).
+
+# 6. Trade-Direction, Fraction-Weighting, and Exclusion Rules
+
+Trade-direction evidence (approved R7 planning review): `app/parser.py`
+classifies `BTO`/`BUY`/`BOUGHT` and `STO` identically as *opening*
+actions (`STO` opens a short - there is no separate short-entry
+`event_type`), and `STC`/`SELL`/`SOLD`/`BTC` identically as *closing*
+actions. `event_type` alone cannot distinguish a long position from a
+short one; only the opener's own raw `action` text can.
+`_resolve_direction()` classifies `BTO`/`BUY`/`BOUGHT` as `"long"`,
+`STO` as `"short"`, and anything else as `None` (never guessed). The
+real 68-message corpus (R6.6) contains no `STO`/`BTC` occurrences, but
+the grammar supports them, so a short direction is detected, never
+assumed absent, and is classified `not_scored`
+(`short_direction_not_scored`) - never scored under the long-position
+return formula.
+
+Fraction-weighted partial exits: `_build_exit_legs()` replays a
+generation's ordered member events and reconstructs its exit history
+using `fractions.Fraction` (never Decimal) for `consumed_fraction`,
+since several approved qualifier tokens (`1/3`, `1/6`) are
+non-terminating in base 10. Each approved token (`1/2`, `1/3`, `1/4`,
+`1/6`, `1/8`, `1/16`) consumes that exact fraction of the *original*
+position; a `FULL_EXIT` always consumes whatever fraction remains. The
+final `gross_price_return_pct` is the fraction-weighted sum of each
+exit leg's own return, never the naive "entry price to final exit price
+only" shortcut - proven by a dedicated test
+(`test_two_partial_exits_then_final_full_exit_is_fraction_weighted`)
+asserting the correct 75% result is produced and explicitly is not
+100%.
+
+Scale-in exclusion: an `ADD` event sets `has_add = True`; any lifecycle
+with an `ADD` is excluded from return/outcome metrics
+(`scale_in_cost_basis_not_modeled`) because this schema has no cost-basis
+model for a scaled-in position, while still counting normally toward
+status-count aggregates (`eligible_for_status_counts` stays `True`).
+
+Short-position exclusion: as above, `short_direction_not_scored`.
+
+Other not-scored/data-error conditions, each producing its own named
+exclusion reason and never a fabricated value: non-`closed` status
+(`status_<status>`), no verified opener (`no_verified_opener`),
+unparseable or missing entry price (`unparseable_entry_price` /
+`missing_entry_price`), zero entry price (`entry_price_zero`), a missing
+exit price on any leg or on a closed lifecycle with no exit legs at all
+(`missing_exit_price`), and an unresolvable exit fraction
+(`unresolvable_exit_fraction` - a defensive-only branch, since the pure
+lifecycle-matching engine already routes any genuinely unresolvable
+fraction to its own standalone `unresolved` singleton before it can ever
+reach a real generation's membership).
+
+# 7. Strict vs. Tolerant Analytics APIs
+
+Strict: `get_trade_lifecycle_analytics()` - a caller asking about one
+specific, named lifecycle id receives the unfiltered truth or an
+exception (`TradeLifecycleNotFoundError`, `LifecycleAnalyticsError`, or
+`LifecycleSnapshotError`), never a silently substituted 'data_error'
+placeholder.
+
+Tolerant: `list_current_trade_lifecycle_analytics()` and
+`list_trader_performance_summaries()` - one corrupted lifecycle
+(zero-event membership, or a malformed/contradictory signal_snapshot)
+can never abort an entire list or summary call. The failure is never
+hidden: it is preserved verbatim in the affected result's
+`analytics_error_detail` and counted in `snapshot_error_count` /
+`snapshot_error_lifecycle_ids` by the trader summary.
+
+# 8. No-Truncation Lifecycle Retrieval
+
+Both tolerant methods are built on
+`get_all_current_trade_lifecycles()` (Section 5a), which has no `LIMIT`
+of any kind - proven directly by
+`test_no_truncation_over_one_hundred_current_lifecycles` (service layer)
+and `test_more_than_one_hundred_current_lifecycles_are_not_truncated`
+(repository layer), each inserting 101 current lifecycles - one more
+than the pre-existing, deliberately bounded
+`list_current_trade_lifecycles()`'s own default `LIMIT 100` - and
+asserting all 101 are returned with no truncation and no double-count.
+
+# 9. Decimal Precision and Rounding Rules
+
+All calculation happens inside a `decimal.localcontext()` with
+`prec = 50` (`_CALC_PRECISION`) and `ROUND_HALF_EVEN`, so an
+intermediate repeating-fraction division (e.g. a `1/3` partial exit)
+never loses precision mid-calculation. Every public percentage field
+(`gross_price_return_pct`, `weighted_average_exit_price`, and every rate
+or average in `TraderPerformanceSummary`) is quantized to exactly six
+decimal places (`Decimal("0.000001")`, `ROUND_HALF_EVEN`) only at the
+point of public serialization, via `_quantize_pct()` - classification
+decisions (win/loss/breakeven, entry-price-zero) always compare the
+unquantized, full-precision value first, never the rounded display
+value. Every Decimal-valued result field is a plain string, never a
+Python `float`, matching this project's existing price/strike
+serialization convention - proven by
+`test_no_float_anywhere_in_result_fields` and
+`test_repeating_fraction_rounds_deterministically_to_six_places`. Median
+uses true division for an even-count dataset
+(`test_median_even_count_uses_true_division_not_floor`), never floor
+division.
+
+# 10. Test Coverage
+
+44 new focused tests across three files:
+
+    tests/test_analytics.py (new, 24 tests)
+        Covers database/analytics.py in complete isolation - no
+        database, no repository, no service, no UI; all fixtures
+        synthetic. Classes: SimpleClosedLifecycleTests,
+        PartialExitTests, ScaleInTests, DirectionTests,
+        NonClosedStatusTests, EntryPriceZeroTests,
+        DecimalPrecisionTests, ZeroEventDataErrorResultTests,
+        SummarizeTraderPerformanceTests.
+
+    tests/test_repository_recovery.py
+        (new class GetAllCurrentTradeLifecyclesTests, 6 tests)
+        Empty result, >100 rows not truncated, excludes superseded
+        lifecycles, trader_id filter, nonexistent trader_id, and
+        same-named traders never merged.
+
+    tests/test_service.py
+        (new class TradeServiceAnalyticsTests, 14 tests)
+        Exercises the real pipeline (real trade_signals -> real
+        rebuild_all_lifecycles()/correct_trade_signal() -> real
+        persisted trade_lifecycles/trade_lifecycle_events) through a
+        real, temporary, file-backed SQLite database - no
+        lifecycle-engine or repository mocking. Covers: strict
+        not-found and zero-event errors, strict propagation of
+        LifecycleSnapshotError unchanged, strict superseded-id
+        acceptance with supersession metadata exposed, tolerant
+        isolation of a data-error lifecycle from clean ones, tolerant
+        zero-event-becomes-data-error (never omitted), no truncation
+        over 100 current lifecycles, trader_id filter scoping, same-
+        named traders never merged in a summary, trader_id-ascending
+        ordering (never performance-ranked), no-trader-id-filter
+        listing every trader, cross-field reconciliation invariants
+        against real mixed-status data, and proof that
+        list_trader_performance_summaries() and
+        list_current_trade_lifecycle_analytics() share exactly one
+        underlying computation per lifecycle (via a `patch.object`
+        spy on `_lifecycle_analytics_or_error`, confirming call count
+        equals lifecycle count, never double-computed).
+
+A pre-existing reporting discrepancy was checked and resolved during
+verification, not a code defect: the shared test helper
+`_build_closed_long_lifecycle(self, symbol="IBM", trader_id=None)`
+defaults to `"IBM"` and is called with that explicit default at most
+call sites, while several call sites pass `symbol="AVGO"` explicitly to
+build a second, distinguishable lifecycle within the same test (a
+different trader, or a second lifecycle sharing no key with the first).
+Both symbols legitimately appear in the working tree at different call
+sites; no change was made.
+
+# 11. Test Results
+
+    tests/test_analytics.py:                          24/24 passing
+    tests/test_repository_recovery.py
+        (GetAllCurrentTradeLifecyclesTests only):       6/6 passing
+    tests/test_service.py
+        (TradeServiceAnalyticsTests only):             14/14 passing
+
+    Full suite: 1244/1244 passing, 0 failures, 0 errors
+    (1200 pre-existing + 44 new)
+
+    `git diff --check`: passed, no output (no whitespace or
+    conflict-marker errors)
+
+One initial full-suite run hit a single transient error:
+`RuntimeError: AppTest script run timed out after 3(s)` inside
+`tests/test_app.py`'s `CorrectSignalWorkflowTests.
+test_action_choices_exactly_approved_for_standard_action` - a file
+completely untouched by R7 (confirmed via `git status --short --
+tests/test_app.py` showing no change). This is the same class of
+transient Streamlit `AppTest` timeout previously documented in the R6.6
+and R6.7 handoffs. The same test was immediately rerun in isolation and
+passed in 0.884 seconds. A full confirming rerun of the entire suite
+afterward passed all 1244 tests with 0 failures and 0 errors. No R7
+implementation or test file caused this timeout, and it did not recur on
+the confirming rerun.
+
+# 12. Explicit Out of Scope
+
+The following were explicitly excluded from R7 and remain unstarted:
+
+    - Any UI or dashboard work of any kind (Recovery Milestone R8, in
+      full) - no chart, table, filter control, or trader-comparison
+      view exists anywhere in the application yet.
+    - Dollar P&L, contract-multiplier, or position-quantity calculation
+      of any kind - no such evidence exists anywhere in the committed
+      schema.
+    - Any use of `trade_signals.stated_return_pct` for a calculation -
+      it remains audit-only.
+    - Trader ranking, sorting by performance, or any comparison logic -
+      every new method orders strictly by id ascending.
+    - Any schema or migration change.
+    - Any lifecycle-engine (`database/lifecycle.py`) change.
+    - Any `database/models.py` change.
+    - Any parser or Discord-adapter change.
+    - Any change to `list_trade_lifecycle_events()` or
+      `LifecycleSnapshotError` (both unchanged from R6.7).
+    - Any change to the pre-existing, bounded
+      `list_current_trade_lifecycles()` display reader.
+
+# 13. Architecture Notes
+
+    - `database/analytics.py` is a pure module with the same
+      no-database-access guarantee as `database/lifecycle.py` - both
+      are independently unit-testable with zero SQLite involvement.
+    - `TradeService` remains the sole owner of fetch/decode/validate
+      orchestration; the pure analytics engine never sees a raw
+      `sqlite3.Connection`, a `TradeLifecycleEvent`, or undecoded JSON.
+    - The unbounded `get_all_current_trade_lifecycles()` and the
+      pre-existing, bounded `list_current_trade_lifecycles()` now
+      coexist deliberately: the former backs analytics-completeness
+      guarantees, the latter continues to back the Review UI's own
+      bounded display - neither was repurposed to serve the other's
+      contract.
+    - The architecture remains modular and provider-independent: R7
+      touches only a new pure module and the service layer's read
+      surface for lifecycles already persisted through the existing,
+      source-independent `trade_lifecycles`/`trade_lifecycle_events`
+      tables.
+
+# 14. Quality-Review History
+
+R7 implementation was followed by an independent final verification pass
+covering: inspection of all six changed files; resolution of the
+IBM/AVGO reporting question (Section 10, confirmed not a defect);
+`git diff --check` (clean); the 44 new focused tests (all passing); and
+two full-suite runs (the first with one transient, unrelated Streamlit
+`AppTest` timeout, the second clean at 1244/1244). No code change was
+made during this verification pass - the working tree was confirmed
+correct as implemented.
+
+# 15. Git and Governance State
+
+    - No file has been staged (`git diff --cached --stat` is empty).
+    - No commit has been made for R7's implementation or for this
+      documentation pass.
+    - Nothing has been pushed to `origin/main`.
+    - Local `main` and `origin/main` remain identical at
+      `6be3856604bd8bd158af6e94ecdad48e04d3b180` (0 ahead / 0 behind) -
+      unchanged by this milestone so far, since nothing has been
+      committed yet.
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+    - Recovery Milestone R8 was not started - no code, test, or
+      documentation file related to R8 was created or modified at any
+      point during R7.
+
+# 16. Next Action
+
+    1. Product Owner / Technical Architect (ChatGPT) review of this
+       documentation pass (this handoff plus the corresponding
+       `docs/PROJECT_STATUS.md` update).
+    2. Once approved: stage and commit the R7 implementation (the six
+       files in Section 4) and this documentation update - as separate
+       commits, matching this project's established convention (an
+       implementation commit, then a documentation commit).
+    3. Push both commits to `origin/main` only after explicit Product
+       Owner approval for that specific action.
+    4. Verify local `main` and `origin/main` become identical (0 ahead /
+       0 behind) after that push.
+    5. Recovery Milestone R8 (trader-performance dashboard/UI) remains
+       separately gated: it has no reviewed design yet and must not
+       begin without its own explicit Product Owner / Technical
+       Architect (ChatGPT) approval, exactly as every prior milestone in
+       this project (most recently R7 itself) required before its own
+       implementation began.
+
+# 17. Governance and Safety Reminders
+
+    - Per this project's established practice: every milestone requires
+      its own explicit design approval before implementation, its own
+      quality review after implementation, and its own explicit approval
+      before staging/committing and before pushing. R7 has completed
+      implementation and final verification; staging, committing, and
+      pushing all remain separately gated on explicit Product Owner
+      approval.
+    - Do not stage, commit, push, or tag anything from this milestone,
+      and do not begin Recovery Milestone R8, without a separate,
+      explicit Product Owner approval for each of those distinct
+      actions.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).

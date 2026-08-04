@@ -1,0 +1,555 @@
+====================================================================
+Discord Traders - Recovery Milestone R8a Handoff
+Trader-Performance Dashboard (Core)
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R8a - "Trader-Performance Dashboard
+(Core)" - the first of a two-part split (R8a/R8b) of Recovery Milestone
+R8 (trader-performance dashboard/UI), approved after Recovery Milestone
+R7's own documentation pass was reviewed and pushed.
+
+Status: R8a implementation is COMPLETE LOCALLY, tested (focused and
+full regression), and independently quality-reviewed, with three MINOR
+test-quality findings identified and corrected - but IS NOT YET STAGED
+OR COMMITTED. This documentation pass (this handoff plus the
+corresponding `docs/PROJECT_STATUS.md` update) is also NOT YET STAGED
+OR COMMITTED. Nothing under R8a or R8b has been pushed to `origin/main`.
+Recovery Milestone R8a is not considered complete until this
+documentation is reviewed and approved, the implementation and
+documentation are staged and committed, and both commits are pushed
+with explicit Product Owner approval. Recovery Milestone R8b
+(ranking/sort selector, CSV export) was not started at any point during
+this milestone.
+
+Preceding milestones (all complete and pushed before R8a began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), R6.5a
+(the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract), R6.5b (migrating the shipped "Correct Signal" UI to that
+API), R6.6 (real-corpus lifecycle acceptance testing against the real
+68-message Discord corpus), R6.7 (the validated, decoded
+`TradeService.list_trade_lifecycle_events()` read API), and R7 (the
+pure `database/analytics.py` price-return engine and three read-only
+trader-performance `TradeService` methods - see
+docs/HANDOFFS/R7_trader_performance_analytics.txt). R7 is fully complete
+and pushed: implementation commit
+`6d74a13c38914d0cb80c0be9f1236b291ccafb24` ("Implement
+trader-performance analytics") and documentation commit
+`909967741fce577e5c77ac3d40d51527df1b2dfa` ("Update documentation for
+Recovery Milestone R7"), pushed together to `origin/main` as a single
+normal fast-forward (`6be3856..9099677`).
+
+# 2. Purpose
+
+R7 computed trader-performance analytics but exposed them only through
+`TradeService` methods - no UI existed anywhere for the Product Owner
+to actually see a trader's performance. R8 (the dashboard/UI milestone)
+was scoped, then split into two approved sub-milestones:
+
+    - R8a (this milestone): the core dashboard - a third sidebar
+      workflow showing a trader summary table and a per-trader,
+      filterable drill-down with full lifecycle and exit-leg evidence.
+      This alone satisfies the Product Owner's original target
+      workflow of viewing performance by trader inside the application.
+    - R8b (separate, unstarted, requires its own approval): ranking/
+      sort-metric selection and CSV export - polish deferred from R8a
+      as lower-risk, separable work.
+
+R8a adds no schema change, no migration, no repository change, no
+service change, no lifecycle-engine change, no model change, no parser
+or adapter change, no new dependency, and performs no analytics
+calculation of its own - it is a pure consumer of the two existing R7
+read methods.
+
+# 3. Repository Baseline
+
+Repository: Discord_Traders (mrlooking1144/Discord_Traders)
+Branch: main
+
+Parent synchronized commit (the approved baseline immediately before
+this milestone, and the current `HEAD`/`origin/main` as of this
+handoff):
+    909967741fce577e5c77ac3d40d51527df1b2dfa
+    ("Update documentation for Recovery Milestone R7")
+
+Local `main` and `origin/main` are identical at that commit (0 ahead / 0
+behind) both before and throughout this milestone - R8a's implementation
+and this documentation exist only as uncommitted working-tree changes as
+of this handoff; no implementation commit exists yet.
+
+# 4. Exact Implementation and Test Files
+
+Five files changed, all in the working tree, none staged - exactly two
+modified, three new:
+
+    app/streamlit_app.py                | 150 ++             (modified)
+    tests/test_app.py                   | 477 +++++           (modified)
+    app/dashboard_formatting.py         | 184 +++++++++++++++ (new)
+    tests/test_dashboard_formatting.py  | 454 +++++++++++++++++++++++ (new)
+    tests/test_dashboard_integration.py | 276 +++++++++++++++ (new)
+    5 files changed, 1541 insertions(+), 3 deletions(-)
+
+Per-file exact statistics (`git diff --numstat` for tracked files,
+`git diff --no-index --numstat` against an empty file for untracked
+files - both read-only, neither touches the index):
+
+    app/streamlit_app.py:                150 insertions,   1 deletion
+    tests/test_app.py:                   477 insertions,   2 deletions
+    app/dashboard_formatting.py:         184 insertions,   0 deletions
+    tests/test_dashboard_formatting.py:  454 insertions,   0 deletions
+    tests/test_dashboard_integration.py: 276 insertions,   0 deletions
+    Total:                              1541 insertions,   3 deletions
+
+No other file is part of the R8a implementation. `database/schema.sql`,
+every file under `database/migrations/`, `database/repository.py`,
+`database/service.py`, `database/lifecycle.py`, `database/models.py`,
+`database/analytics.py`, `app/parser.py`, `app/discord_adapter.py`,
+`requirements.txt`, and every documentation file (other than this
+handoff and the corresponding `docs/PROJECT_STATUS.md` update, prepared
+separately) are unchanged by R8a's implementation.
+
+# 5. Exact Production Change
+
+## 5a. `app/streamlit_app.py` (modified)
+
+The sidebar's `st.sidebar.radio("Workflow", [...])` options list gains
+a third entry, `"Trader Performance"` - the one approved change to
+that line. A new `elif workflow == "Trader Performance":` branch is
+appended after the existing Review Signals branch. Manual Message
+Entry, Review Signals, and Correct Signal code is otherwise completely
+unchanged - not "byte-for-byte unchanged" (the options list line itself
+necessarily changed), but behaviorally unchanged and fully
+regression-tested (the complete pre-existing `tests/test_app.py` suite,
+minus one disclosed test-expectation update to the options list,
+passes unmodified).
+
+The new branch:
+
+    - Reads `db_path = resolve_database_path()`. If
+      `not Path(db_path).exists()`, shows the fixed
+      `_DASHBOARD_EMPTY_MESSAGE` and does nothing else - never calls
+      `initialize_database()`, never opens a connection, never creates
+      a file or directory. Identical guarantee to Review Signals.
+    - Otherwise opens one connection (`conn: sqlite3.Connection | None
+      = None` declared before the `try`), constructs one
+      `TradeService`, and calls
+      `service.list_trader_performance_summaries()`. A `finally:
+      if conn is not None: conn.close()` at the very end of the branch
+      closes the connection on every path - success, an exception
+      during the summary fetch, or an exception anywhere inside the
+      nested rendering code - exactly mirroring Review Signals'
+      established shape.
+    - An exception fetching summaries is caught, logged via the
+      existing sanitized `log_operation_failure()`, and shown as the
+      fixed `_DASHBOARD_LOAD_FAILURE_MESSAGE` - never raw exception
+      text.
+    - An empty summary list shows `_DASHBOARD_EMPTY_MESSAGE` (the same
+      fixed message reused for both the missing-database and
+      empty-database cases, matching the Review Signals precedent).
+    - Otherwise renders the Trader Summary table via
+      `build_summary_display_rows(summaries)` (see Section 5b), then a
+      trader selectbox (`key="dashboard_trader_select"`, options are
+      the summaries' own `trader_id` values in their own returned
+      order, `format_func` uses `build_trader_label()`). Before
+      rendering, if the previously selected trader_id is no longer
+      present, `st.session_state.pop("dashboard_trader_select", None)`
+      is called first - the same pattern already used for
+      `correction_signal_id` in Review Signals - so Streamlit falls
+      back to a valid default instead of raising
+      `StreamlitAPIException` for a stale value.
+    - Calls `service.list_current_trade_lifecycle_analytics(trader_id=
+      selected_trader_id)` in its own nested `try`/`except`; a failure
+      is logged and shown as the fixed
+      `_DASHBOARD_DRILLDOWN_LOAD_FAILURE_MESSAGE`.
+    - Renders a status `st.multiselect`, an outcome `st.multiselect`,
+      and a symbol `st.text_input` (all independently optional; an
+      empty multiselect selection or blank text input means "no filter
+      on that dimension"), applies `filter_lifecycle_results()` (see
+      Section 5b), and either shows
+      `_DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE` (if the filtered list
+      is empty) or renders the drill-down table via
+      `build_lifecycle_display_rows(filtered_results)`.
+    - Renders a second selectbox (`key="dashboard_lifecycle_select"`,
+      options are the filtered results' own `trade_lifecycle_id`
+      values) with the same stale-value pop-before-render guard - one
+      inclusion check against the current, filtered `lifecycle_ids`
+      handles both "the trader changed" and "a filter narrowed the
+      lifecycle out" without distinguishing the two causes.
+    - Builds `build_lifecycle_detail(selected_result)` (see Section 5b)
+      and renders "Data Error Detail: {error_detail}" (the em-dash
+      placeholder for a non-error lifecycle, or the verbatim
+      `analytics_error_detail` string for a `data_error` one - the
+      *only* place that field is ever rendered), then either "No exit
+      events for this lifecycle." (an empty `exit_legs`) or the
+      exit-leg table.
+
+## 5b. `app/dashboard_formatting.py` (new, pure module)
+
+Contains no database access and no Streamlit dependency whatsoever - no
+`sqlite3`, `database.repository`, `database.service`, `database.
+analytics`, or `streamlit` import anywhere in the file, confirmed by
+direct inspection during the independent quality-review pass, not just
+by the absence of an import error. Every function takes an
+already-fetched plain dict or list of dicts - the exact shape
+`TradeService.list_trader_performance_summaries()`/
+`list_current_trade_lifecycle_analytics()` already return - and returns
+a display-ready value or row dict. No function computes, re-derives,
+rounds, or ranks any R7 analytics value.
+
+Public surface (eleven functions):
+
+    format_optional_value(value) -> str
+        str(value), or the fixed em-dash placeholder ("—") if
+        value is None.
+
+    format_percent(value: str | None) -> str
+        f"{value}%" for an already-quantized R7 percentage string, or
+        the em-dash placeholder if value is None (a zero-denominator
+        rate/average per R7's own contract - never rendered as "0%").
+        Never parses value as a number.
+
+    format_data_error_count(count: int) -> str
+        "0" when count == 0, else a visible "⚠ {count}" indicator
+        - the summary table's only exposure of a data-error condition,
+        never the verbatim analytics_error_detail text.
+
+    build_trader_label(trader_id, trader_name) -> str
+        "{trader_name} (ID {trader_id})" - used everywhere a trader is
+        displayed or selected, so two identically-named traders are
+        never confused.
+
+    build_summary_display_row(summary) -> dict
+    build_summary_display_rows(summaries) -> list[dict]
+        Convert one/many list_trader_performance_summaries() dicts into
+        display-ready summary-table row(s), order preserved exactly (no
+        ranking applied by R8a).
+
+    filter_lifecycle_results(results, *, statuses=None, outcomes=None,
+                              symbol=None) -> list[dict]
+        Pure, order-preserving filter over an already-fetched
+        list_current_trade_lifecycle_analytics() result list. An empty
+        or None statuses/outcomes list means "no filter on that
+        dimension" (never "match nothing"). symbol is stripped and
+        uppercased; blank (including whitespace-only) means no filter;
+        a non-blank value requires an exact match (never substring).
+        Never mutates results.
+
+    build_lifecycle_display_row(result) -> dict
+    build_lifecycle_display_rows(results) -> list[dict]
+        Convert one/many lifecycle analytics dicts into display-ready
+        drill-down row(s), including a short "Data Error" indicator
+        (never the verbatim analytics_error_detail text).
+
+    build_exit_leg_display_rows(exit_legs) -> list[dict]
+        Convert one lifecycle's exit_legs list into display rows: Event
+        Type, Consumed Fraction, Exit Price, Sequence Index - in the
+        order already provided (sequence_index ascending, as R7
+        guarantees). Returns [] unchanged if exit_legs is empty.
+
+    build_lifecycle_detail(result) -> dict
+        {"error_detail": str, "exit_leg_rows": list[dict]} - the
+        verbatim analytics_error_detail display value and the exit-leg
+        rows for the selected-lifecycle detail panel. The only function
+        that ever surfaces analytics_error_detail.
+
+# 6. UI Layout, Columns, and Behavior
+
+Summary table columns (Trader, Total Lifecycles, Open, Partially
+Closed, Closed, Orphan, Unresolved, Invalid, Data Errors, Eligible, Not
+Scored, Wins, Losses, Breakeven, Win Rate, Loss Rate, Breakeven Rate,
+Avg Return, Median Return, Avg Winner Return, Avg Loser Return) map
+directly to `TraderPerformanceSummary` fields; no field is renamed in a
+way that changes its meaning, re-derived, or re-rounded.
+
+Drill-down table columns (Lifecycle ID, Symbol, Option Type, Strike,
+Expiration, Status, Outcome, Direction, Entry Price, Terminal Exit
+Price, Weighted Avg Exit Price, Return, Opened At, Closed At, Ambiguity
+Flags, Exclusion Reasons, Data Error) map directly to
+`LifecycleAnalyticsResult` fields, with Ambiguity Flags/Exclusion
+Reasons joined with ", " (or the em-dash placeholder when empty).
+
+Lifecycle-detail panel: Data Error Detail (verbatim, or em-dash) and an
+exit-leg table (Event Type, Consumed Fraction, Exit Price, Sequence
+Index), or "No exit events for this lifecycle." when empty.
+
+Duplicate trader names always render as `{trader_name} (ID
+{trader_id})`, both in the summary table's Trader column and the
+trader-selector's option labels - proven end-to-end with two real,
+distinct `trader_id`s sharing the name "TC" in the integration suite
+(Section 9).
+
+# 7. Exact Fixed Messages
+
+    _DASHBOARD_EMPTY_MESSAGE = "No trader performance data found."
+    _DASHBOARD_LOAD_FAILURE_MESSAGE = "Could not load trader performance data."
+    _DASHBOARD_DRILLDOWN_LOAD_FAILURE_MESSAGE = (
+        "Could not load lifecycle details for this trader."
+    )
+    _DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE = "No lifecycles match the current filters."
+
+# 8. Empty-State, Corrupted-Data, and Stale-Selection Handling
+
+    - Missing database: _DASHBOARD_EMPTY_MESSAGE; no file, directory,
+      connection, or initialized database is ever created.
+    - Database exists, no trader has a current lifecycle:
+      _DASHBOARD_EMPTY_MESSAGE (same fixed message).
+    - A trader with only not_scored lifecycles: eligible_lifecycle_
+      count == 0, every rate/average renders as the em-dash placeholder
+      (never "0%"), Not Scored count visibly nonzero.
+    - A trader with only data_error lifecycles: Data Errors indicator
+      visibly nonzero in the summary row; each such drill-down row
+      shows the "⚠" indicator; the verbatim detail is available
+      only via the lifecycle-detail panel.
+    - Filters remove every drill-down row:
+      _DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE; the lifecycle-detail
+      selectbox is not rendered.
+    - A previously selected trader or lifecycle that no longer appears
+      (data changed between reruns, or a filter narrowed it out) is
+      silently cleared via the session_state-pop-before-render pattern
+      - no error, no message, no StreamlitAPIException.
+    - Summary/drill-down query or connection failure: the existing
+      sanitized log_operation_failure() + fixed-message pattern - no
+      raw exception text is ever shown to the user.
+
+# 9. Test Coverage
+
+78 new focused tests across three files, plus one existing test
+updated:
+
+    tests/test_app.py (WorkflowNavigationTests)
+        `test_sidebar_offers_both_workflows` renamed to
+        `test_sidebar_offers_all_three_workflows`, expected options
+        list updated to include "Trader Performance" - the one
+        disclosed, approved change to an existing test's expectations.
+        No other existing test in this file was modified beyond the
+        three minor corrections in Section 10.
+
+    tests/test_dashboard_formatting.py (new, 43 tests)
+        Pure unit tests for all eleven helper functions - no database,
+        no Streamlit. Covers None/percent/data-error-count formatting,
+        trader-label disambiguation, summary-row construction and exact
+        column-key sets, filter semantics (status-only, outcome-only,
+        combined AND, exact-uppercase symbol matching, never substring,
+        blank-means-no-filter, empty-list-means-no-filter,
+        never-mutates-input), lifecycle-row construction (data-error
+        indicator, ambiguity/exclusion joining, None-optional-field
+        rendering, exact column-key set, analytics_error_detail never a
+        key), exit-leg row construction and ordering, and
+        lifecycle-detail construction (verbatim error text for
+        data_error, em-dash otherwise, delegation to
+        build_exit_leg_display_rows()).
+
+    tests/test_app.py (new class TraderPerformanceWorkflowTests, 27 tests)
+        AppTest component coverage with `TradeService` mocked (matching
+        `ReviewSignalsDisplayTests`' established setUp/addCleanup
+        pattern, since trader/filter/lifecycle selection each trigger a
+        full module rerun). Covers summary-table rendering and exact
+        columns, duplicate-name disambiguation, None-as-em-dash
+        rendering, data-error indicator without verbatim detail in the
+        summary, missing-database no-connection guarantee, empty-summary
+        and load-failure fixed messages (summary and drill-down),
+        trader-selector default and drill-down invocation with the
+        correct trader_id, drill-down column set, status/outcome/symbol
+        filtering (including a genuine AND-combination proof - see
+        Section 10), exclusion-reason and ambiguity-flag visibility,
+        exit-leg rendering, verbatim error-detail-only-in-detail-panel,
+        the "no exit events" empty case, stale trader/lifecycle
+        selection safety, isolation from the other two workflows'
+        TradeService methods, and no-write-transaction confirmation.
+
+    tests/test_dashboard_integration.py (new, 8 tests)
+        Real pipeline through a real temporary SQLite database - real
+        `create_trade_signal()`/`rebuild_all_lifecycles()`/
+        `create_trade_lifecycle()` seeding (mirroring
+        `tests/test_service.py`'s `TradeServiceAnalyticsTests`
+        precedent, since UI ingestion alone never triggers a lifecycle
+        rebuild), then a real `AppTest` read through the dashboard - no
+        mocking. Covers real multi-trader summary numbers (including a
+        hand-verified 87.5% average-return figure across a 100% and a
+        fraction-weighted 75% lifecycle), real duplicate-trader-name
+        separation by real distinct trader_id, real drill-down evidence
+        per trader, a real data_error lifecycle (zero-event membership)
+        surfaced end-to-end, a real not_scored (open) lifecycle
+        surfaced with its real exclusion reason, a real two-leg
+        partial-exit exit-leg sequence matched exactly (event type,
+        consumed fraction, exit price, sequence index), a real
+        row-count-unchanged no-write proof, and a real missing-database
+        end-to-end case.
+
+# 10. Quality-Review History and Corrections
+
+An independent quality-review pass (separate from implementation)
+inspected all five changed files against the approved R8a scope,
+verified every checklist item in Sections 5-8 of this handoff by direct
+code inspection (not merely by test outcome), and reviewed test quality
+for false positives, duplication, brittle indexing, and coverage gaps.
+No BLOCKER or MAJOR finding was raised, and no finding indicated any
+production-behavior defect. Three MINOR findings were identified and
+corrected in `tests/test_app.py` only (no production file touched):
+
+    1. `test_combined_filters_apply_together` originally could pass
+       even if the status filter were silently broken, since the
+       outcome filter alone already produced the same result under the
+       shared class-level fixture. Corrected to use a local
+       (non-shared) four-row fixture where status=["closed"] alone
+       matches two rows, outcome=["win"] alone matches two different
+       rows, and only their intersection yields the expected single
+       row - a genuine proof of AND-combination.
+    2. `test_summary_order_matches_service_return_order` and
+       `test_duplicate_trader_names_render_distinct_labels` had
+       byte-identical bodies. The former was corrected to use a local
+       fixture returned in deliberately non-ascending trader_id order
+       (9 then 2), asserting the displayed order matches - so it can
+       only pass if the UI genuinely preserves the service's own order,
+       not merely because the fixture happened to already be sorted.
+       The latter was left unchanged.
+    3. `test_ambiguity_and_exclusion_reasons_visible_in_drilldown`
+       asserted only on Exclusion Reasons despite its name; no fixture
+       anywhere in the AppTest or integration suites had a non-empty
+       `lifecycle_ambiguity_flags` value, so that column's real
+       `st.dataframe()` rendering had only ever been proven at the pure
+       unit-test level. Renamed to
+       `test_exclusion_reasons_visible_in_drilldown`, and a new
+       `test_ambiguity_flags_visible_in_drilldown` test was added with
+       a local non-empty `lifecycle_ambiguity_flags` fixture, asserting
+       the real rendered column content.
+
+All corrections used a local (test-scoped) fixture built via dict
+overrides on an existing class-level template - never mutating the
+shared class-level fixture lists relied on by other tests. After these
+corrections: `TraderPerformanceWorkflowTests` grew from 26 to 27 tests;
+`tests/test_app.py` grew from 417/2 to 477/2 insertions/deletions; the
+full suite grew from 1321 to 1322.
+
+# 11. Test Results
+
+    tests/test_dashboard_formatting.py:                43/43 passing
+    tests/test_app.py::TraderPerformanceWorkflowTests:  27/27 passing
+    tests/test_dashboard_integration.py:                 8/8 passing
+    tests/test_app.py (complete):                     129/129 passing
+
+    Full suite: 1322/1322 passing, 0 failures, 0 errors
+    (1244 pre-existing + 78 new)
+
+    `git diff --check`: passed, no output (no whitespace or
+    conflict-marker errors)
+
+No transient rerun was required at any point during R8a - every
+regression run (focused and full) passed cleanly on its first attempt,
+unlike the transient Streamlit `AppTest` timeout previously documented
+in the R6.6, R6.7, and R7 handoffs.
+
+# 12. Explicit Out of Scope
+
+The following were explicitly excluded from R8a and remain deferred to
+Recovery Milestone R8b or later:
+
+    - Any ranking, sorting-by-performance-metric control, or tie-break
+      logic for the summary table - default order is always exactly
+      what `list_trader_performance_summaries()` returned
+      (trader_id-ascending).
+    - CSV or Excel export of any kind.
+    - Any chart, graph, or visualization.
+    - Any minimum-eligible-sample-size threshold or "insufficient data"
+      classification beyond R7's own not_scored/data_error contract.
+    - Any schema, migration, `database/repository.py`,
+      `database/service.py`, `database/lifecycle.py`,
+      `database/models.py`, `app/parser.py`, `app/discord_adapter.py`,
+      or `requirements.txt`/dependency change of any kind.
+    - Any change to `database/analytics.py`'s calculation logic, or any
+      UI-side recalculation, parsing, or rounding of an R7 analytics
+      value.
+    - Historical/superseded-lifecycle drill-down (current lifecycles
+      only, matching R7's own "current" scope).
+    - A head-to-head "compare traders" view beyond the single,
+      unranked summary table.
+    - Automated Discord ingestion, broker integration, or any R9 work.
+    - Any change to Manual Message Entry, Review Signals, or Correct
+      Signal behavior beyond the one approved sidebar-options-list
+      addition.
+
+# 13. Architecture Notes
+
+    - `app/dashboard_formatting.py` is a pure module with the same
+      no-database-access guarantee as `database/analytics.py` and
+      `database/lifecycle.py` - independently unit-testable with zero
+      SQLite or Streamlit involvement.
+    - `app/streamlit_app.py` remains the sole orchestration layer:
+      it fetches via `TradeService`, formats via
+      `app/dashboard_formatting.py`, and renders via `streamlit` - no
+      layer does more than one of those three responsibilities.
+    - The dashboard consumes R7's read surface exactly as designed:
+      `list_trader_performance_summaries()` for the trader-level view
+      and `list_current_trade_lifecycle_analytics(trader_id=...)` for
+      the lifecycle-level drill-down - no new backend method was
+      required or added.
+    - The architecture remains modular and provider-independent: R8a
+      touches only a new pure presentation module and the service
+      layer's existing read surface for lifecycles already computed by
+      R7.
+
+# 14. Git and Governance State
+
+    - No file has been staged (`git diff --cached --stat` is empty).
+    - No commit has been made for R8a's implementation or for this
+      documentation pass.
+    - Nothing has been pushed to `origin/main`.
+    - Local `main` and `origin/main` remain identical at
+      `909967741fce577e5c77ac3d40d51527df1b2dfa` (0 ahead / 0 behind) -
+      unchanged by this milestone so far, since nothing has been
+      committed yet.
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+    - Recovery Milestone R8b was not started - no code, test, or
+      documentation file related to R8b was created or modified at any
+      point during R8a.
+
+# 15. Next Action
+
+    1. Product Owner / Technical Architect (ChatGPT) review of this
+       documentation pass (this handoff plus the corresponding
+       `docs/PROJECT_STATUS.md` update).
+    2. Once approved: stage and commit the R8a implementation (the five
+       files in Section 4) and this documentation update - as separate
+       commits, matching this project's established convention (an
+       implementation commit, then a documentation commit).
+    3. Push both commits to `origin/main` only after explicit Product
+       Owner approval for that specific action.
+    4. Verify local `main` and `origin/main` become identical (0 ahead /
+       0 behind) after that push.
+    5. Recovery Milestone R8b (ranking/sort selector, CSV export)
+       remains separately gated: it has no reviewed design yet and must
+       not begin without its own explicit Product Owner / Technical
+       Architect (ChatGPT) approval, exactly as every prior milestone in
+       this project (most recently R8a itself) required before its own
+       implementation began.
+
+# 16. Governance and Safety Reminders
+
+    - Per this project's established practice: every milestone requires
+      its own explicit design approval before implementation, its own
+      quality review after implementation, and its own explicit approval
+      before staging/committing and before pushing. R8a has completed
+      implementation, quality review, and correction of the three minor
+      findings; staging, committing, and pushing all remain separately
+      gated on explicit Product Owner approval.
+    - Do not stage, commit, push, or tag anything from this milestone,
+      and do not begin Recovery Milestone R8b, without a separate,
+      explicit Product Owner approval for each of those distinct
+      actions.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).

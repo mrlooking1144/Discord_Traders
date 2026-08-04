@@ -952,12 +952,18 @@ class WorkflowNavigationTests(unittest.TestCase):
     only the selected workflow's code executes on a given rerun.
     """
 
-    def test_sidebar_offers_both_workflows(self):
+    def test_sidebar_offers_all_three_workflows(self):
+        # Recovery Milestone R8a: the sidebar's options list itself must
+        # change to add "Trader Performance" - this is the one approved
+        # change to Manual Message Entry/Review Signals' own behavior;
+        # every other assertion in this file proves the other two
+        # workflows are otherwise unaffected.
         at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(
-            at.sidebar.radio[0].options, ["Manual Message Entry", "Review Signals"]
+            at.sidebar.radio[0].options,
+            ["Manual Message Entry", "Review Signals", "Trader Performance"],
         )
 
     def test_manual_message_entry_is_the_default_selection(self):
@@ -2010,6 +2016,475 @@ class CorrectSignalWorkflowTests(unittest.TestCase):
         self.mock_parse.assert_not_called()
         self.mock_service_cls.return_value.ingest_message.assert_not_called()
         self.mock_backup.assert_not_called()
+
+
+class TraderPerformanceWorkflowTests(unittest.TestCase):
+    """Covers Recovery Milestone R8a: the Trader Performance dashboard
+    workflow. database.db.get_connection and database.service.TradeService
+    are patched for the lifetime of each test (setUp/addCleanup, not a
+    `with` block scoped only to the first .run()), matching
+    ReviewSignalsDisplayTests' own established pattern, since trader/
+    filter/lifecycle selection each trigger a full module rerun and the
+    patches must still be active for every one of them."""
+
+    _SUMMARIES = [
+        {
+            "trader_id": 1, "trader_name": "TC", "total_lifecycle_count": 2,
+            "open_count": 1, "partially_closed_count": 0, "closed_count": 1,
+            "orphan_count": 0, "unresolved_count": 0, "invalid_count": 0,
+            "snapshot_error_count": 0, "eligible_lifecycle_count": 1,
+            "not_scored_count": 1, "winning_count": 1, "losing_count": 0,
+            "breakeven_count": 0, "win_rate_pct": "100.000000",
+            "loss_rate_pct": "0.000000", "breakeven_rate_pct": "0.000000",
+            "average_gross_price_return_pct": "100.000000",
+            "median_gross_price_return_pct": "100.000000",
+            "average_winner_price_return_pct": "100.000000",
+            "average_loser_price_return_pct": None,
+            "all_current_lifecycle_ids": [1, 2], "eligible_lifecycle_ids": [1],
+            "return_ineligible_lifecycle_ids": [2],
+            "snapshot_error_lifecycle_ids": [],
+            "exclusion_reason_counts": {"status_open": 1},
+        },
+        {
+            "trader_id": 2, "trader_name": "TC", "total_lifecycle_count": 1,
+            "open_count": 0, "partially_closed_count": 0, "closed_count": 0,
+            "orphan_count": 0, "unresolved_count": 0, "invalid_count": 0,
+            "snapshot_error_count": 1, "eligible_lifecycle_count": 0,
+            "not_scored_count": 0, "winning_count": 0, "losing_count": 0,
+            "breakeven_count": 0, "win_rate_pct": None,
+            "loss_rate_pct": None, "breakeven_rate_pct": None,
+            "average_gross_price_return_pct": None,
+            "median_gross_price_return_pct": None,
+            "average_winner_price_return_pct": None,
+            "average_loser_price_return_pct": None,
+            "all_current_lifecycle_ids": [3], "eligible_lifecycle_ids": [],
+            "return_ineligible_lifecycle_ids": [],
+            "snapshot_error_lifecycle_ids": [3],
+            "exclusion_reason_counts": {},
+        },
+    ]
+
+    _LIFECYCLE_RESULTS_TRADER_1 = [
+        {
+            "trade_lifecycle_id": 1, "trader_id": 1, "trader_name": "TC",
+            "is_current": True, "superseded_at": None, "status": "closed",
+            "outcome": "win", "direction": "long", "symbol": "IBM",
+            "option_type": "call", "strike": "207.5", "expiration": "2026-07-24",
+            "opened_at": "2026-07-20T10:00:00+00:00",
+            "closed_at": "2026-07-21T10:00:00+00:00",
+            "entry_price": "1.00", "terminal_exit_price": "2.00",
+            "weighted_average_exit_price": "2.00",
+            "exit_legs": [
+                {
+                    "trade_lifecycle_event_id": 10, "trade_signal_id": 100,
+                    "sequence_index": 2, "event_type": "FULL_EXIT",
+                    "consumed_fraction": "1", "exit_price": "2.00",
+                },
+            ],
+            "gross_price_return_pct": "100.000000",
+            "eligible_for_status_counts": True, "eligible_for_outcome_metrics": True,
+            "eligible_for_return_metrics": True,
+            "lifecycle_ambiguity_flags": [], "analytics_exclusion_reasons": [],
+            "analytics_error_detail": None, "source_event_ids": [9, 10],
+        },
+        {
+            "trade_lifecycle_id": 2, "trader_id": 1, "trader_name": "TC",
+            "is_current": True, "superseded_at": None, "status": "open",
+            "outcome": "not_scored", "direction": None, "symbol": "NVDA",
+            "option_type": "call", "strike": "950", "expiration": "2026-08-15",
+            "opened_at": "2026-07-22T10:00:00+00:00", "closed_at": None,
+            "entry_price": "5.00", "terminal_exit_price": None,
+            "weighted_average_exit_price": None,
+            "exit_legs": [],
+            "gross_price_return_pct": None,
+            "eligible_for_status_counts": True, "eligible_for_outcome_metrics": False,
+            "eligible_for_return_metrics": False,
+            "lifecycle_ambiguity_flags": [], "analytics_exclusion_reasons": ["status_open"],
+            "analytics_error_detail": None, "source_event_ids": [11],
+        },
+    ]
+
+    _LIFECYCLE_RESULTS_TRADER_2 = [
+        {
+            "trade_lifecycle_id": 3, "trader_id": 2, "trader_name": "TC",
+            "is_current": True, "superseded_at": None, "status": "closed",
+            "outcome": "data_error", "direction": None, "symbol": "AVGO",
+            "option_type": "call", "strike": "150", "expiration": "2026-09-01",
+            "opened_at": None, "closed_at": None,
+            "entry_price": None, "terminal_exit_price": None,
+            "weighted_average_exit_price": None,
+            "exit_legs": [],
+            "gross_price_return_pct": None,
+            "eligible_for_status_counts": True, "eligible_for_outcome_metrics": False,
+            "eligible_for_return_metrics": False,
+            "lifecycle_ambiguity_flags": [], "analytics_exclusion_reasons": [],
+            "analytics_error_detail": "trade_lifecycle_id 3 has no membership events.",
+            "source_event_ids": [],
+        },
+    ]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        db_path = Path(self._tmp.name) / "discord_traders.db"
+        db_path.write_bytes(b"")
+
+        env_patcher = patch.dict(
+            os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        self.mock_conn = MagicMock()
+        conn_patcher = patch("database.db.get_connection", return_value=self.mock_conn)
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        service_patcher = patch("database.service.TradeService")
+        mock_service_cls = service_patcher.start()
+        self.addCleanup(service_patcher.stop)
+        mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            self._SUMMARIES
+        )
+
+        def _fake_lifecycles(*, trader_id):
+            if trader_id == 1:
+                return self._LIFECYCLE_RESULTS_TRADER_1
+            if trader_id == 2:
+                return self._LIFECYCLE_RESULTS_TRADER_2
+            return []
+
+        mock_service_cls.return_value.list_current_trade_lifecycle_analytics.side_effect = (
+            _fake_lifecycles
+        )
+        self.mock_service_cls = mock_service_cls
+
+    def _open_dashboard(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.run()
+        return at.sidebar.radio[0].set_value("Trader Performance").run()
+
+    # -- summary table ---------------------------------------------------
+
+    def test_summary_table_renders_expected_columns_and_row_count(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        self.assertEqual(len(df), 2)
+        for column in (
+            "Trader", "Total Lifecycles", "Open", "Partially Closed", "Closed",
+            "Orphan", "Unresolved", "Invalid", "Data Errors", "Eligible",
+            "Not Scored", "Wins", "Losses", "Breakeven", "Win Rate", "Loss Rate",
+            "Breakeven Rate", "Avg Return", "Median Return",
+            "Avg Winner Return", "Avg Loser Return",
+        ):
+            self.assertIn(column, df.columns)
+
+    def test_duplicate_trader_names_render_distinct_labels(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        self.assertEqual(list(df["Trader"]), ["TC (ID 1)", "TC (ID 2)"])
+
+    def test_none_percentage_fields_render_as_em_dash_not_zero(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        row_two = df[df["Trader"] == "TC (ID 2)"].iloc[0]
+        self.assertEqual(row_two["Win Rate"], "—")
+        self.assertEqual(row_two["Avg Return"], "—")
+        self.assertEqual(row_two["Avg Loser Return"], "—")
+
+    def test_data_error_indicator_visible_without_verbatim_detail_in_summary(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        row_one = df[df["Trader"] == "TC (ID 1)"].iloc[0]
+        row_two = df[df["Trader"] == "TC (ID 2)"].iloc[0]
+        self.assertEqual(row_one["Data Errors"], "0")
+        self.assertEqual(row_two["Data Errors"], "⚠ 1")
+        self.assertNotIn("has no membership events", df.to_string())
+
+    def test_summary_order_matches_service_return_order(self):
+        # Local fixture (never mutating the shared class-level
+        # _SUMMARIES list), deliberately in non-ascending trader_id
+        # order - this can only pass if the UI truly preserves whatever
+        # order the service returned, not merely because the fixture
+        # already happened to already be trader_id-ascending.
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {**template, "trader_id": 9, "trader_name": "Zeta"},
+            {**template, "trader_id": 2, "trader_name": "Alpha"},
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        self.assertEqual(list(df["Trader"]), ["Zeta (ID 9)", "Alpha (ID 2)"])
+
+    # -- empty/missing/failure states -------------------------------------
+
+    def test_missing_database_shows_empty_message_and_opens_no_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = Path(tmp) / "does_not_exist.db"
+            with patch.dict(
+                os.environ, {"DISCORD_TRADERS_DB_PATH": str(missing_path)}, clear=False
+            ), patch("database.db.get_connection") as mock_get_connection, patch(
+                "database.db.initialize_database"
+            ) as mock_init:
+                at = AppTest.from_file("app/streamlit_app.py")
+                at.run()
+                at = at.sidebar.radio[0].set_value("Trader Performance").run()
+
+        self.assertEqual(len(at.info), 1)
+        self.assertEqual(at.info[0].value, "No trader performance data found.")
+        mock_get_connection.assert_not_called()
+        mock_init.assert_not_called()
+
+    def test_empty_summary_shows_fixed_message(self):
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            []
+        )
+        at = self._open_dashboard()
+
+        self.assertEqual(len(at.info), 1)
+        self.assertEqual(at.info[0].value, "No trader performance data found.")
+
+    def test_summary_load_failure_shows_fixed_message_and_logs_sanitized(self):
+        self.mock_service_cls.return_value.list_trader_performance_summaries.side_effect = (
+            sqlite3.OperationalError("SENTINEL_DASH_SUMMARY_EXC_991")
+        )
+        with self.assertLogs("discord_traders", level="ERROR") as captured:
+            at = self._open_dashboard()
+
+        self.assertEqual(len(at.error), 1)
+        self.assertEqual(at.error[0].value, "Could not load trader performance data.")
+        joined = "\n".join(captured.output)
+        self.assertNotIn("SENTINEL_DASH_SUMMARY_EXC_991", joined)
+        self.assertTrue(
+            all(record.levelno < logging.CRITICAL for record in captured.records)
+        )
+
+    def test_drilldown_load_failure_shows_fixed_message_and_logs_sanitized(self):
+        self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.side_effect = (
+            sqlite3.OperationalError("SENTINEL_DASH_DRILLDOWN_EXC_552")
+        )
+        with self.assertLogs("discord_traders", level="ERROR") as captured:
+            at = self._open_dashboard()
+
+        self.assertEqual(len(at.error), 1)
+        self.assertEqual(
+            at.error[0].value, "Could not load lifecycle details for this trader."
+        )
+        joined = "\n".join(captured.output)
+        self.assertNotIn("SENTINEL_DASH_DRILLDOWN_EXC_552", joined)
+
+    def test_no_lifecycles_match_filters_shows_message(self):
+        at = self._open_dashboard()
+
+        at = at.text_input[0].set_value("ZZZZ").run()
+
+        self.assertEqual(len(at.info), 1)
+        self.assertEqual(at.info[0].value, "No lifecycles match the current filters.")
+
+    # -- trader selection and drill-down -----------------------------------
+
+    def test_trader_selector_defaults_to_first_available_trader(self):
+        at = self._open_dashboard()
+
+        self.assertEqual(at.selectbox[0].value, 1)
+
+    def test_selecting_trader_invokes_drilldown_with_correct_trader_id(self):
+        at = self._open_dashboard()
+
+        at.selectbox[0].set_value(2).run()
+
+        self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.assert_called_with(
+            trader_id=2
+        )
+
+    def test_drilldown_table_renders_expected_columns(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[1].value
+        for column in (
+            "Lifecycle ID", "Symbol", "Option Type", "Strike", "Expiration",
+            "Status", "Outcome", "Direction", "Entry Price", "Terminal Exit Price",
+            "Weighted Avg Exit Price", "Return", "Opened At", "Closed At",
+            "Ambiguity Flags", "Exclusion Reasons", "Data Error",
+        ):
+            self.assertIn(column, df.columns)
+        self.assertNotIn("Error Detail", df.columns)
+
+    def test_status_filter_narrows_drilldown_rows(self):
+        at = self._open_dashboard()
+
+        at = at.multiselect[0].set_value(["open"]).run()
+
+        df = at.dataframe[1].value
+        self.assertEqual(list(df["Lifecycle ID"]), [2])
+
+    def test_outcome_filter_narrows_drilldown_rows(self):
+        at = self._open_dashboard()
+
+        at = at.multiselect[1].set_value(["win"]).run()
+
+        df = at.dataframe[1].value
+        self.assertEqual(list(df["Lifecycle ID"]), [1])
+
+    def test_symbol_filter_exact_uppercase_match(self):
+        at = self._open_dashboard()
+
+        at = at.text_input[0].set_value("ibm").run()
+
+        df = at.dataframe[1].value
+        self.assertEqual(list(df["Lifecycle ID"]), [1])
+
+    def test_combined_filters_apply_together(self):
+        # Local fixture (never mutating the shared class-level
+        # _LIFECYCLE_RESULTS_TRADER_1 list): status=["closed"] alone
+        # matches two rows (1, 2), outcome=["win"] alone also matches
+        # two different rows (1, 3) - only their intersection can ever
+        # produce the single expected row, proving genuine AND
+        # combination rather than one filter happening to be sufficient
+        # by itself.
+        template = self._LIFECYCLE_RESULTS_TRADER_1[0]
+        local_results = [
+            {**template, "trade_lifecycle_id": 1, "status": "closed", "outcome": "win"},
+            {**template, "trade_lifecycle_id": 2, "status": "closed", "outcome": "loss"},
+            {**template, "trade_lifecycle_id": 3, "status": "open", "outcome": "win"},
+            {
+                **template, "trade_lifecycle_id": 4, "status": "open",
+                "outcome": "not_scored",
+            },
+        ]
+        self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.side_effect = (
+            lambda *, trader_id: local_results
+        )
+
+        at = self._open_dashboard()
+
+        at.multiselect[0].set_value(["closed"])
+        at = at.multiselect[1].set_value(["win"]).run()
+
+        df = at.dataframe[1].value
+        self.assertEqual(list(df["Lifecycle ID"]), [1])
+
+    def test_exclusion_reasons_visible_in_drilldown(self):
+        at = self._open_dashboard()
+
+        df = at.dataframe[1].value
+        not_scored_row = df[df["Lifecycle ID"] == 2].iloc[0]
+        self.assertEqual(not_scored_row["Exclusion Reasons"], "status_open")
+
+    def test_ambiguity_flags_visible_in_drilldown(self):
+        # Local fixture (never mutating the shared class-level list) -
+        # no existing fixture lifecycle carries a non-empty
+        # lifecycle_ambiguity_flags value, so the real st.dataframe()
+        # column rendering for that case was previously proven only at
+        # the pure-formatting unit level (test_dashboard_formatting.py),
+        # never through the actual Streamlit wiring.
+        template = self._LIFECYCLE_RESULTS_TRADER_1[0]
+        local_results = [
+            {
+                **template,
+                "trade_lifecycle_id": 99,
+                "lifecycle_ambiguity_flags": ["ambiguous_add_no_open_position"],
+            },
+        ]
+        self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.side_effect = (
+            lambda *, trader_id: local_results
+        )
+
+        at = self._open_dashboard()
+
+        df = at.dataframe[1].value
+        row = df[df["Lifecycle ID"] == 99].iloc[0]
+        self.assertEqual(row["Ambiguity Flags"], "ambiguous_add_no_open_position")
+
+    # -- lifecycle detail --------------------------------------------------
+
+    def test_lifecycle_detail_shows_exit_legs(self):
+        at = self._open_dashboard()
+
+        at = at.selectbox[1].set_value(1).run()
+
+        df = at.dataframe[2].value
+        self.assertEqual(list(df["Event Type"]), ["FULL_EXIT"])
+        self.assertEqual(list(df["Consumed Fraction"]), ["1"])
+        self.assertEqual(list(df["Exit Price"]), ["2.00"])
+        self.assertEqual(list(df["Sequence Index"]), [2])
+
+    def test_lifecycle_detail_shows_verbatim_error_detail_for_data_error_lifecycle(self):
+        at = self._open_dashboard()
+
+        at = at.selectbox[0].set_value(2).run()
+        at = at.selectbox[1].set_value(3).run()
+
+        detail_text = "\n".join(element.value for element in at.markdown)
+        self.assertIn(
+            "trade_lifecycle_id 3 has no membership events.", detail_text
+        )
+
+    def test_lifecycle_detail_shows_em_dash_for_normal_lifecycle(self):
+        at = self._open_dashboard()
+
+        at = at.selectbox[1].set_value(1).run()
+
+        detail_text = "\n".join(element.value for element in at.markdown)
+        self.assertIn("Data Error Detail: —", detail_text)
+
+    def test_open_lifecycle_with_no_exit_legs_shows_message_not_empty_table(self):
+        at = self._open_dashboard()
+
+        at = at.selectbox[1].set_value(2).run()
+
+        detail_text = "\n".join(element.value for element in at.markdown)
+        self.assertIn("No exit events for this lifecycle.", detail_text)
+        self.assertEqual(len(at.dataframe), 2)  # summary + drilldown only
+
+    # -- stale-selection safety ---------------------------------------------
+
+    def test_selected_trader_no_longer_present_is_cleared_without_raising(self):
+        at = self._open_dashboard()
+        at = at.selectbox[0].set_value(2).run()
+
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            [self._SUMMARIES[0]]
+        )
+        at = at.run()
+
+        self.assertEqual(at.selectbox[0].value, 1)
+
+    def test_selected_lifecycle_no_longer_matching_filters_is_cleared_without_raising(
+        self,
+    ):
+        at = self._open_dashboard()
+        at = at.selectbox[1].set_value(2).run()
+
+        at = at.multiselect[0].set_value(["closed"]).run()
+
+        self.assertEqual(list(at.dataframe[1].value["Lifecycle ID"]), [1])
+        self.assertEqual(at.selectbox[1].value, 1)
+
+    # -- isolation from other workflows --------------------------------------
+
+    def test_trader_performance_does_not_invoke_other_workflow_methods(self):
+        at = self._open_dashboard()
+
+        self.mock_service_cls.return_value.ingest_message.assert_not_called()
+        self.mock_service_cls.return_value.list_trade_signals_for_review.assert_not_called()
+        self.mock_service_cls.return_value.correct_trade_signal.assert_not_called()
+
+    def test_trader_performance_never_writes(self):
+        at = self._open_dashboard()
+
+        self.mock_conn.commit.assert_not_called()
+        self.mock_conn.rollback.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

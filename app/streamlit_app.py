@@ -76,6 +76,13 @@ from pathlib import Path
 
 import streamlit as st
 
+from app.dashboard_formatting import (
+    build_lifecycle_detail,
+    build_lifecycle_display_rows,
+    build_summary_display_rows,
+    build_trader_label,
+    filter_lifecycle_results,
+)
 from app.logging_config import (
     configure_console_logging,
     configure_file_logging,
@@ -111,6 +118,16 @@ _CORRECTION_CONFLICT_MESSAGE = (
 _CORRECTION_FAILURE_MESSAGE = "Could not save the trade signal correction."
 _CORRECTION_SUCCESS_MESSAGE = "Trade signal correction saved."
 _AUDIT_HISTORY_FAILURE_MESSAGE = "Could not load correction history."
+_DASHBOARD_EMPTY_MESSAGE = "No trader performance data found."
+_DASHBOARD_LOAD_FAILURE_MESSAGE = "Could not load trader performance data."
+_DASHBOARD_DRILLDOWN_LOAD_FAILURE_MESSAGE = (
+    "Could not load lifecycle details for this trader."
+)
+_DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE = "No lifecycles match the current filters."
+_DASHBOARD_STATUS_CHOICES = [
+    "open", "partially_closed", "closed", "orphan", "unresolved", "invalid",
+]
+_DASHBOARD_OUTCOME_CHOICES = ["win", "loss", "breakeven", "not_scored", "data_error"]
 
 
 def _correction_selectbox_choices(base_choices: list[str], current_value: str) -> list[str]:
@@ -132,7 +149,9 @@ logger = logging.getLogger("discord_traders.app")
 configure_console_logging()
 logger.info("Discord Traders UI started")
 
-workflow = st.sidebar.radio("Workflow", ["Manual Message Entry", "Review Signals"])
+workflow = st.sidebar.radio(
+    "Workflow", ["Manual Message Entry", "Review Signals", "Trader Performance"]
+)
 
 if workflow == "Manual Message Entry":
     st.title("Discord Traders - Manual Message Entry")
@@ -545,6 +564,136 @@ elif workflow == "Review Signals":
                                 for entry in audit_history
                             ]
                         )
+        finally:
+            if conn is not None:
+                conn.close()
+
+elif workflow == "Trader Performance":
+    st.title("Discord Traders - Trader Performance")
+
+    db_path = resolve_database_path()
+
+    if not Path(db_path).exists():
+        # Strictly read-only, mirroring Review Signals: never
+        # initialize_database(), never create the parent directory or
+        # the database file, never open a connection, when the
+        # production database does not already exist.
+        st.info(_DASHBOARD_EMPTY_MESSAGE)
+    else:
+        conn: sqlite3.Connection | None = None
+        try:
+            config = DatabaseConfig(db_path=db_path)
+            conn = get_connection(config)
+            service = TradeService(conn)
+            summaries = service.list_trader_performance_summaries()
+        except Exception as exc:
+            log_operation_failure(logger, "trader performance summary load", exc)
+            st.error(_DASHBOARD_LOAD_FAILURE_MESSAGE)
+        else:
+            if not summaries:
+                st.info(_DASHBOARD_EMPTY_MESSAGE)
+            else:
+                st.subheader("Trader Summary")
+                st.dataframe(build_summary_display_rows(summaries))
+
+                trader_ids = [summary["trader_id"] for summary in summaries]
+                trader_names_by_id = {
+                    summary["trader_id"]: summary["trader_name"] for summary in summaries
+                }
+
+                # A previously selected trader that no longer has a
+                # current lifecycle (e.g. its last one was corrected
+                # away on an earlier rerun) is cleared before the
+                # selectbox renders, so Streamlit falls back to a valid
+                # default instead of raising for a stale session_state
+                # value - the same pattern already used for
+                # correction_signal_id in the Review Signals workflow.
+                if (
+                    "dashboard_trader_select" in st.session_state
+                    and st.session_state["dashboard_trader_select"] not in trader_ids
+                ):
+                    st.session_state.pop("dashboard_trader_select", None)
+
+                selected_trader_id = st.selectbox(
+                    "Select a trader to drill in",
+                    trader_ids,
+                    format_func=lambda trader_id: build_trader_label(
+                        trader_id, trader_names_by_id[trader_id]
+                    ),
+                    key="dashboard_trader_select",
+                )
+
+                try:
+                    lifecycle_results = service.list_current_trade_lifecycle_analytics(
+                        trader_id=selected_trader_id
+                    )
+                except Exception as exc:
+                    log_operation_failure(
+                        logger, "trader lifecycle drill-down load", exc
+                    )
+                    st.error(_DASHBOARD_DRILLDOWN_LOAD_FAILURE_MESSAGE)
+                else:
+                    selected_trader_label = build_trader_label(
+                        selected_trader_id, trader_names_by_id[selected_trader_id]
+                    )
+                    st.subheader(f"{selected_trader_label} - Lifecycle Detail")
+
+                    status_filter = st.multiselect(
+                        "Status filter", _DASHBOARD_STATUS_CHOICES
+                    )
+                    outcome_filter = st.multiselect(
+                        "Outcome filter", _DASHBOARD_OUTCOME_CHOICES
+                    )
+                    symbol_filter = st.text_input("Symbol filter (exact match)")
+
+                    filtered_results = filter_lifecycle_results(
+                        lifecycle_results,
+                        statuses=status_filter,
+                        outcomes=outcome_filter,
+                        symbol=symbol_filter,
+                    )
+
+                    if not filtered_results:
+                        st.info(_DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE)
+                    else:
+                        st.dataframe(build_lifecycle_display_rows(filtered_results))
+
+                        lifecycle_ids = [
+                            result["trade_lifecycle_id"] for result in filtered_results
+                        ]
+                        results_by_id = {
+                            result["trade_lifecycle_id"]: result
+                            for result in filtered_results
+                        }
+
+                        # A previously selected lifecycle that no longer
+                        # appears under the current trader/filters (a
+                        # trader change, or a filter narrowing it out)
+                        # is cleared the same way as the trader
+                        # selection above - one inclusion check handles
+                        # both causes without distinguishing them.
+                        if (
+                            "dashboard_lifecycle_select" in st.session_state
+                            and st.session_state["dashboard_lifecycle_select"]
+                            not in lifecycle_ids
+                        ):
+                            st.session_state.pop("dashboard_lifecycle_select", None)
+
+                        selected_lifecycle_id = st.selectbox(
+                            "Select a lifecycle ID for detail",
+                            lifecycle_ids,
+                            key="dashboard_lifecycle_select",
+                        )
+                        selected_result = results_by_id[selected_lifecycle_id]
+                        detail = build_lifecycle_detail(selected_result)
+
+                        st.subheader(f"Lifecycle {selected_lifecycle_id} Detail")
+                        st.write(f"Data Error Detail: {detail['error_detail']}")
+
+                        if not detail["exit_leg_rows"]:
+                            st.write("No exit events for this lifecycle.")
+                        else:
+                            st.dataframe(detail["exit_leg_rows"])
         finally:
             if conn is not None:
                 conn.close()

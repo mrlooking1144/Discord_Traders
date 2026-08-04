@@ -3080,6 +3080,49 @@ def list_current_trade_lifecycles(
     return results
 
 
+def get_all_current_trade_lifecycles(
+    conn: sqlite3.Connection,
+    *,
+    trader_id: int | None = None,
+) -> list[TradeLifecycle]:
+    """List every current (is_current=1) lifecycle generation, in full,
+    with no LIMIT of any kind.
+
+    The analytics-completeness counterpart to list_current_trade_lifecycles():
+    that function is a bounded, newest-first *display* reader for the
+    Review UI (default LIMIT 100) and must never be repurposed to back a
+    "did we see every current lifecycle" guarantee - it offers no way for
+    a caller to detect truncation. This function instead follows the same
+    unbounded-scan precedent already established by
+    get_all_current_lifecycle_keys() (used by rebuild_all_lifecycles() for
+    whole-database correctness), but returns full TradeLifecycle rows
+    rather than deduplicated key tuples, since analytics needs each
+    generation's own id/status/opened-closed pointers, not just its key.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        trader_id: FK to traders.id to filter by, or None for every
+            trader.
+
+    Returns:
+        Every matching TradeLifecycle, ordered by id ascending
+        (deterministic; not a display "newest first" convention). Empty
+        list if none match.
+    """
+    if trader_id is None:
+        rows = conn.execute(
+            f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles "
+            "WHERE is_current = 1 ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_TRADE_LIFECYCLE_COLUMNS} FROM trade_lifecycles "
+            "WHERE is_current = 1 AND trader_id = ? ORDER BY id",
+            (trader_id,),
+        ).fetchall()
+    return [_row_to_trade_lifecycle(row) for row in rows]
+
+
 def get_all_current_lifecycle_keys(conn: sqlite3.Connection) -> list[tuple]:
     """List every distinct normalized key among all current (is_current=1)
     lifecycle generations - including a key whose generation(s) no longer

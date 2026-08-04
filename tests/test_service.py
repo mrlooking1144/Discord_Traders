@@ -54,9 +54,11 @@ from database.service import (
     AMBIGUITY_FLAG_TRADER_IDENTITY_MISSING,
     DUPLICATE_WINDOW_MINUTES,
     AuditHistoryError,
+    LifecycleAnalyticsError,
     LifecycleSnapshotError,
     ReprocessingNotSupportedError,
     StaleTradeSignalError,
+    TradeLifecycleNotFoundError,
     TradeService,
     TradeSignalNotFoundError,
     _REQUIRED_SNAPSHOT_FIELDS,
@@ -1294,6 +1296,314 @@ class TradeServiceLifecycleReadTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNone(row_after_rollback)
             other_connection.close()
+
+
+class TradeServiceAnalyticsTests(unittest.TestCase):
+    """Covers Recovery Milestone R7:
+    TradeService.get_trade_lifecycle_analytics(),
+    TradeService.list_current_trade_lifecycle_analytics(), and
+    TradeService.list_trader_performance_summaries().
+
+    Exercises the real pipeline (real trade_signals -> real
+    rebuild_all_lifecycles()/correct_trade_signal() -> real persisted
+    trade_lifecycles/trade_lifecycle_events) through a real, temporary,
+    file-backed SQLite database - no lifecycle-engine or repository
+    mocking - so these tests prove the three new methods' real,
+    end-to-end orchestration, not just their call arguments.
+    """
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+        self.service = TradeService(self.connection)
+        self.source = get_or_create_source(self.connection, "discord")
+        self.connection.commit()
+        self.trader = create_trader(self.connection, self.source.id, "TC")
+        self.connection.commit()
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _make_signal(
+        self, *, symbol="IBM", action="BOUGHT", event_type="ENTRY",
+        qualifier=None, price=None, strike=None, expiration="2026-07-24",
+        trader_id=None,
+    ):
+        raw_message = create_raw_message(self.connection, self.source.id, "x")
+        signal = create_trade_signal(
+            self.connection,
+            raw_message.id,
+            trader_id if trader_id is not None else self.trader.id,
+            symbol,
+            action,
+            option_type="call",
+            strike=strike,
+            expiration=expiration,
+            event_type=event_type,
+            qualifier=qualifier,
+            price=price,
+        )
+        self.connection.commit()
+        return signal, raw_message
+
+    def _build_closed_long_lifecycle(self, symbol="IBM", trader_id=None):
+        """Persist a real ENTRY + FULL_EXIT pair for one key and rebuild,
+        returning the resulting current trade_lifecycles.id."""
+        self._make_signal(
+            symbol=symbol, action="BTO", event_type="ENTRY",
+            price=Decimal("1.00"), strike=Decimal("207.5"), trader_id=trader_id,
+        )
+        self._make_signal(
+            symbol=symbol, action="STC", event_type="FULL_EXIT", qualifier="ALL OUT",
+            price=Decimal("2.00"), strike=Decimal("207.5"), trader_id=trader_id,
+        )
+        self.service.rebuild_all_lifecycles()
+        lifecycles = repository.get_current_lifecycles_for_key(
+            self.connection,
+            trader_id if trader_id is not None else self.trader.id,
+            symbol, "call", Decimal("207.5"), "2026-07-24",
+        )
+        self.assertEqual(len(lifecycles), 1)
+        return lifecycles[0].id
+
+    # -- get_trade_lifecycle_analytics(): strict ------------------------
+
+    def test_strict_raises_not_found_for_missing_id(self):
+        with self.assertRaises(TradeLifecycleNotFoundError):
+            self.service.get_trade_lifecycle_analytics(999999)
+
+    def test_strict_raises_analytics_error_for_zero_events(self):
+        bare = repository.create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        self.connection.commit()
+
+        with self.assertRaises(LifecycleAnalyticsError):
+            self.service.get_trade_lifecycle_analytics(bare.id)
+
+    def test_strict_propagates_lifecycle_snapshot_error_unchanged(self):
+        signal, _ = self._make_signal(action="BTO", event_type="ENTRY", price=Decimal("1.00"))
+        bare = repository.create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="closed",
+            remaining_fraction="0",
+        )
+        repository.create_trade_lifecycle_event(
+            self.connection, bare.id, signal.id, 1, "not valid json",
+        )
+        self.connection.commit()
+
+        with self.assertRaises(LifecycleSnapshotError):
+            self.service.get_trade_lifecycle_analytics(bare.id)
+
+    def test_strict_returns_correct_result_for_real_long_win(self):
+        lifecycle_id = self._build_closed_long_lifecycle()
+
+        result = self.service.get_trade_lifecycle_analytics(lifecycle_id)
+
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["direction"], "long")
+        self.assertEqual(Decimal(result["gross_price_return_pct"]), Decimal("100.000000"))
+        self.assertTrue(result["is_current"])
+        self.assertIsNone(result["superseded_at"])
+        self.assertIsInstance(result["exit_legs"], list)
+        self.assertIsInstance(result["source_event_ids"], list)
+        self.assertEqual(len(result["exit_legs"]), 1)
+        self.assertIsInstance(result["exit_legs"][0], dict)
+
+    def test_strict_accepts_superseded_id_and_exposes_supersession_metadata(self):
+        old_lifecycle_id = self._build_closed_long_lifecycle(symbol="IBM")
+        self._make_signal(
+            symbol="AVGO", action="BTO", event_type="ENTRY",
+            price=Decimal("5.00"),
+        )
+        # Correct the original IBM entry's symbol to a new key - a
+        # key-changing correction that triggers a targeted rebuild,
+        # superseding the old IBM generation.
+        original_entry = repository.get_current_trade_signals_for_key(
+            self.connection, self.trader.id, "IBM", "call", Decimal("207.5"), "2026-07-24",
+        )[0]
+        self.service.correct_trade_signal(
+            original_entry.trade_signal_id,
+            expected_current_values={
+                "symbol": "IBM", "action": "BTO", "option_type": "call",
+                "price": Decimal("1.00"), "expiration": "2026-07-24",
+                "position_size": None,
+            },
+            symbol="IBMX", action="BTO", option_type="call",
+            price=Decimal("1.00"), expiration="2026-07-24", position_size=None,
+        )
+
+        old_result = self.service.get_trade_lifecycle_analytics(old_lifecycle_id)
+        self.assertFalse(old_result["is_current"])
+        self.assertIsNotNone(old_result["superseded_at"])
+
+    # -- list_current_trade_lifecycle_analytics(): tolerant -------------
+
+    def test_tolerant_isolates_data_error_lifecycle_from_clean_ones(self):
+        clean_id = self._build_closed_long_lifecycle(symbol="IBM")
+        broken_signal, _ = self._make_signal(
+            symbol="AVGO", action="BTO", event_type="ENTRY", price=Decimal("1.00"),
+        )
+        broken = repository.create_trade_lifecycle(
+            self.connection, self.trader.id, "AVGO", status="closed",
+            remaining_fraction="0",
+        )
+        broken_event = repository.create_trade_lifecycle_event(
+            self.connection, broken.id, broken_signal.id, 1, "not valid json",
+        )
+        self.connection.commit()
+
+        results = self.service.list_current_trade_lifecycle_analytics()
+        by_id = {r["trade_lifecycle_id"]: r for r in results}
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(by_id[clean_id]["outcome"], "win")
+        self.assertEqual(by_id[broken.id]["outcome"], "data_error")
+        self.assertIsNotNone(by_id[broken.id]["analytics_error_detail"])
+        # The membership row was found (unlike the zero-event case) - its
+        # own content just failed to decode - so source_event_ids
+        # reflects the event id(s) that were actually found, never
+        # assumed empty just because the call ultimately failed.
+        self.assertEqual(by_id[broken.id]["source_event_ids"], [broken_event.id])
+
+    def test_tolerant_zero_event_lifecycle_becomes_data_error_not_omitted(self):
+        bare = repository.create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        self.connection.commit()
+
+        results = self.service.list_current_trade_lifecycle_analytics()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["outcome"], "data_error")
+        self.assertEqual(results[0]["trade_lifecycle_id"], bare.id)
+
+    def test_no_truncation_over_one_hundred_current_lifecycles(self):
+        created_ids = []
+        for _ in range(101):
+            lifecycle = repository.create_trade_lifecycle(
+                self.connection, self.trader.id, "IBM", status="open",
+                remaining_fraction="1",
+            )
+            created_ids.append(lifecycle.id)
+        self.connection.commit()
+
+        results = self.service.list_current_trade_lifecycle_analytics()
+
+        self.assertEqual(len(results), 101)
+        self.assertEqual(
+            {r["trade_lifecycle_id"] for r in results}, set(created_ids)
+        )
+
+    def test_trader_id_filter_scopes_to_one_trader(self):
+        other_trader = create_trader(self.connection, self.source.id, "Sarang")
+        self.connection.commit()
+        own_id = self._build_closed_long_lifecycle(symbol="IBM")
+        self._build_closed_long_lifecycle(symbol="AVGO", trader_id=other_trader.id)
+
+        results = self.service.list_current_trade_lifecycle_analytics(
+            trader_id=self.trader.id
+        )
+
+        self.assertEqual([r["trade_lifecycle_id"] for r in results], [own_id])
+
+    # -- list_trader_performance_summaries() ----------------------------
+
+    def test_several_trader_ids_sharing_the_same_name_are_never_merged(self):
+        duplicate_named_trader = create_trader(self.connection, self.source.id, "TC")
+        self.connection.commit()
+        self._build_closed_long_lifecycle(symbol="IBM")
+        self._build_closed_long_lifecycle(symbol="AVGO", trader_id=duplicate_named_trader.id)
+
+        summaries = self.service.list_trader_performance_summaries()
+
+        self.assertEqual(len(summaries), 2)
+        trader_ids = [s["trader_id"] for s in summaries]
+        self.assertEqual(trader_ids, sorted(trader_ids))
+        self.assertEqual(set(trader_ids), {self.trader.id, duplicate_named_trader.id})
+        for summary in summaries:
+            self.assertEqual(summary["eligible_lifecycle_count"], 1)
+            self.assertEqual(summary["winning_count"], 1)
+
+    def test_ordered_by_trader_id_ascending_never_ranked_by_performance(self):
+        losing_trader = create_trader(self.connection, self.source.id, "Loser")
+        self.connection.commit()
+        # Ensure the losing trader has the *lower* id if created second is
+        # actually higher - build it explicitly with a losing lifecycle so
+        # a performance-based sort would reorder these, then assert it did
+        # not.
+        self._build_closed_long_lifecycle(symbol="IBM")
+        self._make_signal(
+            symbol="MU", action="BTO", event_type="ENTRY", price=Decimal("2.00"),
+            strike=Decimal("950"), trader_id=losing_trader.id,
+        )
+        self._make_signal(
+            symbol="MU", action="STC", event_type="FULL_EXIT", qualifier="ALL OUT",
+            price=Decimal("1.00"), strike=Decimal("950"), trader_id=losing_trader.id,
+        )
+        self.service.rebuild_all_lifecycles()
+
+        summaries = self.service.list_trader_performance_summaries()
+
+        trader_ids_in_result = [s["trader_id"] for s in summaries]
+        self.assertEqual(trader_ids_in_result, sorted(trader_ids_in_result))
+
+    def test_no_trader_id_filter_lists_every_trader_with_current_lifecycles(self):
+        other_trader = create_trader(self.connection, self.source.id, "Sarang")
+        self.connection.commit()
+        self._build_closed_long_lifecycle(symbol="IBM")
+        self._build_closed_long_lifecycle(symbol="AVGO", trader_id=other_trader.id)
+
+        summaries = self.service.list_trader_performance_summaries()
+
+        self.assertEqual({s["trader_id"] for s in summaries}, {self.trader.id, other_trader.id})
+
+    def test_reconciliation_invariants_hold_for_real_mixed_data(self):
+        self._build_closed_long_lifecycle(symbol="IBM")
+        repository.create_trade_lifecycle(
+            self.connection, self.trader.id, "NVDA", status="open",
+            remaining_fraction="1",
+        )
+        self.connection.commit()
+
+        summaries = self.service.list_trader_performance_summaries()
+        summary = next(s for s in summaries if s["trader_id"] == self.trader.id)
+
+        self.assertEqual(
+            summary["total_lifecycle_count"],
+            summary["open_count"] + summary["partially_closed_count"]
+            + summary["closed_count"] + summary["orphan_count"]
+            + summary["unresolved_count"] + summary["invalid_count"],
+        )
+        self.assertEqual(
+            summary["total_lifecycle_count"],
+            summary["eligible_lifecycle_count"] + summary["not_scored_count"]
+            + summary["snapshot_error_count"],
+        )
+
+    def test_summary_and_list_share_one_underlying_computation(self):
+        self._build_closed_long_lifecycle(symbol="IBM")
+        self._build_closed_long_lifecycle(symbol="AVGO")
+
+        with patch.object(
+            TradeService, "_lifecycle_analytics_or_error",
+            wraps=TradeService._lifecycle_analytics_or_error,
+            autospec=True,
+        ) as spy:
+            summaries = self.service.list_trader_performance_summaries()
+
+        # Exactly one computation per current lifecycle for this one
+        # call - never twice (e.g. once to build a list, once again to
+        # summarize it).
+        self.assertEqual(spy.call_count, 2)
+        self.assertEqual(summaries[0]["eligible_lifecycle_count"], 2)
 
 
 class TradeServiceControlledCorrectionTests(unittest.TestCase):

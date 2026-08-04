@@ -34,6 +34,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.datetime_resolution import resolve_expiration, resolve_footer_timestamp
 from app.discord_adapter import segment_discord_batch
 from app.parser import PARSER_VERSION, extract_trade_event
+from database.analytics import (
+    build_data_error_result,
+    compute_lifecycle_analytics,
+    summarize_trader_performance,
+)
 from database.lifecycle import (
     FLAG_INCOMPLETE_CONTRACT_IDENTITY,
     STATUS_UNRESOLVED,
@@ -61,6 +66,7 @@ from database.repository import (
     delete_import_batch_if_empty,
     get_all_current_lifecycle_eligible_signal_ids,
     get_all_current_lifecycle_keys,
+    get_all_current_trade_lifecycles,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
     get_chronological_positions_for_raw_messages,
@@ -411,6 +417,30 @@ class LifecycleSnapshotError(Exception):
         super().__init__(message)
 
 
+class TradeLifecycleNotFoundError(ValueError):
+    """Raised by TradeService.get_trade_lifecycle_analytics() (Recovery
+    Milestone R7) when trade_lifecycle_id references no trade_lifecycles
+    row at all, current or superseded. A ValueError subclass, matching
+    this project's existing not-found exception convention
+    (TradeSignalNotFoundError)."""
+
+
+class LifecycleAnalyticsError(Exception):
+    """Raised by TradeService.get_trade_lifecycle_analytics() (Recovery
+    Milestone R7) when a trade_lifecycles row exists but has zero
+    trade_lifecycle_events membership rows.
+
+    Distinct from LifecycleSnapshotError: that exception covers a
+    membership row whose own signal_snapshot content is malformed; this
+    one covers the case where no membership row exists to validate at
+    all - a schema-unconstrained data-integrity condition that must never
+    be silently treated as "zero events, therefore nothing to report."
+    Never raised by the tolerant list_current_trade_lifecycle_analytics()/
+    list_trader_performance_summaries() read paths, which instead surface
+    this same condition as a per-lifecycle 'data_error' analytics result.
+    """
+
+
 _REQUIRED_SNAPSHOT_FIELDS = frozenset(
     {
         "trade_signal_id", "raw_message_id", "trader_id", "symbol", "option_type",
@@ -609,6 +639,44 @@ def _validate_and_decode_snapshot(trade_lifecycle_id: int, event) -> dict:
         )
 
     return decoded
+
+
+def _lifecycle_analytics_result_to_dict(result) -> dict:
+    """Convert one database.analytics.LifecycleAnalyticsResult (a frozen,
+    internal dataclass) into a plain dict for TradeService's public
+    boundary - matching list_trade_lifecycle_events()'s existing
+    plain-dict convention (Recovery Milestone R7 planning: "keep the
+    public TradeService boundary as plain dictionaries for consistency
+    with R6.7"). Every tuple-typed field is converted to a list, since a
+    tuple is not the expected shape for a public, JSON-friendly result;
+    dataclasses.asdict() already recurses into the nested ExitLeg
+    dataclasses within exit_legs, producing a tuple of dicts, so only the
+    outer container needs converting.
+    """
+    result_dict = asdict(result)
+    result_dict["exit_legs"] = list(result_dict["exit_legs"])
+    result_dict["lifecycle_ambiguity_flags"] = list(result_dict["lifecycle_ambiguity_flags"])
+    result_dict["analytics_exclusion_reasons"] = list(
+        result_dict["analytics_exclusion_reasons"]
+    )
+    result_dict["source_event_ids"] = list(result_dict["source_event_ids"])
+    return result_dict
+
+
+def _trader_performance_summary_to_dict(summary) -> dict:
+    """Convert one database.analytics.TraderPerformanceSummary (a frozen,
+    internal dataclass) into a plain dict for TradeService's public
+    boundary, converting every tuple-typed id-list field to a list."""
+    summary_dict = asdict(summary)
+    summary_dict["all_current_lifecycle_ids"] = list(summary_dict["all_current_lifecycle_ids"])
+    summary_dict["eligible_lifecycle_ids"] = list(summary_dict["eligible_lifecycle_ids"])
+    summary_dict["return_ineligible_lifecycle_ids"] = list(
+        summary_dict["return_ineligible_lifecycle_ids"]
+    )
+    summary_dict["snapshot_error_lifecycle_ids"] = list(
+        summary_dict["snapshot_error_lifecycle_ids"]
+    )
+    return summary_dict
 
 
 class _RebuildCounters:
@@ -1198,6 +1266,315 @@ class TradeService:
             }
             for event in events
         ]
+
+    # -----------------------------------------------------------------
+    # Recovery Milestone R7: trader-performance analytics.
+    #
+    # Three public read methods, all read-only (no write, no transaction,
+    # no commit/rollback - the same caller-owned-connection convention as
+    # list_trade_lifecycle_events() above). All calculation logic lives in
+    # the pure database.analytics module; these methods only fetch,
+    # validate/decode, and translate frozen analytics dataclasses into
+    # plain dicts at the public boundary (matching R6.7's own
+    # plain-dict convention).
+    # -----------------------------------------------------------------
+
+    def _resolve_event_timestamp(
+        self, signal_id: int | None, events_by_signal_id: dict
+    ) -> str | None:
+        """Resolve the canonical UTC timestamp for one member signal's raw
+        message, or None if signal_id is None, the signal is not among
+        events_by_signal_id, or its raw message has no resolved
+        received_at.
+
+        Reads database.repository.get_raw_message_by_id() live rather
+        than only trusting the frozen snapshot's own ordering_key: the
+        snapshot's raw_message_id link is immutable (frozen at build
+        time), but raw_messages.received_at is itself never updated once
+        written (no update_raw_message() function exists anywhere in
+        database/repository.py) - so reading it live via that immutable
+        id is safe and does not violate the snapshot trust boundary, and
+        is more precise than inferring anything from ordering_key's own
+        2- vs 3-element shape (which describes a whole matching window,
+        not this one specific message).
+        """
+        if signal_id is None:
+            return None
+        event = events_by_signal_id.get(signal_id)
+        if event is None:
+            return None
+        raw_message_id = event["snapshot"]["raw_message_id"]
+        raw_message = get_raw_message_by_id(self.conn, raw_message_id)
+        if raw_message is None:
+            return None
+        return raw_message.received_at
+
+    def _build_lifecycle_analytics(self, lifecycle, events: list):
+        """Decode every member event's signal_snapshot and compute the
+        complete analytics result for one lifecycle generation.
+
+        Args:
+            lifecycle: A database.models.TradeLifecycle, already fetched
+                by the caller. events must not be empty - the caller
+                (get_trade_lifecycle_analytics() or
+                _lifecycle_analytics_or_error()) is responsible for the
+                zero-event check before calling this method.
+            events: Every database.models.TradeLifecycleEvent for this
+                generation (database.repository.get_trade_lifecycle_events()'s
+                own return value), already ordered by sequence_index.
+
+        Returns:
+            A database.analytics.LifecycleAnalyticsResult.
+
+        Raises:
+            LifecycleSnapshotError: Propagated unchanged from
+                _validate_and_decode_snapshot() for any malformed or
+                contradictory snapshot evidence - never caught here.
+        """
+        trader = get_trader_by_id(self.conn, lifecycle.trader_id)
+        trader_name = trader.name if trader is not None else None
+
+        decoded_events = [
+            {
+                "id": event.id,
+                "trade_signal_id": event.trade_signal_id,
+                "sequence_index": event.sequence_index,
+                "snapshot": _validate_and_decode_snapshot(lifecycle.id, event),
+            }
+            for event in events
+        ]
+
+        events_by_signal_id = {e["trade_signal_id"]: e for e in decoded_events}
+        opened_at = self._resolve_event_timestamp(
+            lifecycle.opened_by_signal_id, events_by_signal_id
+        )
+        closed_at = self._resolve_event_timestamp(
+            lifecycle.closed_by_signal_id, events_by_signal_id
+        )
+
+        return compute_lifecycle_analytics(
+            trade_lifecycle_id=lifecycle.id,
+            trader_id=lifecycle.trader_id,
+            trader_name=trader_name,
+            is_current=lifecycle.is_current,
+            superseded_at=lifecycle.superseded_at,
+            status=lifecycle.status,
+            symbol=lifecycle.symbol,
+            option_type=lifecycle.option_type,
+            strike=lifecycle.strike,
+            expiration=lifecycle.expiration,
+            lifecycle_ambiguity_flags=lifecycle.ambiguity_flags,
+            opened_by_signal_id=lifecycle.opened_by_signal_id,
+            closed_by_signal_id=lifecycle.closed_by_signal_id,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            events=decoded_events,
+        )
+
+    def _lifecycle_analytics_or_error(self, lifecycle):
+        """The tolerant counterpart to _build_lifecycle_analytics(): never
+        raises. A zero-event generation or a LifecycleSnapshotError is
+        converted into a 'data_error' database.analytics.LifecycleAnalyticsResult
+        instead of propagating, so one corrupted lifecycle can never abort
+        an entire current-lifecycle list or trader-summary call. The
+        failure is never hidden - it is preserved verbatim in the
+        returned result's analytics_error_detail and counted by the
+        caller.
+
+        The trader lookup is performed only inside each error branch,
+        not unconditionally up front - on the normal (non-error) path,
+        _build_lifecycle_analytics() already performs its own single
+        trader lookup, so resolving trader_name here too would be a
+        redundant second query for every successfully computed
+        lifecycle."""
+        events = get_trade_lifecycle_events(self.conn, lifecycle.id)
+
+        if not events:
+            trader = get_trader_by_id(self.conn, lifecycle.trader_id)
+            return build_data_error_result(
+                trade_lifecycle_id=lifecycle.id,
+                trader_id=lifecycle.trader_id,
+                trader_name=trader.name if trader is not None else None,
+                is_current=lifecycle.is_current,
+                superseded_at=lifecycle.superseded_at,
+                status=lifecycle.status,
+                symbol=lifecycle.symbol,
+                option_type=lifecycle.option_type,
+                strike=lifecycle.strike,
+                expiration=lifecycle.expiration,
+                lifecycle_ambiguity_flags=lifecycle.ambiguity_flags,
+                source_event_ids=[],
+                analytics_error_detail=(
+                    f"trade_lifecycle_id {lifecycle.id} has no membership events."
+                ),
+            )
+
+        try:
+            return self._build_lifecycle_analytics(lifecycle, events)
+        except LifecycleSnapshotError as exc:
+            trader = get_trader_by_id(self.conn, lifecycle.trader_id)
+            return build_data_error_result(
+                trade_lifecycle_id=lifecycle.id,
+                trader_id=lifecycle.trader_id,
+                trader_name=trader.name if trader is not None else None,
+                is_current=lifecycle.is_current,
+                superseded_at=lifecycle.superseded_at,
+                status=lifecycle.status,
+                symbol=lifecycle.symbol,
+                option_type=lifecycle.option_type,
+                strike=lifecycle.strike,
+                expiration=lifecycle.expiration,
+                lifecycle_ambiguity_flags=lifecycle.ambiguity_flags,
+                source_event_ids=[event.id for event in events],
+                analytics_error_detail=str(exc),
+            )
+
+    def get_trade_lifecycle_analytics(self, trade_lifecycle_id: int) -> dict:
+        """Compute one lifecycle generation's complete R7 analytics
+        result - strict, and accepts any id, current or superseded.
+
+        A thin orchestration over database.analytics.compute_lifecycle_analytics():
+        fetches the lifecycle and its membership, decodes every snapshot,
+        resolves opened_at/closed_at from the immutable raw_messages
+        evidence behind the opener/closer signal, and returns the result
+        as a plain dict (matching list_trade_lifecycle_events()'s
+        existing plain-dict convention). Performs no write, opens no
+        transaction, calls neither commit nor rollback.
+
+        This is the strict counterpart to list_current_trade_lifecycle_analytics():
+        a caller asking about one specific, named lifecycle receives the
+        unfiltered truth or an exception, never a silently substituted
+        'data_error' placeholder.
+
+        Args:
+            trade_lifecycle_id: FK to trade_lifecycles.id. May reference a
+                current or superseded generation - the result always
+                exposes is_current/superseded_at so a superseded
+                generation's analytics can never be mistaken for current
+                performance.
+
+        Returns:
+            A plain dict mirroring database.analytics.LifecycleAnalyticsResult
+            field-for-field (exit_legs, lifecycle_ambiguity_flags,
+            analytics_exclusion_reasons, and source_event_ids as lists,
+            not tuples).
+
+        Raises:
+            TradeLifecycleNotFoundError: If trade_lifecycle_id references
+                no trade_lifecycles row at all.
+            LifecycleAnalyticsError: If the row exists but has zero
+                trade_lifecycle_events membership rows.
+            LifecycleSnapshotError: Propagated unchanged from
+                _validate_and_decode_snapshot() for any malformed or
+                contradictory snapshot evidence.
+        """
+        lifecycle = get_trade_lifecycle_by_id(self.conn, trade_lifecycle_id)
+        if lifecycle is None:
+            raise TradeLifecycleNotFoundError(
+                f"No trade_lifecycles row exists with id {trade_lifecycle_id}."
+            )
+
+        events = get_trade_lifecycle_events(self.conn, trade_lifecycle_id)
+        if not events:
+            raise LifecycleAnalyticsError(
+                f"trade_lifecycle_id {trade_lifecycle_id} has no membership events."
+            )
+
+        result = self._build_lifecycle_analytics(lifecycle, events)
+        return _lifecycle_analytics_result_to_dict(result)
+
+    def list_current_trade_lifecycle_analytics(
+        self,
+        *,
+        trader_id: int | None = None,
+    ) -> list[dict]:
+        """List every current lifecycle generation's R7 analytics result -
+        tolerant per lifecycle, with no truncating limit.
+
+        Built on database.repository.get_all_current_trade_lifecycles()
+        (Recovery Milestone R7 - no LIMIT of any kind, unlike the
+        pre-existing, display-oriented list_current_trade_lifecycles()),
+        so this method can never silently omit a current lifecycle. A
+        malformed signal_snapshot, or a lifecycle with zero membership
+        events, never aborts the call and is never silently dropped - it
+        produces an explicit 'data_error' result in its place (see
+        _lifecycle_analytics_or_error()). Performs no write, opens no
+        transaction, calls neither commit nor rollback.
+
+        Args:
+            trader_id: FK to traders.id to scope to one trader, or None
+                for every trader with at least one current lifecycle.
+                trader_id is the sole authoritative selector - there is
+                no trader_name filter on this method, since the
+                repository permits duplicate trader names and this
+                contract must never silently merge or arbitrarily pick
+                among same-named traders.
+
+        Returns:
+            A list of plain dicts (see get_trade_lifecycle_analytics()'s
+            return shape), one per current lifecycle, ordered by
+            trade_lifecycle_id ascending - deterministic, never a
+            "newest first" display convention. Empty list if no current
+            lifecycle matches.
+        """
+        lifecycles = get_all_current_trade_lifecycles(self.conn, trader_id=trader_id)
+        results = [self._lifecycle_analytics_or_error(lifecycle) for lifecycle in lifecycles]
+        return [_lifecycle_analytics_result_to_dict(result) for result in results]
+
+    def list_trader_performance_summaries(
+        self,
+        *,
+        trader_id: int | None = None,
+    ) -> list[dict]:
+        """List one performance summary per trader, aggregated strictly
+        from current-lifecycle analytics results.
+
+        Shares its underlying per-lifecycle computation with
+        list_current_trade_lifecycle_analytics(): both methods delegate
+        every lifecycle's fetch/decode/compute work to the same private
+        _lifecycle_analytics_or_error() helper, so no signal_snapshot is
+        ever read or decoded twice for the same call, and the two public
+        methods can never disagree with each other about one lifecycle's
+        own result - this method does not call
+        list_current_trade_lifecycle_analytics() and then re-derive
+        anything from its dict output; it computes the same underlying
+        LifecycleAnalyticsResult objects once and reduces over them
+        directly via database.analytics.summarize_trader_performance().
+
+        Never ranks or sorts by any performance metric - trader_id
+        ascending only, so any ranking/comparison-display decision
+        remains entirely with R8.
+
+        Args:
+            trader_id: FK to traders.id to scope to one trader, or None
+                for every trader with at least one current lifecycle.
+                The sole authoritative selector - no trader_name filter.
+
+        Returns:
+            A list of plain dicts mirroring
+            database.analytics.TraderPerformanceSummary field-for-field
+            (every *_lifecycle_ids field as a list, ascending), ordered
+            by trader_id ascending. Empty list if no trader has any
+            current lifecycle.
+        """
+        lifecycles = get_all_current_trade_lifecycles(self.conn, trader_id=trader_id)
+        results = [self._lifecycle_analytics_or_error(lifecycle) for lifecycle in lifecycles]
+
+        grouped: dict[int, list] = {}
+        for result in results:
+            grouped.setdefault(result.trader_id, []).append(result)
+
+        summaries = []
+        for grouped_trader_id in sorted(grouped):
+            group = grouped[grouped_trader_id]
+            summaries.append(
+                summarize_trader_performance(
+                    trader_id=grouped_trader_id,
+                    trader_name=group[0].trader_name,
+                    lifecycle_results=group,
+                )
+            )
+        return [_trader_performance_summary_to_dict(summary) for summary in summaries]
 
     # -----------------------------------------------------------------
     # Recovery Milestone R5

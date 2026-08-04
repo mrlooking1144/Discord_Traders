@@ -40,6 +40,7 @@ from database.repository import (
     delete_import_batch_if_empty,
     get_all_current_lifecycle_eligible_signal_ids,
     get_all_current_lifecycle_keys,
+    get_all_current_trade_lifecycles,
     get_channel_by_external_id,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
@@ -2849,6 +2850,113 @@ class DatabaseLifecyclePurityUnaffectedTests(unittest.TestCase):
             self.assertNotIn("sqlite3", line)
             self.assertNotIn("database.repository", line)
             self.assertNotIn("database.service", line)
+
+
+class GetAllCurrentTradeLifecyclesTests(_LifecycleRepositoryTestCase):
+    """Covers Recovery Milestone R7's
+    database.repository.get_all_current_trade_lifecycles() - the
+    unbounded (no LIMIT) analytics-completeness reader, distinct from the
+    pre-existing, deliberately bounded (default LIMIT 100) display reader
+    list_current_trade_lifecycles()."""
+
+    def test_returns_empty_list_when_no_current_lifecycle_exists(self):
+        self.assertEqual(get_all_current_trade_lifecycles(self.connection), [])
+
+    def test_more_than_one_hundred_current_lifecycles_are_not_truncated(self):
+        # 101 rows - one more than list_current_trade_lifecycles()'s own
+        # default LIMIT 100 - proving this function has no such bound.
+        created_ids = []
+        for _ in range(101):
+            lifecycle = create_trade_lifecycle(
+                self.connection, self.trader.id, "IBM", status="open",
+                remaining_fraction="1",
+            )
+            created_ids.append(lifecycle.id)
+        self.connection.commit()
+
+        total_in_db = self.connection.execute(
+            "SELECT COUNT(*) FROM trade_lifecycles WHERE is_current = 1"
+        ).fetchone()[0]
+        self.assertEqual(total_in_db, 101)
+
+        results = get_all_current_trade_lifecycles(self.connection)
+
+        # No truncation: every one of the 101 inserted ids is present.
+        self.assertEqual(len(results), 101)
+        # No double-counting: every id is distinct.
+        result_ids = [r.id for r in results]
+        self.assertEqual(len(result_ids), len(set(result_ids)))
+        self.assertEqual(set(result_ids), set(created_ids))
+        # Deterministic ascending order, not a display "newest first"
+        # convention.
+        self.assertEqual(result_ids, sorted(result_ids))
+
+    def test_excludes_superseded_lifecycles(self):
+        lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="closed",
+            remaining_fraction="0",
+        )
+        self.connection.commit()
+        supersede_trade_lifecycle(self.connection, lifecycle.id)
+        self.connection.commit()
+
+        self.assertEqual(get_all_current_trade_lifecycles(self.connection), [])
+
+    def test_filters_by_trader_id(self):
+        own_lifecycle = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        other_trader = create_trader(self.connection, self.source.id, "Sarang")
+        self.connection.commit()
+        create_trade_lifecycle(
+            self.connection, other_trader.id, "AVGO", status="closed",
+            remaining_fraction="0",
+        )
+        self.connection.commit()
+
+        results = get_all_current_trade_lifecycles(
+            self.connection, trader_id=self.trader.id
+        )
+
+        self.assertEqual([r.id for r in results], [own_lifecycle.id])
+
+    def test_filter_by_nonexistent_trader_id_returns_empty_list(self):
+        create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        self.connection.commit()
+
+        self.assertEqual(
+            get_all_current_trade_lifecycles(self.connection, trader_id=999999), []
+        )
+
+    def test_several_trader_ids_sharing_the_same_name_are_never_merged(self):
+        duplicate_named_trader = create_trader(self.connection, self.source.id, "TC")
+        self.connection.commit()
+        self.assertNotEqual(self.trader.id, duplicate_named_trader.id)
+        self.assertEqual(self.trader.name, duplicate_named_trader.name)
+
+        lifecycle_one = create_trade_lifecycle(
+            self.connection, self.trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        lifecycle_two = create_trade_lifecycle(
+            self.connection, duplicate_named_trader.id, "IBM", status="open",
+            remaining_fraction="1",
+        )
+        self.connection.commit()
+
+        results = get_all_current_trade_lifecycles(self.connection)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {r.trader_id for r in results}, {self.trader.id, duplicate_named_trader.id}
+        )
+        self.assertEqual(
+            {r.id for r in results}, {lifecycle_one.id, lifecycle_two.id}
+        )
 
 
 if __name__ == "__main__":

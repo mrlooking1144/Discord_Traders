@@ -1,0 +1,672 @@
+====================================================================
+Discord Traders - Recovery Milestone R8b Handoff
+Trader-Performance Dashboard: Ranking, Minimum-Sample Threshold, and
+CSV Export
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R8b - "Trader-Performance Dashboard:
+Ranking, Minimum-Sample Threshold, and CSV Export" - the second and
+FINAL sub-milestone of the two-part split (R8a/R8b) of Recovery
+Milestone R8 (the Trader-Performance Dashboard module). R8b was
+approved for planning after R8a's own documentation pass was reviewed
+and pushed, then approved for implementation after its own separate
+scoping/planning review.
+
+Status: R8b implementation is COMPLETE LOCALLY, tested (focused and
+full regression), and independently quality-reviewed, with five MINOR
+test-quality findings identified and explicitly accepted (no correction
+required before this documentation) - but IS NOT YET STAGED OR
+COMMITTED. This documentation pass (this handoff plus the corresponding
+`docs/PROJECT_STATUS.md` update) is also NOT YET STAGED OR COMMITTED.
+Nothing under R8b has been pushed to `origin/main`. Recovery Milestone
+R8b is not considered complete until this documentation is reviewed and
+approved, the implementation and documentation are staged and
+committed, and both commits are pushed with explicit Product Owner
+approval.
+
+**Once R8b is committed and pushed, the Trader-Performance Dashboard
+module (Recovery Milestone R8, split into R8a and R8b) is considered
+complete.** No further sub-milestone of R8 is planned. The next
+separate module - the Bulk Channel Import UI - has not started and
+will begin in a new ChatGPT session only after R8b is synchronized to
+`origin/main` (see Section 18).
+
+Preceding milestones (all complete and pushed before R8b began): R1-R5
+(schema/migration foundation through metadata-rich ingestion), R6.1-R6.4
+(lifecycle schema foundation, the pure lifecycle-matching engine, the
+lifecycle repository layer, and lifecycle rebuild orchestration), R6.5a
+(the lifecycle-safe `TradeService.correct_trade_signal()` service
+contract), R6.5b (migrating the shipped "Correct Signal" UI to that
+API), R6.6 (real-corpus lifecycle acceptance testing against the real
+68-message Discord corpus), R6.7 (the validated, decoded
+`TradeService.list_trade_lifecycle_events()` read API), R7 (the pure
+`database/analytics.py` price-return engine and three read-only
+`TradeService` methods - see docs/HANDOFFS/R7_trader_performance_analytics.txt),
+and R8a (the core Trader Performance dashboard - a trader summary
+table, a filterable per-trader drill-down, and lifecycle/exit-leg
+evidence - see docs/HANDOFFS/R8a_trader_performance_dashboard_core.txt).
+R8a is fully complete and pushed: implementation commit
+`2fac9a210521ce150426520fdf2c505f782f4a4f` ("Implement trader-performance
+dashboard core") and documentation commit
+`98c4a830f6af141579055449a64d1d6121908502` ("Update documentation for
+Recovery Milestone R8a"), both present on `origin/main`; local `main`
+and `origin/main` are synchronized at
+`98c4a830f6af141579055449a64d1d6121908502`, 0 ahead / 0 behind.
+
+# 2. Purpose
+
+R8a delivered the first user-facing view of R7's trader-performance
+analytics, but deliberately deferred all ranking/comparison, a
+minimum-sample-size threshold, and CSV export as lower-risk, separable
+polish. R8b closes exactly that gap:
+
+    - Trader ranking and comparison through the existing Trader Summary
+      table - a user-selectable ranking metric and direction, default
+      ranking by Average Return descending.
+    - A minimum eligible-lifecycle threshold (default 3) that clearly
+      marks, but never hides, a trader whose sample size is too small
+      to rank confidently alongside qualifying traders.
+    - Deterministic CSV export of both the ranked Trader Summary table
+      and the currently filtered Lifecycle Drill-down table, generated
+      entirely in Python via the standard library - never pandas.
+
+R8b adds no schema change, no migration, no repository change, no
+service change, no lifecycle-engine change, no model change, no parser
+or adapter change, no new dependency, and performs no analytics
+calculation of its own - like R8a, it is a pure consumer of the two
+existing R7 read methods, plus new pure ranking/export helpers that
+operate only on already-computed R7 data.
+
+# 3. Repository Baseline
+
+Repository: Discord_Traders (mrlooking1144/Discord_Traders)
+Branch: main
+
+Parent synchronized commit (the approved baseline immediately before
+this milestone, and the current `HEAD`/`origin/main` as of this
+handoff):
+    98c4a830f6af141579055449a64d1d6121908502
+    ("Update documentation for Recovery Milestone R8a")
+
+Local `main` and `origin/main` are identical at that commit (0 ahead / 0
+behind) both before and throughout this milestone - R8b's implementation
+and this documentation exist only as uncommitted working-tree changes as
+of this handoff; no implementation commit exists yet.
+
+# 4. Exact Implementation and Test Files
+
+Five files changed, all in the working tree, none staged - all five
+modified (no new file was created; R8b extends R8a's existing pure
+module and test files rather than adding another implementation file,
+per approved scope):
+
+    app/dashboard_formatting.py         | 252 insertions(+), 8 deletions(-)
+    app/streamlit_app.py                |  97 insertions(+), 3 deletions(-)
+    tests/test_app.py                   | 369 insertions(+), 23 deletions(-)
+    tests/test_dashboard_formatting.py  | 411 insertions(+), 13 deletions(-)
+    tests/test_dashboard_integration.py | 253 insertions(+), 7 deletions(-)
+    5 files changed, 1382 insertions(+), 54 deletions(-)
+
+No other file is part of the R8b implementation. `database/schema.sql`,
+every file under `database/migrations/`, `database/repository.py`,
+`database/service.py`, `database/lifecycle.py`, `database/models.py`,
+`database/analytics.py`, `app/parser.py`, `app/discord_adapter.py`,
+`requirements.txt`, and every documentation file (other than this
+handoff and the corresponding `docs/PROJECT_STATUS.md` update, prepared
+separately) are unchanged by R8b's implementation.
+
+# 5. Exact Production Change
+
+## 5a. `app/dashboard_formatting.py` (modified, still pure)
+
+Retains R8a's guarantee: no `sqlite3` import, no import of
+`database.repository`, `database.service`, or `database.analytics`, and
+no `streamlit` import - confirmed by direct inspection during the
+independent quality-review pass. New standard-library-only imports:
+`csv`, `functools`, `io`, and `decimal.Decimal`.
+
+New public constants:
+
+    SORT_METRIC_CHOICES - the exact ten approved metrics, in order:
+        "Average Return", "Median Return", "Win Rate", "Loss Rate",
+        "Avg Winner Return", "Avg Loser Return", "Eligible Lifecycles",
+        "Total Lifecycles", "Trader Name", "Trader ID"
+    SORT_DIRECTION_CHOICES - ("Descending", "Ascending")
+    SUMMARY_CSV_FIELDNAMES - the fixed, documented Trader Summary CSV
+        column order (Trader Name, Trader ID, Meets Minimum Sample,
+        then every remaining summary column in the same order as the
+        on-screen table)
+    LIFECYCLE_CSV_FIELDNAMES - the fixed Lifecycle Drill-down CSV column
+        order, identical to the drill-down table's own column order
+
+New/changed public functions:
+
+    meets_minimum_sample(summary, min_eligible_lifecycles) -> bool
+        summary["eligible_lifecycle_count"] >= min_eligible_lifecycles.
+        Never recalculates eligible_lifecycle_count.
+
+    format_minimum_sample(summary, min_eligible_lifecycles) -> str
+        "Yes", or "No (n < threshold)" showing the real counts - never
+        a bare "No" that hides them.
+
+    build_summary_display_row(summary, *, min_eligible_lifecycles) -> dict
+    build_summary_display_rows(summaries, *, min_eligible_lifecycles) -> list[dict]
+        Signature changed (R8a's version took no threshold argument):
+        now keyword-only `min_eligible_lifecycles`, required. Adds one
+        new column, "Meets Minimum Sample", positioned immediately
+        after "Trader". Every other column, and every existing
+        formatting rule, is unchanged from R8a.
+
+    rank_trader_summaries(summaries, *, sort_metric, descending,
+                           min_eligible_lifecycles) -> list[dict]
+        The new ranking function (plus private helpers
+        `_sort_key_value()` and `_compare_ranked_summaries()`, and a
+        module-private `_SORT_METRIC_FIELDS` vocabulary mapping each
+        approved metric label to its raw field name and comparison
+        type). Operates on the raw service dicts, never the
+        display-formatted rows. Comparison rules: Decimal for every
+        percentage/return field (never float, never a string/
+        lexicographic compare), int for every count/trader_id field,
+        case-insensitive string compare for trader_name. A `None`
+        metric value always sorts last, in either direction. A trader
+        below `min_eligible_lifecycles` always sorts after every
+        qualifying trader; within each of those two tiers, the same
+        metric/direction rule applies, and the final tie-break is
+        always `trader_id` ascending, unconditionally of direction.
+        Implemented via `sorted(summaries, key=functools.cmp_to_key(...))`
+        - never mutates its input, always returns a new list. Raises
+        `ValueError` for an unrecognized `sort_metric`.
+
+    build_summary_csv_row(summary, *, min_eligible_lifecycles) -> dict
+    build_summary_csv_rows(summaries, *, min_eligible_lifecycles) -> list[dict]
+        Convert one/many already-ranked summary dicts into CSV-ready
+        rows matching `SUMMARY_CSV_FIELDNAMES` exactly: the combined
+        on-screen "Trader" label is split back into separate
+        "Trader Name"/"Trader ID" columns (the one deliberate,
+        approved divergence from the on-screen table); every other
+        value is identical to `build_summary_display_row()`'s own
+        formatting - the export is always what is on screen, never
+        recalculated.
+
+    build_lifecycle_csv_rows(results) -> list[dict]
+        A direct delegation to the existing `build_lifecycle_display_rows()`
+        - the drill-down CSV export is always byte-identical in content
+        and order to the on-screen drill-down table. Never includes
+        `analytics_error_detail` (that field is not, and has never
+        been, part of the approved lifecycle display-row contract).
+
+    rows_to_csv_string(rows, fieldnames) -> str
+        Serializes display/CSV-ready rows into one deterministic CSV
+        string using only `csv.DictWriter` + `io.StringIO` - never
+        pandas. Always writes the header row, even for an empty `rows`
+        list. Uses the `csv` module's default dialect: comma-delimited,
+        `\r\n` line endings, standard quoting for commas/quotes/
+        newlines. Repeated calls with the same input always produce
+        byte-identical output.
+
+## 5b. `app/streamlit_app.py` (modified)
+
+Three new controls added to the existing Trader Performance workflow's
+Trader Summary section, rendered before the summary table and trader
+selector (their values determine the ranked order both are built from):
+
+    st.selectbox("Rank traders by", SORT_METRIC_CHOICES,
+                 key="dashboard_sort_metric")
+    st.selectbox("Sort direction", SORT_DIRECTION_CHOICES,
+                 key="dashboard_sort_direction")
+    st.number_input("Minimum eligible lifecycles", min_value=0,
+                     value=3, step=1, key="dashboard_min_eligible")
+
+The summary table, its CSV export, and the trader selector's option
+list/order are now all derived from one shared `ranked_summaries =
+rank_trader_summaries(summaries, sort_metric=..., descending=(...),
+min_eligible_lifecycles=...)` call - never from the raw
+`list_trader_performance_summaries()` return order. The existing
+stale-selection guard for `dashboard_trader_select` is unchanged in
+logic (ranking never removes a trader from `trader_ids`, only reorders/
+tags it, so its trigger condition - a trader no longer present at all -
+is unaffected by R8b).
+
+Two new `st.download_button` calls, each routed through a new private
+helper:
+
+    _render_csv_download(*, label, rows, fieldnames, file_name, key)
+        Wraps `rows_to_csv_string()` in try/except: on success, renders
+        `st.download_button(label, data=csv_text, file_name=file_name,
+        mime="text/csv", key=key)`; on any unexpected exception, logs
+        via the existing sanitized `log_operation_failure()` and shows
+        the fixed `_DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE` - never raw
+        exception text. Mirrors this module's established
+        try/except/log/fixed-message pattern exactly.
+
+    "Download Trader Summary CSV" -> `trader_performance_summary.csv`,
+        built from `build_summary_csv_rows(ranked_summaries,
+        min_eligible_lifecycles=...)` - rendered unconditionally inside
+        the already-guaranteed-non-empty summaries branch, so it always
+        appears whenever the summary table itself renders.
+
+    "Download Lifecycle Drill-down CSV" ->
+        `trader_lifecycle_drilldown_{selected_trader_id}.csv`, built
+        from `build_lifecycle_csv_rows(filtered_results)` - the exact
+        same `filtered_results` list (current trader, current status/
+        outcome/symbol filters) the drill-down table itself renders
+        from; rendered only inside the `filtered_results`-non-empty
+        branch, so it is absent whenever
+        `_DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE` is shown instead.
+
+New fixed constants: `_DASHBOARD_DEFAULT_MIN_ELIGIBLE_LIFECYCLES = 3`,
+`_DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE = "Could not generate the CSV
+export."`, `_DASHBOARD_SUMMARY_CSV_FILENAME =
+"trader_performance_summary.csv"`.
+
+No other line in `app/streamlit_app.py` outside the Trader Performance
+branch changed. Manual Message Entry, Review Signals, and Correct
+Signal remain byte-for-byte unchanged and fully regression-tested.
+
+# 6. UI Layout, Controls, and Default Behavior
+
+Ranking controls (Trader Summary section, in render order): "Rank
+traders by" (selectbox, default "Average Return"), "Sort direction"
+(selectbox, default "Descending"), "Minimum eligible lifecycles"
+(number input, default 3, `min_value=0`).
+
+Summary table: R8a's existing 21-column set plus one new column,
+"Meets Minimum Sample", positioned immediately after "Trader". No other
+column, formatting rule, or value changed. Row order is now
+`rank_trader_summaries()`'s output - descending Average Return by
+default - instead of R8a's `trader_id`-ascending service-return order.
+
+Trader selector: options and their displayed order now follow the
+identical ranked sequence the summary table renders from - the
+highest-ranked qualifying trader is always the first (default-selected)
+option on initial load. Changing any ranking control (metric,
+direction, or threshold) never clears a still-present selected trader,
+since ranking only reorders/tags `trader_ids`, never removes an entry
+from it while that trader still exists.
+
+Lifecycle Drill-down table, filters, and lifecycle-detail panel: fully
+unchanged from R8a.
+
+Two CSV download buttons, described in Section 5b, each appearing only
+when its corresponding table has rows.
+
+# 7. Exact Fixed Messages
+
+All four of R8a's fixed messages are unchanged:
+
+    _DASHBOARD_EMPTY_MESSAGE = "No trader performance data found."
+    _DASHBOARD_LOAD_FAILURE_MESSAGE = "Could not load trader performance data."
+    _DASHBOARD_DRILLDOWN_LOAD_FAILURE_MESSAGE = (
+        "Could not load lifecycle details for this trader."
+    )
+    _DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE = "No lifecycles match the current filters."
+
+One new fixed message (R8b):
+
+    _DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE = "Could not generate the CSV export."
+
+# 8. Ranking, Minimum-Sample, and CSV Contract Rules
+
+Ranking: see `rank_trader_summaries()` in Section 5a for the complete,
+exact rule set (Decimal/int/case-insensitive-string comparison per
+metric type, None-always-last in either direction, qualifying-before-
+below-threshold tiering, trader_id-ascending final tie-break,
+never-mutates-input). Ranking is always computed in plain Python before
+any Streamlit rendering - never delegated to `st.dataframe`'s own
+interactive column-sort, which remains available to the user for
+on-screen inspection only and has no bearing on the CSV export or the
+trader-selector order.
+
+Minimum-sample threshold: a trader "qualifies" when
+`eligible_lifecycle_count >= min_eligible_lifecycles` (the current
+user-selected value, default 3). A below-threshold trader is never
+hidden - no hide-below-threshold control exists anywhere in this
+milestone - it remains fully visible in the table and CSV, tagged with
+a clear "No (n < threshold)" indicator, and is always ranked after
+every qualifying trader.
+
+CSV contracts:
+
+    Trader Summary CSV (`trader_performance_summary.csv`): current
+    ranked order preserved; current threshold state reflected (both the
+    "Meets Minimum Sample" column and tier position); "Trader Name" and
+    "Trader ID" as separate columns; fixed column order per
+    `SUMMARY_CSV_FIELDNAMES`; no analytics recalculation - every value
+    is either passed through verbatim from the R7 service result or
+    produced by the same formatting helpers the on-screen table uses.
+
+    Lifecycle Drill-down CSV (`trader_lifecycle_drilldown_{trader_id}.csv`):
+    exports only the currently selected trader's currently filtered
+    (status/outcome/symbol) result set, in the exact order the
+    drill-down table itself displays; uses the existing
+    `build_lifecycle_display_row()` contract unchanged, so
+    `analytics_error_detail` is never exported (that field has never
+    been part of the drill-down table's column contract - the
+    lifecycle-detail panel remains its one and only display surface).
+
+    Serializer: Python standard-library `csv` + `io.StringIO` only, no
+    pandas; deterministic `\r\n` line endings and standard CSV quoting;
+    a repeated call with identical input always produces byte-identical
+    output; an empty `rows` list produces a header-only string at the
+    `rows_to_csv_string()` level.
+
+# 9. Empty-State, Failure, and Read-Only Behavior
+
+All of R8a's empty/missing-database/failure/filter/stale-selection
+behavior is unchanged (see docs/HANDOFFS/R8a_trader_performance_dashboard_core.txt
+Section 8) and is re-proven passing by the full regression suite.
+
+New R8b-specific rule: both CSV download buttons are absent whenever
+their corresponding table does not render - missing database, empty
+summaries, a summary-load failure, a drill-down-load failure, or no
+lifecycle rows matching the current filters. An unexpected CSV
+serialization failure (defensively handled, though unreachable under
+normal operation since every CSV row dict is built with exactly the
+fieldnames its own fixed contract requires) shows the fixed
+`_DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE` via the same sanitized
+`log_operation_failure()` pattern used everywhere else in this module -
+never raw exception text. No `commit()`, `rollback()`,
+`initialize_database()`, or new-connection call was added anywhere by
+R8b; the workflow remains strictly read-only.
+
+# 10. Test Coverage
+
+68 new focused tests across the three existing test files (no new test
+file, matching the approved five-file scope):
+
+    tests/test_dashboard_formatting.py: 43 -> 84 (+41)
+        New classes: `MeetsMinimumSampleTests`, `FormatMinimumSampleTests`,
+        `RankTraderSummariesTests` (approved-metric-list validation,
+        unknown-metric rejection, Decimal-not-lexicographic sorting for
+        every decimal metric in both directions, int-not-lexicographic
+        sorting for count/trader_id metrics, case-insensitive name
+        sorting, None-always-last in both directions, qualifying-before-
+        below-threshold tiering, within-tier metric ordering, trader_id
+        tie-break including a tie between two None values, never-
+        mutates-input, returns-a-new-list), `BuildSummaryCsvRowTests`,
+        `BuildLifecycleCsvRowsTests`, `RowsToCsvStringTests` (header-only
+        empty output, exact header/column order, round-trip value
+        preservation, comma/quote/newline quoting and round-trip,
+        `\r\n` line endings, repeated-call determinism, never-mutates-
+        input), plus additions to the existing `BuildSummaryDisplayRowTests`/
+        `BuildSummaryDisplayRowsTests` classes for the new
+        `min_eligible_lifecycles` parameter and "Meets Minimum Sample"
+        column.
+
+    tests/test_app.py (`TraderPerformanceWorkflowTests`): 27 -> 46 (+19)
+        Exact control labels/options/keys/defaults; default descending-
+        by-Average-Return order; ascending direction; an alternate-
+        metric (Win Rate) reorder; below-threshold-after-qualifying
+        ordering; a threshold change moving a trader between tiers; the
+        "Meets Minimum Sample" indicator's exact text; the trader
+        selector's options following ranked order; a selected trader
+        remaining valid after a ranking-control change; exact
+        download-button labels/filenames/mime-type (via
+        `patch("streamlit.download_button")` - confirmed, via direct
+        inspection of Streamlit's `AppTest` internals, to be the only
+        practical way to capture a download button's `data`/`file_name`
+        kwargs, since `AppTest`'s public API exposes no stable accessor
+        for them); download-button absence in every missing-database/
+        empty/failure/no-match state; no write/commit/rollback across a
+        ranking-control-change rerun.
+
+    tests/test_dashboard_integration.py: 8 -> 16 (+8, new
+        `RankingAndExportIntegrationTests` class, real SQLite, no
+        mocking)
+        A real four-trader fixture (qualifying-and-tied, qualifying,
+        below-threshold-but-tied, and zero-eligible) proving default
+        ranked order, the "Meets Minimum Sample" column's real values,
+        ascending direction through the real UI, a real threshold
+        change requalifying a trader and reordering the table; real
+        summary and drill-down CSV content parsed back via
+        `csv.DictReader` and asserted against literal expected values
+        (trader name, ID, threshold indicator, formatted return);
+        duplicate trader names (reusing R8a's existing `_seed_database()`
+        fixture) remaining distinct by ID in the ranked CSV export; real
+        database row counts unchanged after driving ranking controls
+        and exports through the real UI.
+
+Three existing R8a tests were intentionally updated (not counted among
+the 68 new tests): `test_summary_order_matches_service_return_order`
+was renamed `test_summary_order_reflects_ranking_not_raw_service_return_order`
+and its expected order corrected, since R8b's approved ranking
+supersedes R8a's "always equals service-return order" guarantee;
+`test_summary_table_renders_expected_columns_and_row_count`'s expected
+column set now includes "Meets Minimum Sample"; and every positional
+`at.selectbox[N]` reference shifted by the two new ranking selectboxes
+(R8a's trader/lifecycle selectors moved from index 0/1 to index 2/3)
+was updated across `tests/test_app.py` and
+`tests/test_dashboard_integration.py` - a mechanical consequence of the
+approved control placement, not a change to any assertion's meaning.
+
+# 11. Test Results
+
+    tests.test_dashboard_formatting                 84/84   passing
+    tests.test_app.TraderPerformanceWorkflowTests    46/46   passing
+    tests.test_dashboard_integration                 16/16  passing
+    tests.test_app (complete)                       148/148 passing
+
+    Full suite: 1390/1390 passing, 0 failures, 0 errors
+    (1322 pre-existing + 68 new)
+
+    `git diff --check`: passed (two harmless CRLF-normalization
+    warnings only, no whitespace or conflict-marker errors)
+
+Test execution history: during the implementation pass, one initial
+run of `tests.test_app.TraderPerformanceWorkflowTests` hit a single
+transient Streamlit `AppTest` timeout on
+`test_alternate_metric_selection_reorders_by_win_rate` - the same
+previously-documented transient pattern noted in the R6.6/R6.7/R7/R8a
+handoffs, unrelated to any R8b code. The isolated test was immediately
+rerun and passed in 0.875s; the complete class was then rerun and
+passed 46/46; the full-suite discovery run then passed 1390/1390 on
+its own first attempt. During the subsequent independent quality-review
+pass, every one of the five required commands (the three focused
+suites, the complete `tests.test_app`, and the full-suite discovery
+run) was rerun from a clean state and passed cleanly with **no**
+transient rerun required at any point.
+
+# 12. Quality-Review History
+
+An independent quality-review pass (separate from implementation)
+inspected all five changed files against the approved R8b scope and
+this handoff's own content, re-ran every required test command, and
+reviewed test quality for tautological assertions, inadequate coverage,
+false-positive patterns, brittle indexing, shared-fixture mutation, and
+overstated test names. No BLOCKER and no MAJOR finding was raised, and
+no finding indicated any production-behavior defect. Five MINOR
+findings were identified and explicitly accepted by the Product Owner
+without correction (all remain as originally implemented):
+
+    1. Two `tests/test_app.py` AppTest-level tests
+       (`test_summary_csv_exact_content`, `test_drilldown_csv_exact_content`)
+       build their "expected" CSV by calling the same production
+       ranking/CSV functions the app itself calls, then assert
+       byte-equality against what the mocked `download_button` received
+       - proving correct wiring, but not independently verifying content
+       correctness (a shared bug would reproduce identically on both
+       sides). No coverage gap in practice: content correctness is
+       independently proven with literal values elsewhere (unit tests
+       in `tests/test_dashboard_formatting.py`; real-database
+       parsed-back literal-value tests in
+       `tests/test_dashboard_integration.py`).
+    2. `tests/test_dashboard_formatting.py::BuildLifecycleCsvRowsTests
+       .test_identical_to_display_rows` is tautologically true by
+       construction, since `build_lifecycle_csv_rows()` is a literal
+       one-line delegation to `build_lifecycle_display_rows()`. No
+       coverage gap: the delegated function's own correctness is
+       thoroughly, independently tested with literal values elsewhere.
+    3. `tests/test_dashboard_formatting.py::BuildSummaryCsvRowTests
+       .test_remaining_fields_match_display_row_formatting` compares
+       `build_summary_csv_row()`'s output against
+       `build_summary_display_row()`'s own output for the same input,
+       rather than a literal expected string. No coverage gap: the
+       underlying formatting helpers are independently tested with
+       literal values elsewhere.
+    4. No single test combines "ascending direction" with "two
+       non-`None` values within the below-threshold tier," nor combines
+       a threshold change with a re-check of the trader-selector's
+       option order or the summary CSV content in one flow - each half
+       of each combination is proven separately. Low risk: the ranking
+       comparator applies one shared, tier-agnostic code path for the
+       metric/direction comparison, so the untested combinations
+       exercise no code not already covered by the tested ones.
+    5. Every ranking-control widget already carries an explicit `key=`,
+       yet tests locate them by position (`at.selectbox[0..3]`,
+       `at.number_input[0]`) rather than Streamlit `AppTest`'s
+       supported `at.selectbox(key="...")` lookup, which would be
+       immune to future widget-reordering. This is a pre-existing R8a
+       convention, not introduced by R8b, though R8b's two new
+       selectboxes required reindexing every existing positional
+       reference.
+
+Two additional OBSERVATIONs (non-actionable, no finding severity): no
+single test exercises "real service data" and "the actual rendered
+`download_button` element" together, since Streamlit's `AppTest` mock
+media-file manager exposes no stable public API for a button's
+`data`/`file_name` after `.run()` completes (confirmed by direct
+experimentation against the installed `streamlit==1.59.2`); and
+`_render_csv_download()`'s parameter type hints are looser than this
+module's usual style elsewhere (cosmetic only).
+
+None of the five MINOR findings or two observations affects production
+behavior. No further correction was required before this documentation
+pass, per explicit Product Owner acceptance of all five findings as
+documented.
+
+# 13. Explicit Out of Scope
+
+The following were explicitly excluded from R8b and remain unstarted or
+deferred, per the approved planning review:
+
+    - Any schema or migration change.
+    - Any `database/repository.py`, `database/service.py`,
+      `database/lifecycle.py`, `database/models.py`, `app/parser.py`,
+      `app/discord_adapter.py` change.
+    - Any change to `database/analytics.py`'s calculation logic, or any
+      UI-side recalculation, parsing, or rounding of an R7 analytics
+      value - `rank_trader_summaries()` compares already-computed R7
+      values; it computes nothing new.
+    - Any new dependency or `requirements.txt` change - CSV export uses
+      only the Python standard library.
+    - Any chart, graph, or visualization.
+    - Any Excel/XLSX export - CSV only.
+    - Dollar P&L, contract-multiplier, or position-quantity/sizing
+      calculation of any kind.
+    - A hide-below-threshold control - below-threshold traders always
+      remain visible.
+    - Historical/superseded-lifecycle drill-down, or a head-to-head
+      "compare traders" view beyond the ranked summary table (both
+      already excluded by R8a and unchanged here).
+    - Automated Discord ingestion, broker integration, or any Bulk
+      Channel Import UI work of any kind - see Section 18.
+    - Any change to Manual Message Entry, Review Signals, or Correct
+      Signal behavior.
+    - Any documentation change beyond this handoff and the corresponding
+      `docs/PROJECT_STATUS.md` update.
+
+# 14. Architecture Notes
+
+    - `app/dashboard_formatting.py` remains a pure module with the same
+      no-database-access guarantee as `database/analytics.py` and
+      `database/lifecycle.py` - independently unit-testable with zero
+      SQLite or Streamlit involvement, now including ranking and CSV
+      serialization alongside R8a's display formatting.
+    - `app/streamlit_app.py` remains the sole orchestration layer: it
+      fetches via `TradeService`, ranks/formats/serializes via
+      `app/dashboard_formatting.py`, and renders via `streamlit` - no
+      layer does more than one of those responsibilities.
+    - The dashboard still consumes only R7's existing read surface -
+      `list_trader_performance_summaries()` and
+      `list_current_trade_lifecycle_analytics(trader_id=...)` - no new
+      backend method was required or added by R8b, exactly as R8a.
+    - The architecture remains modular and provider-independent: R8b
+      touches only the existing pure presentation module and its
+      orchestrating UI script.
+
+# 15. Git and Governance State
+
+    - No file has been staged (`git diff --cached --stat` is empty).
+    - No commit has been made for R8b's implementation or for this
+      documentation pass.
+    - Nothing has been pushed to `origin/main`.
+    - Local `main` and `origin/main` remain identical at
+      `98c4a830f6af141579055449a64d1d6121908502` (0 ahead / 0 behind) -
+      unchanged by this milestone so far, since nothing has been
+      committed yet.
+    - No tag was created or moved at any point in this milestone; the
+      pre-existing `v0.1.0` tag remains unrelated and unchanged.
+
+# 16. Next Action
+
+    1. Product Owner / Technical Architect (ChatGPT) review of this
+       documentation pass (this handoff plus the corresponding
+       `docs/PROJECT_STATUS.md` update).
+    2. Once approved: stage and commit the R8b implementation (the five
+       files in Section 4) and this documentation update - as separate
+       commits, matching this project's established convention (an
+       implementation commit, then a documentation commit).
+    3. Push both commits to `origin/main` only after explicit Product
+       Owner approval for that specific action.
+    4. Verify local `main` and `origin/main` become identical (0 ahead /
+       0 behind) after that push.
+    5. Once pushed, the Trader-Performance Dashboard module (Recovery
+       Milestone R8, R8a+R8b) is considered complete. See Section 18
+       for the next module.
+
+# 17. Governance and Safety Reminders
+
+    - Per this project's established practice: every milestone requires
+      its own explicit design approval before implementation, its own
+      quality review after implementation, and its own explicit approval
+      before staging/committing and before pushing. R8b has completed
+      implementation, quality review, and explicit Product Owner
+      acceptance of the five MINOR findings without further correction;
+      staging, committing, and pushing all remain separately gated on
+      explicit Product Owner approval.
+    - Do not stage, commit, push, or tag anything from this milestone
+      without a separate, explicit Product Owner approval for each of
+      those distinct actions.
+    - No `Co-Authored-By` trailer is used in this project's commits (per
+      this project's established convention).
+
+# 18. Next Module: Bulk Channel Import UI (Not Started)
+
+The Trader-Performance Dashboard module (Recovery Milestone R8, split
+into R8a and R8b) is the last dashboard/analytics-UI work currently
+approved. Once R8b is committed and pushed, the next separate module is
+the **Bulk Channel Import UI** - entirely unstarted, with no reviewed
+design, requiring its own separate Product Owner / Technical Architect
+(ChatGPT) scoping and planning pass and explicit approval before any
+implementation begins, exactly as every prior milestone in this project
+required.
+
+Requirements already stated by the Product Owner for that future
+module's own scoping pass (recorded here for continuity only - not
+scoped, designed, or approved for implementation by this handoff):
+
+    - Support pasting at least 15 (or more) Discord messages in one
+      batch.
+    - Show, per channel: the last imported Discord message's own
+      date/time, the last paste/import operation's own time, the
+      current checkpoint/message ID, and processing counts.
+
+The Bulk Channel Import UI will begin in a new ChatGPT session only
+after Recovery Milestone R8b is fully synchronized to `origin/main` (0
+ahead / 0 behind, both the implementation and documentation commits
+pushed) - it must not begin before that synchronization, and must not
+begin without its own separate scoping/planning approval regardless of
+R8b's status.

@@ -77,11 +77,19 @@ from pathlib import Path
 import streamlit as st
 
 from app.dashboard_formatting import (
+    LIFECYCLE_CSV_FIELDNAMES,
+    SORT_DIRECTION_CHOICES,
+    SORT_METRIC_CHOICES,
+    SUMMARY_CSV_FIELDNAMES,
+    build_lifecycle_csv_rows,
     build_lifecycle_detail,
     build_lifecycle_display_rows,
+    build_summary_csv_rows,
     build_summary_display_rows,
     build_trader_label,
     filter_lifecycle_results,
+    rank_trader_summaries,
+    rows_to_csv_string,
 )
 from app.logging_config import (
     configure_console_logging,
@@ -128,6 +136,11 @@ _DASHBOARD_STATUS_CHOICES = [
     "open", "partially_closed", "closed", "orphan", "unresolved", "invalid",
 ]
 _DASHBOARD_OUTCOME_CHOICES = ["win", "loss", "breakeven", "not_scored", "data_error"]
+# Recovery Milestone R8b: ranking, minimum-sample threshold, and CSV
+# export defaults/messages.
+_DASHBOARD_DEFAULT_MIN_ELIGIBLE_LIFECYCLES = 3
+_DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE = "Could not generate the CSV export."
+_DASHBOARD_SUMMARY_CSV_FILENAME = "trader_performance_summary.csv"
 
 
 def _correction_selectbox_choices(base_choices: list[str], current_value: str) -> list[str]:
@@ -142,6 +155,27 @@ def _correction_selectbox_choices(base_choices: list[str], current_value: str) -
     if current_value not in choices:
         choices.append(current_value)
     return choices
+
+
+def _render_csv_download(*, label: str, rows: list, fieldnames: tuple, file_name: str, key: str) -> None:
+    """Render one Recovery Milestone R8b CSV download button for
+    already-built display/export rows, or a fixed sanitized failure
+    message on any unexpected serialization error - never raw exception
+    text. Mirrors the log_operation_failure() + fixed-message pattern
+    already used everywhere else in this module."""
+    try:
+        csv_text = rows_to_csv_string(rows, fieldnames)
+    except Exception as exc:
+        log_operation_failure(logger, "trader performance CSV export", exc)
+        st.error(_DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE)
+    else:
+        st.download_button(
+            label,
+            data=csv_text,
+            file_name=file_name,
+            mime="text/csv",
+            key=key,
+        )
 
 
 logger = logging.getLogger("discord_traders.app")
@@ -594,11 +628,61 @@ elif workflow == "Trader Performance":
                 st.info(_DASHBOARD_EMPTY_MESSAGE)
             else:
                 st.subheader("Trader Summary")
-                st.dataframe(build_summary_display_rows(summaries))
 
-                trader_ids = [summary["trader_id"] for summary in summaries]
+                # Recovery Milestone R8b: ranking controls. Rendered
+                # before the summary table/trader selector, since their
+                # current values determine the ranked order both are
+                # built from - trader_ids below is derived from
+                # ranked_summaries, never the raw service order.
+                sort_metric = st.selectbox(
+                    "Rank traders by",
+                    SORT_METRIC_CHOICES,
+                    key="dashboard_sort_metric",
+                )
+                sort_direction = st.selectbox(
+                    "Sort direction",
+                    SORT_DIRECTION_CHOICES,
+                    key="dashboard_sort_direction",
+                )
+                min_eligible_lifecycles = int(
+                    st.number_input(
+                        "Minimum eligible lifecycles",
+                        min_value=0,
+                        value=_DASHBOARD_DEFAULT_MIN_ELIGIBLE_LIFECYCLES,
+                        step=1,
+                        key="dashboard_min_eligible",
+                    )
+                )
+
+                ranked_summaries = rank_trader_summaries(
+                    summaries,
+                    sort_metric=sort_metric,
+                    descending=(sort_direction == "Descending"),
+                    min_eligible_lifecycles=min_eligible_lifecycles,
+                )
+
+                st.dataframe(
+                    build_summary_display_rows(
+                        ranked_summaries,
+                        min_eligible_lifecycles=min_eligible_lifecycles,
+                    )
+                )
+
+                _render_csv_download(
+                    label="Download Trader Summary CSV",
+                    rows=build_summary_csv_rows(
+                        ranked_summaries,
+                        min_eligible_lifecycles=min_eligible_lifecycles,
+                    ),
+                    fieldnames=SUMMARY_CSV_FIELDNAMES,
+                    file_name=_DASHBOARD_SUMMARY_CSV_FILENAME,
+                    key="dashboard_summary_csv_download",
+                )
+
+                trader_ids = [summary["trader_id"] for summary in ranked_summaries]
                 trader_names_by_id = {
-                    summary["trader_id"]: summary["trader_name"] for summary in summaries
+                    summary["trader_id"]: summary["trader_name"]
+                    for summary in ranked_summaries
                 }
 
                 # A previously selected trader that no longer has a
@@ -657,6 +741,16 @@ elif workflow == "Trader Performance":
                         st.info(_DASHBOARD_NO_MATCHING_LIFECYCLES_MESSAGE)
                     else:
                         st.dataframe(build_lifecycle_display_rows(filtered_results))
+
+                        _render_csv_download(
+                            label="Download Lifecycle Drill-down CSV",
+                            rows=build_lifecycle_csv_rows(filtered_results),
+                            fieldnames=LIFECYCLE_CSV_FIELDNAMES,
+                            file_name=(
+                                f"trader_lifecycle_drilldown_{selected_trader_id}.csv"
+                            ),
+                            key="dashboard_drilldown_csv_download",
+                        )
 
                         lifecycle_ids = [
                             result["trade_lifecycle_id"] for result in filtered_results

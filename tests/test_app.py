@@ -41,6 +41,15 @@ from unittest.mock import MagicMock, patch
 from streamlit.testing.v1 import AppTest
 
 from app import logging_config
+from app.dashboard_formatting import (
+    LIFECYCLE_CSV_FIELDNAMES,
+    SORT_METRIC_CHOICES,
+    SUMMARY_CSV_FIELDNAMES,
+    build_lifecycle_csv_rows,
+    build_summary_csv_rows,
+    rank_trader_summaries,
+    rows_to_csv_string,
+)
 from app.parser import parse_message
 from database.config import resolve_database_path
 from database.service import (
@@ -2172,11 +2181,13 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
         df = at.dataframe[0].value
         self.assertEqual(len(df), 2)
         for column in (
-            "Trader", "Total Lifecycles", "Open", "Partially Closed", "Closed",
-            "Orphan", "Unresolved", "Invalid", "Data Errors", "Eligible",
-            "Not Scored", "Wins", "Losses", "Breakeven", "Win Rate", "Loss Rate",
-            "Breakeven Rate", "Avg Return", "Median Return",
-            "Avg Winner Return", "Avg Loser Return",
+            # Recovery Milestone R8b adds "Meets Minimum Sample" to the
+            # existing R8a column set - every other column is unchanged.
+            "Trader", "Meets Minimum Sample", "Total Lifecycles", "Open",
+            "Partially Closed", "Closed", "Orphan", "Unresolved", "Invalid",
+            "Data Errors", "Eligible", "Not Scored", "Wins", "Losses",
+            "Breakeven", "Win Rate", "Loss Rate", "Breakeven Rate",
+            "Avg Return", "Median Return", "Avg Winner Return", "Avg Loser Return",
         ):
             self.assertIn(column, df.columns)
 
@@ -2205,12 +2216,18 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
         self.assertEqual(row_two["Data Errors"], "⚠ 1")
         self.assertNotIn("has no membership events", df.to_string())
 
-    def test_summary_order_matches_service_return_order(self):
-        # Local fixture (never mutating the shared class-level
-        # _SUMMARIES list), deliberately in non-ascending trader_id
-        # order - this can only pass if the UI truly preserves whatever
-        # order the service returned, not merely because the fixture
-        # already happened to already be trader_id-ascending.
+    def test_summary_order_reflects_ranking_not_raw_service_return_order(self):
+        # Recovery Milestone R8b superseded R8a's "order always equals
+        # service-return order" guarantee with the approved ranking
+        # rules. Local fixture (never mutating the shared class-level
+        # _SUMMARIES list), deliberately returned by the service in
+        # descending-trader_id order (9 then 2) while both entries tie
+        # on the default ranking metric (Average Return) and are both
+        # below the default minimum-sample threshold - so the displayed
+        # order can only match trader_id-ascending (2 then 9) if the UI
+        # genuinely applies rank_trader_summaries()'s own tie-break
+        # rule, not merely because it preserved whatever order the
+        # service happened to return.
         template = self._SUMMARIES[0]
         local_summaries = [
             {**template, "trader_id": 9, "trader_name": "Zeta"},
@@ -2223,7 +2240,334 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
         at = self._open_dashboard()
 
         df = at.dataframe[0].value
-        self.assertEqual(list(df["Trader"]), ["Zeta (ID 9)", "Alpha (ID 2)"])
+        self.assertEqual(list(df["Trader"]), ["Alpha (ID 2)", "Zeta (ID 9)"])
+
+    # -- Recovery Milestone R8b: ranking controls, minimum-sample -----------
+    # threshold, and CSV export -----------------------------------------
+
+    def test_ranking_controls_render_with_exact_labels_options_and_defaults(self):
+        at = self._open_dashboard()
+
+        self.assertEqual(at.selectbox[0].label, "Rank traders by")
+        self.assertEqual(list(at.selectbox[0].options), list(SORT_METRIC_CHOICES))
+        self.assertEqual(at.selectbox[0].value, "Average Return")
+
+        self.assertEqual(at.selectbox[1].label, "Sort direction")
+        self.assertEqual(list(at.selectbox[1].options), ["Descending", "Ascending"])
+        self.assertEqual(at.selectbox[1].value, "Descending")
+
+        self.assertEqual(at.number_input[0].label, "Minimum eligible lifecycles")
+        self.assertEqual(at.number_input[0].value, 3)
+
+    def test_default_ranking_uses_average_return_descending(self):
+        # Local fixture: three qualifying traders (eligible >= default
+        # threshold 3) with distinct average returns, returned by the
+        # service in a scrambled (non-ranked) order - proves the
+        # displayed order is genuinely descending by Average Return.
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 1, "trader_name": "Low",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "10.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "High",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "90.000000",
+            },
+            {
+                **template, "trader_id": 3, "trader_name": "Mid",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "50.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        self.assertEqual(
+            list(df["Trader"]), ["High (ID 2)", "Mid (ID 3)", "Low (ID 1)"]
+        )
+
+    def test_ascending_direction_reverses_order(self):
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 1, "trader_name": "Low",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "10.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "High",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "90.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+        at = at.selectbox[1].set_value("Ascending").run()
+
+        df = at.dataframe[0].value
+        self.assertEqual(list(df["Trader"]), ["Low (ID 1)", "High (ID 2)"])
+
+    def test_alternate_metric_selection_reorders_by_win_rate(self):
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 1, "trader_name": "A",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "90.000000",
+                "win_rate_pct": "10.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "B",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "10.000000",
+                "win_rate_pct": "90.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+        at = at.selectbox[0].set_value("Win Rate").run()
+
+        df = at.dataframe[0].value
+        self.assertEqual(list(df["Trader"]), ["B (ID 2)", "A (ID 1)"])
+
+    def test_below_threshold_traders_ranked_after_qualifying_traders(self):
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 1, "trader_name": "BelowButHighReturn",
+                "eligible_lifecycle_count": 1,
+                "average_gross_price_return_pct": "999.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "Qualifies",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "1.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        self.assertEqual(
+            list(df["Trader"]), ["Qualifies (ID 2)", "BelowButHighReturn (ID 1)"]
+        )
+
+    def test_threshold_change_moves_trader_between_tiers(self):
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 1, "trader_name": "TwoEligible",
+                "eligible_lifecycle_count": 2,
+                "average_gross_price_return_pct": "50.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "ThreeEligible",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "10.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+        df_before = at.dataframe[0].value
+        self.assertEqual(
+            list(df_before["Trader"]), ["ThreeEligible (ID 2)", "TwoEligible (ID 1)"]
+        )
+
+        at = at.number_input[0].set_value(2).run()
+        df_after = at.dataframe[0].value
+        self.assertEqual(
+            list(df_after["Trader"]), ["TwoEligible (ID 1)", "ThreeEligible (ID 2)"]
+        )
+
+    def test_meets_minimum_sample_indicator_values(self):
+        # Default fixture: trader 1 has eligible_lifecycle_count=1,
+        # trader 2 has eligible_lifecycle_count=0 - both below the
+        # default threshold of 3.
+        at = self._open_dashboard()
+
+        df = at.dataframe[0].value
+        row_one = df[df["Trader"] == "TC (ID 1)"].iloc[0]
+        row_two = df[df["Trader"] == "TC (ID 2)"].iloc[0]
+        self.assertEqual(row_one["Meets Minimum Sample"], "No (1 < 3)")
+        self.assertEqual(row_two["Meets Minimum Sample"], "No (0 < 3)")
+
+    def test_trader_selector_options_follow_ranked_order(self):
+        template = self._SUMMARIES[0]
+        local_summaries = [
+            {
+                **template, "trader_id": 9, "trader_name": "Zeta",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "10.000000",
+            },
+            {
+                **template, "trader_id": 2, "trader_name": "Alpha",
+                "eligible_lifecycle_count": 3,
+                "average_gross_price_return_pct": "90.000000",
+            },
+        ]
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            local_summaries
+        )
+
+        at = self._open_dashboard()
+
+        # .options holds the format_func-rendered labels, not the raw
+        # trader_id values - the label order itself proves the
+        # selector's options follow ranked_summaries' order (Alpha
+        # ranked first for its 90% return, ahead of Zeta's 10%).
+        self.assertEqual(
+            list(at.selectbox[2].options), ["Alpha (ID 2)", "Zeta (ID 9)"]
+        )
+        self.assertEqual(at.selectbox[2].value, 2)
+
+    def test_selected_trader_remains_valid_after_changing_ranking_controls(self):
+        at = self._open_dashboard()
+        at = at.selectbox[2].set_value(2).run()
+
+        at = at.selectbox[1].set_value("Ascending").run()
+
+        self.assertEqual(at.selectbox[2].value, 2)
+
+    def test_summary_csv_download_button_exact_label_and_filename(self):
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            self._open_dashboard()
+
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertIn("Download Trader Summary CSV", calls)
+        self.assertEqual(
+            calls["Download Trader Summary CSV"]["file_name"],
+            "trader_performance_summary.csv",
+        )
+        self.assertEqual(calls["Download Trader Summary CSV"]["mime"], "text/csv")
+
+    def test_drilldown_csv_download_button_exact_label_and_filename(self):
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            self._open_dashboard()
+
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertIn("Download Lifecycle Drill-down CSV", calls)
+        self.assertEqual(
+            calls["Download Lifecycle Drill-down CSV"]["file_name"],
+            "trader_lifecycle_drilldown_1.csv",
+        )
+        self.assertEqual(
+            calls["Download Lifecycle Drill-down CSV"]["mime"], "text/csv"
+        )
+
+    def test_summary_csv_exact_content(self):
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            self._open_dashboard()
+
+        ranked = rank_trader_summaries(
+            self._SUMMARIES, sort_metric="Average Return", descending=True,
+            min_eligible_lifecycles=3,
+        )
+        expected_rows = build_summary_csv_rows(ranked, min_eligible_lifecycles=3)
+        expected_csv = rows_to_csv_string(expected_rows, SUMMARY_CSV_FIELDNAMES)
+
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertEqual(calls["Download Trader Summary CSV"]["data"], expected_csv)
+
+    def test_drilldown_csv_exact_content(self):
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            self._open_dashboard()
+
+        expected_rows = build_lifecycle_csv_rows(self._LIFECYCLE_RESULTS_TRADER_1)
+        expected_csv = rows_to_csv_string(expected_rows, LIFECYCLE_CSV_FIELDNAMES)
+
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertEqual(
+            calls["Download Lifecycle Drill-down CSV"]["data"], expected_csv
+        )
+
+    def test_csv_buttons_absent_when_database_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = Path(tmp) / "does_not_exist.db"
+            with patch.dict(
+                os.environ, {"DISCORD_TRADERS_DB_PATH": str(missing_path)}, clear=False
+            ), patch("database.db.get_connection"), patch(
+                "database.db.initialize_database"
+            ), patch("streamlit.download_button") as mock_download_button:
+                at = AppTest.from_file("app/streamlit_app.py")
+                at.run()
+                at = at.sidebar.radio[0].set_value("Trader Performance").run()
+
+        mock_download_button.assert_not_called()
+
+    def test_csv_buttons_absent_when_summaries_empty(self):
+        self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
+            []
+        )
+        with patch("streamlit.download_button") as mock_download_button:
+            self._open_dashboard()
+        mock_download_button.assert_not_called()
+
+    def test_csv_buttons_absent_when_summary_load_fails(self):
+        self.mock_service_cls.return_value.list_trader_performance_summaries.side_effect = (
+            sqlite3.OperationalError("SENTINEL_DASH_R8B_SUMMARY_EXC")
+        )
+        with patch("streamlit.download_button") as mock_download_button:
+            self._open_dashboard()
+        mock_download_button.assert_not_called()
+
+    def test_drilldown_csv_button_absent_when_drilldown_load_fails(self):
+        self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.side_effect = (
+            sqlite3.OperationalError("SENTINEL_DASH_R8B_DRILLDOWN_EXC")
+        )
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            self._open_dashboard()
+
+        # The summary CSV button still renders (summaries loaded fine);
+        # only the drilldown button is absent.
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertIn("Download Trader Summary CSV", calls)
+        self.assertNotIn("Download Lifecycle Drill-down CSV", calls)
+
+    def test_drilldown_csv_button_absent_when_no_lifecycles_match_filters(self):
+        with patch("streamlit.download_button") as mock_download_button:
+            mock_download_button.return_value = False
+            at = self._open_dashboard()
+            # Reset here: the initial unfiltered render already showed
+            # the drilldown button once - only the post-filter rerun's
+            # calls matter for this assertion.
+            mock_download_button.reset_mock()
+            at.text_input[0].set_value("ZZZZ").run()
+
+        calls = {c.args[0]: c.kwargs for c in mock_download_button.call_args_list}
+        self.assertIn("Download Trader Summary CSV", calls)
+        self.assertNotIn("Download Lifecycle Drill-down CSV", calls)
+
+    def test_ranking_and_csv_export_never_write_to_database(self):
+        at = self._open_dashboard()
+        at = at.selectbox[1].set_value("Ascending").run()
+        at = at.number_input[0].set_value(1).run()
+
+        self.mock_conn.commit.assert_not_called()
+        self.mock_conn.rollback.assert_not_called()
 
     # -- empty/missing/failure states -------------------------------------
 
@@ -2295,12 +2639,14 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
     def test_trader_selector_defaults_to_first_available_trader(self):
         at = self._open_dashboard()
 
-        self.assertEqual(at.selectbox[0].value, 1)
+        # selectbox[0]/[1] are the R8b "Rank traders by"/"Sort
+        # direction" controls; selectbox[2] is the trader selector.
+        self.assertEqual(at.selectbox[2].value, 1)
 
     def test_selecting_trader_invokes_drilldown_with_correct_trader_id(self):
         at = self._open_dashboard()
 
-        at.selectbox[0].set_value(2).run()
+        at.selectbox[2].set_value(2).run()
 
         self.mock_service_cls.return_value.list_current_trade_lifecycle_analytics.assert_called_with(
             trader_id=2
@@ -2410,7 +2756,7 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
     def test_lifecycle_detail_shows_exit_legs(self):
         at = self._open_dashboard()
 
-        at = at.selectbox[1].set_value(1).run()
+        at = at.selectbox[3].set_value(1).run()
 
         df = at.dataframe[2].value
         self.assertEqual(list(df["Event Type"]), ["FULL_EXIT"])
@@ -2421,8 +2767,8 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
     def test_lifecycle_detail_shows_verbatim_error_detail_for_data_error_lifecycle(self):
         at = self._open_dashboard()
 
-        at = at.selectbox[0].set_value(2).run()
-        at = at.selectbox[1].set_value(3).run()
+        at = at.selectbox[2].set_value(2).run()
+        at = at.selectbox[3].set_value(3).run()
 
         detail_text = "\n".join(element.value for element in at.markdown)
         self.assertIn(
@@ -2432,7 +2778,7 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
     def test_lifecycle_detail_shows_em_dash_for_normal_lifecycle(self):
         at = self._open_dashboard()
 
-        at = at.selectbox[1].set_value(1).run()
+        at = at.selectbox[3].set_value(1).run()
 
         detail_text = "\n".join(element.value for element in at.markdown)
         self.assertIn("Data Error Detail: —", detail_text)
@@ -2440,7 +2786,7 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
     def test_open_lifecycle_with_no_exit_legs_shows_message_not_empty_table(self):
         at = self._open_dashboard()
 
-        at = at.selectbox[1].set_value(2).run()
+        at = at.selectbox[3].set_value(2).run()
 
         detail_text = "\n".join(element.value for element in at.markdown)
         self.assertIn("No exit events for this lifecycle.", detail_text)
@@ -2450,25 +2796,25 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
 
     def test_selected_trader_no_longer_present_is_cleared_without_raising(self):
         at = self._open_dashboard()
-        at = at.selectbox[0].set_value(2).run()
+        at = at.selectbox[2].set_value(2).run()
 
         self.mock_service_cls.return_value.list_trader_performance_summaries.return_value = (
             [self._SUMMARIES[0]]
         )
         at = at.run()
 
-        self.assertEqual(at.selectbox[0].value, 1)
+        self.assertEqual(at.selectbox[2].value, 1)
 
     def test_selected_lifecycle_no_longer_matching_filters_is_cleared_without_raising(
         self,
     ):
         at = self._open_dashboard()
-        at = at.selectbox[1].set_value(2).run()
+        at = at.selectbox[3].set_value(2).run()
 
         at = at.multiselect[0].set_value(["closed"]).run()
 
         self.assertEqual(list(at.dataframe[1].value["Lifecycle ID"]), [1])
-        self.assertEqual(at.selectbox[1].value, 1)
+        self.assertEqual(at.selectbox[3].value, 1)
 
     # -- isolation from other workflows --------------------------------------
 

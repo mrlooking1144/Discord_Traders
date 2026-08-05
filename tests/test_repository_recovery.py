@@ -19,6 +19,7 @@ from database.db import get_connection, initialize_database
 from database.lifecycle import LifecycleBuild, build_lifecycle_sequence
 from database.models import (
     Channel,
+    ChannelImportOperation,
     ImportBatch,
     MessageExtraction,
     RawMessage,
@@ -29,6 +30,7 @@ from database.repository import (
     build_signal_snapshot_json,
     clear_lifecycle_pointers_for_generation,
     create_channel,
+    create_channel_import_operation,
     create_import_batch,
     create_lifecycle_unresolved_singleton,
     create_message_extraction,
@@ -42,6 +44,7 @@ from database.repository import (
     get_all_current_lifecycle_keys,
     get_all_current_trade_lifecycles,
     get_channel_by_external_id,
+    get_channel_by_id,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
     get_chronological_positions_for_raw_messages,
@@ -54,6 +57,7 @@ from database.repository import (
     get_current_trade_signals_for_key,
     get_distinct_lifecycle_keys_for_signal_ids,
     get_import_batch_by_id,
+    get_latest_channel_import_operation,
     get_or_create_channel,
     get_or_create_source,
     get_or_create_unspecified_channel,
@@ -68,6 +72,7 @@ from database.repository import (
     get_trade_signal_by_id,
     get_trader_by_id,
     get_traders_by_canonical_name,
+    list_channels,
     list_current_trade_lifecycles,
     persist_lifecycle_builds,
     supersede_extraction,
@@ -161,6 +166,112 @@ class ChannelsRepositoryTests(_RecoveryRepositoryTestCase):
         self.connection.commit()
 
         self.assertNotEqual(discord_unspecified.id, telegram_unspecified.id)
+
+    # -- Recovery Milestone R9a: get_channel_by_id() / list_channels() -----
+
+    def test_get_channel_by_id_returns_existing_channel(self):
+        created = create_channel(
+            self.connection, self.source.id, external_channel_id="chan-9", name="pro-alerts"
+        )
+        self.connection.commit()
+
+        found = get_channel_by_id(self.connection, created.id)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, created.id)
+        self.assertEqual(found.external_channel_id, "chan-9")
+        self.assertEqual(found.name, "pro-alerts")
+
+    def test_get_channel_by_id_missing_returns_none(self):
+        self.assertIsNone(get_channel_by_id(self.connection, 999999))
+
+    def test_list_channels_empty_for_source_with_no_channels(self):
+        self.assertEqual(list_channels(self.connection, self.source.id), [])
+
+    def test_list_channels_includes_channel_with_zero_messages(self):
+        # No raw_messages row is ever created for this channel - unlike
+        # get_channel_ingestion_cursors(), list_channels() must still
+        # return it.
+        create_channel(self.connection, self.source.id, external_channel_id="empty-chan")
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        self.assertEqual(
+            {c.external_channel_id for c in channels}, {"empty-chan"}
+        )
+        self.assertEqual(
+            get_channel_ingestion_cursors(self.connection), [],
+            "sanity check: the ingestion-cursor query has no row for a "
+            "message-less channel, confirming list_channels() is the one "
+            "actually exercised by this test, not accidentally reusing "
+            "that query",
+        )
+
+    def test_list_channels_is_source_scoped(self):
+        other_source = get_or_create_source(self.connection, "telegram")
+        create_channel(self.connection, self.source.id, external_channel_id="discord-chan")
+        create_channel(self.connection, other_source.id, external_channel_id="telegram-chan")
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        self.assertEqual({c.external_channel_id for c in channels}, {"discord-chan"})
+
+    def test_list_channels_deterministic_ordering(self):
+        create_channel(self.connection, self.source.id, external_channel_id="z-id", name="Bravo")
+        create_channel(self.connection, self.source.id, external_channel_id="a-id", name="alpha")
+        create_channel(self.connection, self.source.id, external_channel_id="m-id")
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        # "alpha"/"Bravo" ordered case-insensitively by name; "m-id" (no
+        # name) ordered by its own external_channel_id, which sorts after
+        # both names alphabetically here.
+        self.assertEqual(
+            [c.external_channel_id for c in channels], ["a-id", "z-id", "m-id"]
+        )
+
+    def test_list_channels_whitespace_only_name_falls_back_to_external_id(self):
+        # A whitespace-only name is treated as absent - ordered by its
+        # own external_channel_id, exactly like a NULL name, never
+        # sorted as if "   " were a real (blank-looking) display value.
+        create_channel(self.connection, self.source.id, external_channel_id="z-id", name="Bravo")
+        create_channel(
+            self.connection, self.source.id, external_channel_id="a-id", name="   "
+        )
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        self.assertEqual(
+            [c.external_channel_id for c in channels], ["a-id", "z-id"]
+        )
+
+    def test_list_channels_includes_unspecified_sentinel(self):
+        # list_channels() is deliberately repository-generic - excluding
+        # the sentinel is the Bulk Channel Import service layer's own
+        # responsibility, not this function's.
+        get_or_create_unspecified_channel(self.connection, self.source.id)
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        self.assertIn("__unspecified__", {c.external_channel_id for c in channels})
+
+    def test_list_channels_tie_broken_by_id_when_display_values_match(self):
+        first = create_channel(
+            self.connection, self.source.id, external_channel_id="dup-a", name="same"
+        )
+        second = create_channel(
+            self.connection, self.source.id, external_channel_id="dup-b", name="same"
+        )
+        self.connection.commit()
+
+        channels = list_channels(self.connection, self.source.id)
+
+        self.assertEqual([c.id for c in channels], sorted([first.id, second.id]))
 
 
 class ImportBatchesRepositoryTests(_RecoveryRepositoryTestCase):
@@ -754,6 +865,118 @@ class ChannelCheckpointQueryTests(_RecoveryRepositoryTestCase):
         row = next(r for r in rows if r["channel_id"] == channel.id)
 
         self.assertEqual(row["latest_received_raw_message_id"], tie_b.id)
+
+
+class ChannelImportOperationsRepositoryTests(_RecoveryRepositoryTestCase):
+    """Recovery Milestone R9a: create_channel_import_operation() /
+    get_latest_channel_import_operation()."""
+
+    def setUp(self):
+        super().setUp()
+        self.channel = create_channel(
+            self.connection, self.source.id, external_channel_id="ops-chan"
+        )
+        self.connection.commit()
+
+    def _create_operation(self, **overrides):
+        values = dict(
+            channel_id=self.channel.id,
+            import_batch_id=None,
+            reference_date="2026-01-01",
+            timezone="UTC",
+            processed_count=15,
+            stored_count=0,
+            duplicate_count=15,
+            unrecognized_count=0,
+            failed_count=0,
+        )
+        values.update(overrides)
+        return create_channel_import_operation(self.connection, **values)
+
+    def test_insert_and_read_back(self):
+        operation = self._create_operation()
+        self.connection.commit()
+
+        self.assertIsInstance(operation, ChannelImportOperation)
+        self.assertIsNotNone(operation.id)
+        self.assertEqual(operation.channel_id, self.channel.id)
+        self.assertIsNone(operation.import_batch_id)
+        self.assertEqual(operation.processed_count, 15)
+        self.assertEqual(operation.duplicate_count, 15)
+        self.assertIsNotNone(operation.committed_at)
+
+    def test_duplicate_only_operation_has_null_import_batch_id(self):
+        operation = self._create_operation(
+            import_batch_id=None, stored_count=0, duplicate_count=15
+        )
+        self.connection.commit()
+
+        self.assertIsNone(operation.import_batch_id)
+
+    def test_stored_operation_requires_import_batch_id(self):
+        import_batch = create_import_batch(
+            self.connection, self.source.id, "2026-01-01", "UTC", "raw text"
+        )
+        self.connection.commit()
+
+        operation = self._create_operation(
+            import_batch_id=import_batch.id,
+            stored_count=15,
+            duplicate_count=0,
+        )
+        self.connection.commit()
+
+        self.assertEqual(operation.import_batch_id, import_batch.id)
+
+    def test_database_constraint_violation_propagates_as_integrity_error(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._create_operation(processed_count=14, stored_count=0, duplicate_count=14)
+
+    def test_create_channel_import_operation_does_not_commit(self):
+        self._create_operation()
+        self.connection.rollback()
+
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM channel_import_operations"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_get_latest_channel_import_operation_returns_highest_id(self):
+        first = self._create_operation()
+        self.connection.commit()
+        second = self._create_operation()
+        self.connection.commit()
+
+        latest = get_latest_channel_import_operation(self.connection, self.channel.id)
+
+        self.assertEqual(latest.id, second.id)
+        self.assertNotEqual(latest.id, first.id)
+
+    def test_get_latest_channel_import_operation_no_operations_returns_none(self):
+        self.assertIsNone(
+            get_latest_channel_import_operation(self.connection, self.channel.id)
+        )
+
+    def test_get_latest_channel_import_operation_is_channel_scoped(self):
+        other_channel = create_channel(
+            self.connection, self.source.id, external_channel_id="other-ops-chan"
+        )
+        self.connection.commit()
+        self._create_operation()
+        self.connection.commit()
+
+        self.assertIsNone(
+            get_latest_channel_import_operation(self.connection, other_channel.id)
+        )
+
+    def test_get_latest_channel_import_operation_does_not_write(self):
+        self._create_operation()
+        self.connection.commit()
+
+        changes_before = self.connection.total_changes
+        get_latest_channel_import_operation(self.connection, self.channel.id)
+
+        self.assertEqual(self.connection.total_changes, changes_before)
 
 
 # ---------------------------------------------------------------------------

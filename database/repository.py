@@ -18,6 +18,7 @@ from typing import Optional
 from database.lifecycle import SignalSnapshot
 from database.models import (
     Channel,
+    ChannelImportOperation,
     ImportBatch,
     MessageExtraction,
     RawMessage,
@@ -249,8 +250,14 @@ def get_traders_by_canonical_name(
     return [_row_to_trader(row) for row in rows]
 
 
-def _compute_content_hash(raw_text: str) -> str:
+def compute_content_hash(raw_text: str) -> str:
     """Compute the content hash used for duplicate-lookup fallback.
+
+    Public (promoted from a private helper during Recovery Milestone R9a)
+    so this is the one and only content-hash implementation in the
+    codebase - database.service imports and calls this exact function
+    (in _duplicate_outcome() and predict_channel_import_duplicate_statuses())
+    rather than maintaining a second, independently computed hash.
 
     Args:
         raw_text: The raw message text, exactly as received.
@@ -339,7 +346,7 @@ def create_raw_message(
             channel_ids.
         TypeError: If metadata is not JSON-serializable.
     """
-    content_hash = _compute_content_hash(raw_text)
+    content_hash = compute_content_hash(raw_text)
     serialized_metadata = (
         json.dumps(metadata, sort_keys=True) if metadata is not None else None
     )
@@ -1074,7 +1081,11 @@ def get_trade_signals_for_review(
     return [dict(row) for row in rows]
 
 
-_UNSPECIFIED_CHANNEL_EXTERNAL_ID = "__unspecified__"
+# Public (Recovery Milestone R9a) so database.service can import and
+# reuse this exact value rather than maintaining a second, independently
+# defined sentinel constant - the one and only definition of the
+# "unspecified" channel's external id.
+UNSPECIFIED_CHANNEL_EXTERNAL_ID = "__unspecified__"
 
 
 def _row_to_channel(row: sqlite3.Row) -> Channel:
@@ -1199,8 +1210,65 @@ def get_or_create_unspecified_channel(conn: sqlite3.Connection, source_id: int) 
         The existing or newly created sentinel Channel for this source.
     """
     return get_or_create_channel(
-        conn, source_id, _UNSPECIFIED_CHANNEL_EXTERNAL_ID, name="unspecified"
+        conn, source_id, UNSPECIFIED_CHANNEL_EXTERNAL_ID, name="unspecified"
     )
+
+
+def get_channel_by_id(conn: sqlite3.Connection, channel_id: int) -> Channel | None:
+    """Look up a channel by primary key (Recovery Milestone R9a).
+
+    One read-only primary-key lookup - never creates or modifies data.
+    Mirrors get_trader_by_id()'s own by-primary-key convention exactly.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        channel_id: Primary key to look up.
+
+    Returns:
+        The matching Channel, or None if no row exists with this id.
+    """
+    row = conn.execute(
+        "SELECT id, source_id, external_channel_id, name, created_at "
+        "FROM channels WHERE id = ?",
+        (channel_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_channel(row)
+
+
+def list_channels(conn: sqlite3.Connection, source_id: int) -> list[Channel]:
+    """List every channel for one source (Recovery Milestone R9a).
+
+    Includes every channel row for source_id, including a channel with
+    zero raw_messages rows (unlike get_channel_ingestion_cursors(), which
+    only returns a channel that already has at least one message) and
+    including the __unspecified__ sentinel channel - this function is
+    deliberately repository-generic; filtering the sentinel out belongs to
+    the Bulk Channel Import service layer, not here.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        source_id: FK to sources.id.
+
+    Returns:
+        Every Channel for source_id, ordered by display name when
+        present, otherwise external_channel_id, case-insensitively, with
+        id as a deterministic tie-breaker (covering the case where both
+        are absent or two channels share the same case-insensitive
+        display value). A null, empty, or whitespace-only name is treated
+        as absent (falls back to external_channel_id, never sorted as if
+        it were a blank-string name) via NULLIF(TRIM(name), '').
+    """
+    rows = conn.execute(
+        "SELECT id, source_id, external_channel_id, name, created_at "
+        "FROM channels WHERE source_id = ? "
+        "ORDER BY "
+        "LOWER(COALESCE(NULLIF(TRIM(name), ''), external_channel_id, '')) ASC, "
+        "id ASC",
+        (source_id,),
+    ).fetchall()
+    return [_row_to_channel(row) for row in rows]
 
 
 def _row_to_import_batch(row: sqlite3.Row) -> ImportBatch:
@@ -1636,6 +1704,140 @@ def get_channel_chronological_checkpoints(conn: sqlite3.Connection) -> list[dict
         "ORDER BY c.id"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _row_to_channel_import_operation(row: sqlite3.Row) -> ChannelImportOperation:
+    """Map a ``channel_import_operations`` table row to a
+    ChannelImportOperation model (Recovery Milestone R9a).
+
+    Args:
+        row: A row from the channel_import_operations table, with all
+            columns selected.
+
+    Returns:
+        The corresponding ChannelImportOperation.
+    """
+    return ChannelImportOperation(
+        id=row["id"],
+        channel_id=row["channel_id"],
+        import_batch_id=row["import_batch_id"],
+        reference_date=row["reference_date"],
+        timezone=row["timezone"],
+        processed_count=row["processed_count"],
+        stored_count=row["stored_count"],
+        duplicate_count=row["duplicate_count"],
+        unrecognized_count=row["unrecognized_count"],
+        failed_count=row["failed_count"],
+        committed_at=row["committed_at"],
+    )
+
+
+def create_channel_import_operation(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    import_batch_id: int | None,
+    reference_date: str,
+    timezone: str,
+    processed_count: int,
+    stored_count: int,
+    duplicate_count: int,
+    unrecognized_count: int,
+    failed_count: int,
+) -> ChannelImportOperation:
+    """Insert one successful channel_import_operations row (Recovery
+    Milestone R9a).
+
+    A plain insert-and-read-back function: inserts only the supplied
+    successful-operation values, relying entirely on the
+    channel_import_operations table's own CHECK constraints (see
+    database/migrations/0008_channel_import_operations.sql) to enforce
+    every count invariant - this function performs no validation of its
+    own beyond what the database itself enforces. Never commits; the
+    caller (Recovery Milestone R9b's atomic import transaction, not yet
+    implemented) owns the transaction this insert participates in.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        channel_id: FK to channels.id.
+        import_batch_id: FK to import_batches.id, or None for a
+            duplicate-only operation.
+        reference_date: The operation's batch-wide reference date
+            ("YYYY-MM-DD").
+        timezone: The operation's IANA timezone name.
+        processed_count: Total messages segmented from this operation's
+            batch.
+        stored_count: Count of messages newly stored.
+        duplicate_count: Count of messages already present.
+        unrecognized_count: Subset of stored_count that was unrecognized.
+        failed_count: Subset of stored_count that failed extraction.
+
+    Returns:
+        The newly created ChannelImportOperation, including its generated
+        id and committed_at.
+
+    Raises:
+        sqlite3.IntegrityError: If channel_id/import_batch_id does not
+            reference an existing row, or if any CHECK constraint is
+            violated (e.g. processed_count < 15, a count-invariant
+            mismatch, or an inconsistent stored_count/import_batch_id
+            pairing).
+    """
+    cursor = conn.execute(
+        "INSERT INTO channel_import_operations ("
+        "channel_id, import_batch_id, reference_date, timezone, "
+        "processed_count, stored_count, duplicate_count, "
+        "unrecognized_count, failed_count"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            channel_id,
+            import_batch_id,
+            reference_date,
+            timezone,
+            processed_count,
+            stored_count,
+            duplicate_count,
+            unrecognized_count,
+            failed_count,
+        ),
+    )
+    row = conn.execute(
+        "SELECT id, channel_id, import_batch_id, reference_date, timezone, "
+        "processed_count, stored_count, duplicate_count, unrecognized_count, "
+        "failed_count, committed_at "
+        "FROM channel_import_operations WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row_to_channel_import_operation(row)
+
+
+def get_latest_channel_import_operation(
+    conn: sqlite3.Connection, channel_id: int
+) -> ChannelImportOperation | None:
+    """Return one channel's most recent successful import operation
+    (Recovery Milestone R9a).
+
+    Read-only; never writes.
+
+    Args:
+        conn: An open sqlite3.Connection.
+        channel_id: FK to channels.id.
+
+    Returns:
+        The ChannelImportOperation with the highest id for channel_id, or
+        None if this channel has no channel_import_operations row.
+    """
+    row = conn.execute(
+        "SELECT id, channel_id, import_batch_id, reference_date, timezone, "
+        "processed_count, stored_count, duplicate_count, unrecognized_count, "
+        "failed_count, committed_at "
+        "FROM channel_import_operations WHERE channel_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (channel_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_channel_import_operation(row)
 
 
 # ---------------------------------------------------------------------------

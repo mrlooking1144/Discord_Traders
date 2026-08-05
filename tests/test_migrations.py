@@ -697,6 +697,296 @@ class R6LifecycleSchemaExactDefinitionTests(unittest.TestCase):
         )
 
 
+class ChannelImportOperationsSchemaTests(unittest.TestCase):
+    """Recovery Milestone R9a: channel_import_operations table (see
+    database/migrations/0008_channel_import_operations.sql). A row
+    represents only a successfully completed confirmed Bulk Channel
+    Import operation - every CHECK constraint below enforces that
+    contract at the database level, not only in service-layer
+    validation (which does not exist yet - Recovery Milestone R9b)."""
+
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.db_path = path
+        self.config = DatabaseConfig(db_path=path)
+        initialize_database(self.config)
+        self.connection = get_connection(self.config)
+
+    def tearDown(self):
+        self.connection.close()
+        os.remove(self.db_path)
+
+    def _seed_channel(self):
+        conn = self.connection
+        conn.execute("INSERT INTO sources (name) VALUES ('discord')")
+        source_id = conn.execute(
+            "SELECT id FROM sources WHERE name = 'discord'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO channels (source_id, external_channel_id, name) "
+            "VALUES (?, 'chan-1', 'general')",
+            (source_id,),
+        )
+        channel_id = conn.execute(
+            "SELECT id FROM channels WHERE external_channel_id = 'chan-1'"
+        ).fetchone()[0]
+        conn.commit()
+        return channel_id
+
+    def _seed_channel_and_batch(self):
+        channel_id = self._seed_channel()
+        conn = self.connection
+        source_id = conn.execute(
+            "SELECT source_id FROM channels WHERE id = ?", (channel_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO import_batches (source_id, reference_date, timezone) "
+            "VALUES (?, '2026-01-01', 'UTC')",
+            (source_id,),
+        )
+        import_batch_id = conn.execute(
+            "SELECT id FROM import_batches WHERE source_id = ? ORDER BY id DESC LIMIT 1",
+            (source_id,),
+        ).fetchone()[0]
+        conn.commit()
+        return channel_id, import_batch_id
+
+    def _insert_operation(self, channel_id, import_batch_id, **overrides):
+        values = {
+            "channel_id": channel_id,
+            "import_batch_id": import_batch_id,
+            "reference_date": "2026-01-01",
+            "timezone": "UTC",
+            "processed_count": 15,
+            "stored_count": 15,
+            "duplicate_count": 0,
+            "unrecognized_count": 0,
+            "failed_count": 0,
+        }
+        values.update(overrides)
+        self.connection.execute(
+            "INSERT INTO channel_import_operations ("
+            "channel_id, import_batch_id, reference_date, timezone, "
+            "processed_count, stored_count, duplicate_count, "
+            "unrecognized_count, failed_count"
+            ") VALUES (:channel_id, :import_batch_id, :reference_date, :timezone, "
+            ":processed_count, :stored_count, :duplicate_count, "
+            ":unrecognized_count, :failed_count)",
+            values,
+        )
+
+    # -- table shape -------------------------------------------------------
+
+    def test_table_exists(self):
+        self.assertIn("channel_import_operations", _table_names(self.connection))
+
+    def test_exact_columns(self):
+        self.assertEqual(
+            _column_names(self.connection, "channel_import_operations"),
+            {
+                "id", "channel_id", "import_batch_id", "reference_date",
+                "timezone", "processed_count", "stored_count",
+                "duplicate_count", "unrecognized_count", "failed_count",
+                "committed_at",
+            },
+        )
+
+    def test_foreign_keys_exact(self):
+        self.assertEqual(
+            _foreign_keys(self.connection, "channel_import_operations"),
+            {
+                ("channel_id", "channels", "id"),
+                ("import_batch_id", "import_batches", "id"),
+            },
+        )
+
+    def test_index_exists_on_channel_id(self):
+        self.assertIn(
+            "idx_channel_import_operations_channel_id", _index_names(self.connection)
+        )
+        self.assertEqual(
+            _index_columns_in_order(
+                self.connection, "idx_channel_import_operations_channel_id"
+            ),
+            ["channel_id"],
+        )
+
+    def test_migration_applied_after_all_previous_migrations(self):
+        # Build a temp database with only migrations 0001-0007 staged
+        # (0008 excluded), confirm channel_import_operations does not
+        # exist yet, then apply the real migrations directory (which
+        # only has 0008 left unapplied) and confirm the real migration
+        # file builds cleanly on the channels/import_batches tables
+        # those earlier migrations created.
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            schema_sql = (
+                Path(__file__).resolve().parent.parent / "database" / "schema.sql"
+            ).read_text(encoding="utf-8")
+            conn.executescript(schema_sql)
+            conn.commit()
+
+            with tempfile.TemporaryDirectory() as staged_dir:
+                staged = Path(staged_dir)
+                for migration_file in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+                    if migration_file.name == "0008_channel_import_operations.sql":
+                        continue
+                    (staged / migration_file.name).write_text(
+                        migration_file.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                apply_migrations(conn, migrations_dir=staged)
+            self.assertNotIn("channel_import_operations", _table_names(conn))
+
+            apply_migrations(conn)  # real migrations dir - only 0008 remains unapplied
+            self.assertIn("channel_import_operations", _table_names(conn))
+        finally:
+            conn.close()
+            os.remove(path)
+
+    def test_backward_compatible_with_preexisting_channel_and_batch_data(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        before_channel = dict(
+            self.connection.execute(
+                "SELECT * FROM channels WHERE id = ?", (channel_id,)
+            ).fetchone()
+        )
+
+        self._insert_operation(channel_id, import_batch_id)
+        self.connection.commit()
+
+        after_channel = dict(
+            self.connection.execute(
+                "SELECT * FROM channels WHERE id = ?", (channel_id,)
+            ).fetchone()
+        )
+        self.assertEqual(before_channel, after_channel)
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM channel_import_operations"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    # -- CHECK constraints ---------------------------------------------------
+
+    def test_every_count_rejects_negative(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        for field in (
+            "processed_count", "stored_count", "duplicate_count",
+            "unrecognized_count", "failed_count",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self._insert_operation(channel_id, import_batch_id, **{field: -1})
+
+    def test_processed_count_14_rejected(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=14, stored_count=14, duplicate_count=0,
+            )
+
+    def test_processed_count_15_accepted(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        self._insert_operation(
+            channel_id, import_batch_id,
+            processed_count=15, stored_count=15, duplicate_count=0,
+        )
+        self.connection.commit()
+        count = self.connection.execute(
+            "SELECT COUNT(*) FROM channel_import_operations"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_stored_plus_duplicate_must_equal_processed(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=20, stored_count=10, duplicate_count=5,
+            )
+
+    def test_unrecognized_count_exceeding_stored_rejected(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=15, stored_count=10, duplicate_count=5,
+                unrecognized_count=11,
+            )
+
+    def test_failed_count_exceeding_stored_rejected(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=15, stored_count=10, duplicate_count=5,
+                failed_count=11,
+            )
+
+    def test_individually_valid_unrecognized_and_failed_sum_exceeding_stored_rejected(
+        self,
+    ):
+        # unrecognized_count=6 <= stored_count=10 and failed_count=6 <=
+        # stored_count=10 each individually satisfy their own CHECK, but
+        # their sum (12) exceeds stored_count - only the combined CHECK
+        # (unrecognized_count + failed_count <= stored_count) catches
+        # this, proving it is not redundant with the two individual ones.
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=16, stored_count=10, duplicate_count=6,
+                unrecognized_count=6, failed_count=6,
+            )
+
+    def test_zero_stored_with_nonnull_import_batch_id_rejected(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, import_batch_id,
+                processed_count=15, stored_count=0, duplicate_count=15,
+            )
+
+    def test_positive_stored_with_null_import_batch_id_rejected(self):
+        channel_id = self._seed_channel()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_operation(
+                channel_id, None,
+                processed_count=15, stored_count=15, duplicate_count=0,
+            )
+
+    def test_duplicate_only_success_with_null_import_batch_id_accepted(self):
+        channel_id = self._seed_channel()
+        self._insert_operation(
+            channel_id, None,
+            processed_count=15, stored_count=0, duplicate_count=15,
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT stored_count, import_batch_id FROM channel_import_operations"
+        ).fetchone()
+        self.assertEqual(row["stored_count"], 0)
+        self.assertIsNone(row["import_batch_id"])
+
+    def test_stored_message_success_with_valid_import_batch_id_accepted(self):
+        channel_id, import_batch_id = self._seed_channel_and_batch()
+        self._insert_operation(
+            channel_id, import_batch_id,
+            processed_count=15, stored_count=15, duplicate_count=0,
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT stored_count, import_batch_id FROM channel_import_operations"
+        ).fetchone()
+        self.assertEqual(row["stored_count"], 15)
+        self.assertEqual(row["import_batch_id"], import_batch_id)
+
+
 class MigrationAtomicityTests(unittest.TestCase):
     """Verifies apply_migrations() applies each file atomically.
 

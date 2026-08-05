@@ -633,3 +633,155 @@ class TradeSignalCorrectionResult:
     trade_signal: TradeSignal
     lifecycle_rebuild_performed: bool
     lifecycle_rebuild_result: LifecycleRebuildResult
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R9a: Bulk Channel Import backend read contracts.
+#
+# All four models below mirror this milestone's approved planning contract
+# exactly. ChannelImportOperation mirrors the new channel_import_operations
+# table (database/migrations/0008_channel_import_operations.sql)
+# field-for-field, following the same plain-data-shape convention as
+# Channel/ImportBatch/MessageExtraction above - a row represents only a
+# successfully completed confirmed operation (see that migration's own
+# comment header). ChannelExternalIdAvailability,
+# ChannelImportDuplicatePrediction, and ChannelImportChannelSummary are
+# purpose-built read-result shapes with no table of their own, following
+# the same frozen-dataclass convention as the Recovery Milestone R5 result
+# models above (MessageIngestOutcome and following) - none of the four is
+# ever constructed by anything except the new Recovery Milestone R9a
+# read-only TradeService methods. AtomicChannelImportResult is explicitly
+# NOT added here - it belongs to Recovery Milestone R9b, not yet started.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChannelImportOperation:
+    """Mirrors one row of the channel_import_operations table (Recovery
+    Milestone R9a). Represents only a successfully completed confirmed
+    Bulk Channel Import operation - a failed or rolled-back attempt is
+    never persisted, so this model has no status/started_at/error field
+    of any kind; the row's mere existence is the success signal.
+
+    Attributes:
+        id: Primary key.
+        channel_id: FK to channels.id.
+        import_batch_id: FK to import_batches.id, or None exactly when
+            this was a duplicate-only operation (stored_count == 0) that
+            created no import_batches row, mirroring
+            BatchIngestResult.import_batch_id's own contract.
+        reference_date: The batch-wide reference date ("YYYY-MM-DD") this
+            operation was resolved against.
+        timezone: The IANA timezone name this operation was resolved
+            against.
+        processed_count: Total messages segmented from this operation's
+            pasted batch (BatchIngestResult.total_segmented). Always >= 15
+            (the approved Bulk Channel Import minimum), enforced by this
+            table's own CHECK constraint.
+        stored_count: Count of messages newly stored (regardless of
+            parse_status), mirroring BatchIngestResult.stored_count.
+        duplicate_count: Count of messages already present, mirroring
+            BatchIngestResult.duplicate_count.
+        unrecognized_count: Subset of stored_count with
+            parse_status == "unrecognized".
+        failed_count: Subset of stored_count with parse_status == "failed".
+        committed_at: ISO8601 timestamp of this operation's commit - the
+            "last successful paste/import" timestamp for this channel when
+            this is the latest row for its channel_id.
+    """
+
+    id: int
+    channel_id: int
+    import_batch_id: Optional[int]
+    reference_date: str
+    timezone: str
+    processed_count: int
+    stored_count: int
+    duplicate_count: int
+    unrecognized_count: int
+    failed_count: int
+    committed_at: str
+
+
+@dataclass(frozen=True)
+class ChannelExternalIdAvailability:
+    """Result of checking whether a candidate new-channel external ID is
+    available (Recovery Milestone R9a) - advisory and read-only; the
+    confirmed Recovery Milestone R9b transaction always repeats this same
+    check authoritatively before ever creating a channel.
+
+    Attributes:
+        external_channel_id: The normalized (stripped) external channel ID
+            that was checked, exactly as evaluated - never re-cased, since
+            channel-ID identity is an exact match, unlike this milestone's
+            display-only case-insensitive channel ordering.
+        is_available: True if no channel with this external ID currently
+            exists for the requested source (or the source itself does not
+            exist yet); False if one already exists.
+        existing_channel: The colliding Channel when is_available is False;
+            None when is_available is True.
+    """
+
+    external_channel_id: str
+    is_available: bool
+    existing_channel: Optional["Channel"]
+
+
+@dataclass(frozen=True)
+class ChannelImportDuplicatePrediction:
+    """One segmented message's predicted duplicate status (Recovery
+    Milestone R9a) - advisory and read-only; the confirmed Recovery
+    Milestone R9b transaction always repeats duplicate detection
+    authoritatively, so a message predicted new here may still be
+    classified a duplicate at confirm time (the same narrow race window
+    Recovery Milestone R5's own duplicate preflight already handles).
+
+    Attributes:
+        sequence_in_batch: This message's 1-indexed position within its
+            batch (app.discord_adapter.SegmentedMessage.sequence_in_batch)
+            - preserves each message's own adapter-generated,
+            occurrence-specific identity even when several messages in the
+            same paste are otherwise identical.
+        external_id: The resolved synthetic external_id for this message,
+            computed by the exact same shared TradeService._resolve_external_id()
+            helper authoritative ingestion itself uses - never a second,
+            independently computed id.
+        predicted_duplicate: True if a raw_messages row already exists for
+            this channel_id/external_id pair.
+        predicted_content_differs: True/False when predicted_duplicate is
+            True (whether this message's own raw_text content hash differs
+            from the existing stored row's content_hash, computed via the
+            exact same content-hash algorithm authoritative ingestion
+            uses); None when predicted_duplicate is False (not
+            applicable) - mirrors MessageIngestOutcome.content_differs'
+            own None-when-not-applicable contract exactly.
+    """
+
+    sequence_in_batch: int
+    external_id: str
+    predicted_duplicate: bool
+    predicted_content_differs: Optional[bool]
+
+
+@dataclass(frozen=True)
+class ChannelImportChannelSummary:
+    """One channel's combined Bulk Channel Import selection summary
+    (Recovery Milestone R9a): the channel itself, its current resume
+    checkpoint, and its latest successful import operation, when each is
+    available - never the __unspecified__ sentinel channel, which this
+    milestone's read-only service methods never include or return.
+
+    Attributes:
+        channel: The Channel itself. Never the __unspecified__ sentinel.
+        checkpoint: This channel's current ChannelCheckpoint, or None when
+            the channel has no raw_messages row yet (e.g. a just-created,
+            still-empty channel) - never substituted with a zero-valued or
+            fabricated checkpoint.
+        latest_operation: This channel's most recent ChannelImportOperation
+            (by descending id), or None when the channel has never had a
+            successfully completed Bulk Channel Import operation.
+    """
+
+    channel: "Channel"
+    checkpoint: Optional["ChannelCheckpoint"]
+    latest_operation: Optional[ChannelImportOperation]

@@ -31,8 +31,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from typing import Sequence
+
 from app.datetime_resolution import resolve_expiration, resolve_footer_timestamp
-from app.discord_adapter import segment_discord_batch
+from app.discord_adapter import SegmentedMessage, segment_discord_batch
 from app.parser import PARSER_VERSION, extract_trade_event
 from database.analytics import (
     build_data_error_result,
@@ -47,6 +49,9 @@ from database.lifecycle import (
 from database.models import (
     BatchIngestResult,
     ChannelCheckpoint,
+    ChannelExternalIdAvailability,
+    ChannelImportChannelSummary,
+    ChannelImportDuplicatePrediction,
     LifecycleRebuildResult,
     MessageIngestOutcome,
     ReprocessBatchResult,
@@ -56,6 +61,7 @@ from database.models import (
 )
 from database.repository import (
     clear_lifecycle_pointers_for_generation,
+    compute_content_hash,
     create_import_batch,
     create_lifecycle_unresolved_singleton,
     create_message_extraction,
@@ -67,6 +73,8 @@ from database.repository import (
     get_all_current_lifecycle_eligible_signal_ids,
     get_all_current_lifecycle_keys,
     get_all_current_trade_lifecycles,
+    get_channel_by_external_id,
+    get_channel_by_id,
     get_channel_chronological_checkpoints,
     get_channel_ingestion_cursors,
     get_chronological_positions_for_raw_messages,
@@ -79,6 +87,7 @@ from database.repository import (
     get_current_trade_signals_for_key,
     get_distinct_lifecycle_keys_for_signal_ids,
     get_import_batch_by_id,
+    get_latest_channel_import_operation,
     get_or_create_channel,
     get_or_create_source,
     get_or_create_unspecified_channel,
@@ -86,6 +95,7 @@ from database.repository import (
     get_raw_message_by_id,
     get_raw_message_ids_by_import_batch,
     get_recorded_shape_for_generation,
+    get_source_by_name,
     get_trade_lifecycle_by_id,
     get_trade_lifecycle_events,
     get_trade_lifecycle_lineage_raw_message_ids,
@@ -96,9 +106,11 @@ from database.repository import (
     get_trader_by_external_id,
     get_trader_by_id,
     get_traders_by_canonical_name,
+    list_channels,
     persist_lifecycle_builds,
     supersede_extraction,
     supersede_trade_lifecycle,
+    UNSPECIFIED_CHANNEL_EXTERNAL_ID,
     update_trade_signal as _repository_update_trade_signal,
     validate_lifecycle_membership_integrity,
     validate_trade_signal_update_fields,
@@ -1813,7 +1825,7 @@ class TradeService:
         """Build a "duplicate" MessageIngestOutcome referencing an
         already-stored raw message. No write of any kind occurs - the
         original raw_text is never overwritten."""
-        incoming_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        incoming_hash = compute_content_hash(raw_text)
         content_differs = existing_raw_message.content_hash != incoming_hash
         return MessageIngestOutcome(
             sequence_in_batch=sequence_in_batch,
@@ -2563,6 +2575,261 @@ class TradeService:
                 )
             )
         return checkpoints
+
+    # -----------------------------------------------------------------
+    # Recovery Milestone R9a: Bulk Channel Import backend read contracts.
+    #
+    # Every public method below is strictly read-only: none opens or
+    # commits a transaction, none calls get_or_create_source()/
+    # get_or_create_channel() or any other write path, and none
+    # initializes or migrates the database - all consistent with
+    # get_channel_checkpoints()'s own established read-only convention
+    # immediately above. Each is advisory/preview-facing; the confirmed
+    # atomic import transaction (Recovery Milestone R9b, not yet
+    # implemented) always repeats the relevant checks authoritatively
+    # inside its own transaction before ever writing.
+    # -----------------------------------------------------------------
+
+    def _channel_checkpoint_or_none(self, channel_id: int) -> ChannelCheckpoint | None:
+        """Return one channel's ChannelCheckpoint, or None if it has no
+        raw_messages row yet. Reuses get_channel_checkpoints()'s own
+        existing query rather than duplicating its SQL - one
+        get_channel_checkpoints() call to read back a single channel's
+        checkpoint. Used only by get_bulk_import_channel_summary(),
+        which needs exactly one channel's checkpoint - list_bulk_import_channels()
+        builds its own {channel_id: checkpoint} map from a single
+        get_channel_checkpoints() call instead, so it never calls this
+        helper once per channel."""
+        for checkpoint in self.get_channel_checkpoints():
+            if checkpoint.channel_id == channel_id:
+                return checkpoint
+        return None
+
+    def list_bulk_import_channels(
+        self, *, source_name: str
+    ) -> list[ChannelImportChannelSummary]:
+        """List every selectable Bulk Channel Import channel for one source.
+
+        Read-only. Uses get_source_by_name() - never
+        get_or_create_source(). Includes a channel with zero messages;
+        excludes the __unspecified__ sentinel channel, which is never a
+        selectable Bulk Channel Import channel.
+
+        Args:
+            source_name: Source type name (e.g. 'discord') to list
+                channels for.
+
+        Returns:
+            One ChannelImportChannelSummary per selectable channel for
+            source_name, in list_channels()'s own deterministic order
+            (display name, else external id, case-insensitive, id
+            tie-break). Empty list if source_name does not exist yet -
+            never creates it to find out.
+        """
+        source = get_source_by_name(self.conn, source_name)
+        if source is None:
+            return []
+
+        # One get_channel_checkpoints() call for the whole list, never
+        # one per channel - build a lookup map once and reuse it below.
+        checkpoints_by_channel_id = {
+            checkpoint.channel_id: checkpoint
+            for checkpoint in self.get_channel_checkpoints()
+        }
+
+        summaries = []
+        for channel in list_channels(self.conn, source.id):
+            if channel.external_channel_id == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+                continue
+            summaries.append(
+                ChannelImportChannelSummary(
+                    channel=channel,
+                    checkpoint=checkpoints_by_channel_id.get(channel.id),
+                    latest_operation=get_latest_channel_import_operation(
+                        self.conn, channel.id
+                    ),
+                )
+            )
+        return summaries
+
+    def get_bulk_import_channel_summary(
+        self, *, source_name: str, channel_id: int
+    ) -> ChannelImportChannelSummary | None:
+        """Get one selected channel's Bulk Channel Import summary.
+
+        Read-only. Never creates a missing channel. Rejects (returns
+        None for) a channel_id that does not exist, does not belong to
+        source_name, or is the __unspecified__ sentinel.
+
+        Args:
+            source_name: Source type name (e.g. 'discord') channel_id is
+                expected to belong to.
+            channel_id: FK to channels.id to summarize.
+
+        Returns:
+            The ChannelImportChannelSummary for channel_id, or None if
+            source_name does not exist, channel_id does not exist,
+            channel_id belongs to a different source, or channel_id is
+            the __unspecified__ sentinel.
+        """
+        source = get_source_by_name(self.conn, source_name)
+        if source is None:
+            return None
+
+        channel = get_channel_by_id(self.conn, channel_id)
+        if channel is None:
+            return None
+        if channel.source_id != source.id:
+            return None
+        if channel.external_channel_id == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+            return None
+
+        return ChannelImportChannelSummary(
+            channel=channel,
+            checkpoint=self._channel_checkpoint_or_none(channel.id),
+            latest_operation=get_latest_channel_import_operation(self.conn, channel.id),
+        )
+
+    def check_new_channel_external_id_availability(
+        self, *, source_name: str, external_channel_id: str
+    ) -> ChannelExternalIdAvailability:
+        """Check whether a candidate new-channel external ID is available.
+
+        Advisory and read-only - the confirmed Recovery Milestone R9b
+        transaction always repeats this same check authoritatively before
+        ever creating a channel. Uses get_source_by_name() and
+        get_channel_by_external_id() - never get_or_create_source() or
+        get_or_create_channel()/create_channel(). Performs no writes.
+
+        Args:
+            source_name: Source type name (e.g. 'discord') to check
+                against.
+            external_channel_id: Candidate external channel ID to check.
+                Stripped of surrounding whitespace before checking and in
+                the returned result; never re-cased, since channel-ID
+                identity is an exact match.
+
+        Returns:
+            A ChannelExternalIdAvailability. is_available is True when
+            source_name does not exist yet, or when it exists but no
+            channel with this external id exists for it; False (with
+            existing_channel populated) when a channel with this exact
+            external id already exists for source_name.
+
+        Raises:
+            ValueError: If external_channel_id is empty or
+                whitespace-only, if it equals the reserved
+                UNSPECIFIED_CHANNEL_EXTERNAL_ID sentinel value (rejected
+                unconditionally - even before checking whether the source
+                or the sentinel row itself exists yet), or if source_name
+                is blank (per get_source_by_name()'s own validation).
+        """
+        if not external_channel_id or not external_channel_id.strip():
+            raise ValueError("external_channel_id must not be empty or whitespace-only.")
+        normalized_external_id = external_channel_id.strip()
+        if normalized_external_id == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+            raise ValueError(
+                "external_channel_id must not be the reserved unspecified-"
+                "channel sentinel value."
+            )
+
+        source = get_source_by_name(self.conn, source_name)
+        if source is None:
+            return ChannelExternalIdAvailability(
+                external_channel_id=normalized_external_id,
+                is_available=True,
+                existing_channel=None,
+            )
+
+        existing = get_channel_by_external_id(self.conn, source.id, normalized_external_id)
+        if existing is None:
+            return ChannelExternalIdAvailability(
+                external_channel_id=normalized_external_id,
+                is_available=True,
+                existing_channel=None,
+            )
+        return ChannelExternalIdAvailability(
+            external_channel_id=normalized_external_id,
+            is_available=False,
+            existing_channel=existing,
+        )
+
+    def predict_channel_import_duplicate_statuses(
+        self, *, channel_id: int, segmented_messages: Sequence[SegmentedMessage]
+    ) -> list[ChannelImportDuplicatePrediction]:
+        """Predict each segmented message's duplicate status for one
+        channel.
+
+        Advisory and read-only - the confirmed Recovery Milestone R9b
+        transaction always repeats duplicate detection authoritatively,
+        so a message predicted new here may still be classified a
+        duplicate at confirm time (the same narrow unique-constraint race
+        window Recovery Milestone R5's own ingest_batch() preflight
+        already handles). Uses the exact same shared
+        _resolve_external_id() and database.repository.compute_content_hash()
+        functions authoritative ingestion itself uses - never a second,
+        independently computed synthetic id or content hash. Performs no
+        writes.
+
+        Args:
+            channel_id: FK to channels.id to check predicted duplicates
+                against. Must reference an existing, non-sentinel channel
+                - never creates or recovers a missing one.
+            segmented_messages: The exact SegmentedMessage sequence the
+                preview layer already produced via
+                app.discord_adapter.segment_discord_batch() - never
+                re-segmented here.
+
+        Returns:
+            One ChannelImportDuplicatePrediction per element of
+            segmented_messages, in the same order - each message's own
+            adapter-generated, occurrence-specific synthetic_id_input is
+            preserved, so two otherwise-identical messages in the same
+            paste retain their own distinct predicted identities. A
+            valid, genuinely empty channel (no raw_messages row yet)
+            correctly predicts every message as new - this is a valid
+            outcome, not an error.
+
+        Raises:
+            ValueError: If channel_id does not exist (never silently
+                treated as "no collisions possible" - a stale/incorrect
+                channel_id must be surfaced, not swallowed), or if it
+                refers to the reserved UNSPECIFIED_CHANNEL_EXTERNAL_ID
+                sentinel channel, which is never a valid Bulk Channel
+                Import prediction target.
+        """
+        channel = get_channel_by_id(self.conn, channel_id)
+        if channel is None:
+            raise ValueError(f"channel_id {channel_id} does not exist.")
+        if channel.external_channel_id == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+            raise ValueError(
+                "channel_id refers to the reserved unspecified channel, "
+                "which is never a valid Bulk Channel Import prediction "
+                "target."
+            )
+
+        predictions = []
+        for message in segmented_messages:
+            external_id = _resolve_external_id(None, message.synthetic_id_input)
+            existing = get_raw_message_by_channel_and_external_id(
+                self.conn, channel_id, external_id
+            )
+            if existing is None:
+                predicted_duplicate = False
+                predicted_content_differs = None
+            else:
+                predicted_duplicate = True
+                incoming_hash = compute_content_hash(message.raw_text)
+                predicted_content_differs = existing.content_hash != incoming_hash
+            predictions.append(
+                ChannelImportDuplicatePrediction(
+                    sequence_in_batch=message.sequence_in_batch,
+                    external_id=external_id,
+                    predicted_duplicate=predicted_duplicate,
+                    predicted_content_differs=predicted_content_differs,
+                )
+            )
+        return predictions
 
     # -----------------------------------------------------------------
     # Recovery Milestone R6.4

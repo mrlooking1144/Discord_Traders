@@ -18,12 +18,15 @@ import typing
 import unittest
 
 from database.models import (
+    AtomicChannelImportResult,
+    BatchIngestResult,
     Channel,
     ChannelCheckpoint,
     ChannelExternalIdAvailability,
     ChannelImportChannelSummary,
     ChannelImportDuplicatePrediction,
     ChannelImportOperation,
+    LifecycleRebuildResult,
     TradeLifecycle,
     TradeLifecycleEvent,
 )
@@ -412,6 +415,98 @@ class ChannelImportChannelSummaryModelTests(unittest.TestCase):
         self.assertEqual(
             hints["latest_operation"], typing.Optional[ChannelImportOperation]
         )
+
+
+class AtomicChannelImportResultModelTests(unittest.TestCase):
+    """Recovery Milestone R9b: AtomicChannelImportResult - the atomic
+    Bulk Channel Import operation's own result model. Mirrors
+    ChannelImportChannelSummaryModelTests' own exact style above (the
+    closest existing precedent - a flat composition of other models with
+    no defaults)."""
+
+    def _channel(self):
+        return Channel(id=5, source_id=1, external_channel_id="chan-1", name="general")
+
+    def _batch_result(self):
+        return BatchIngestResult(
+            import_batch_id=7, channel_id=5, total_segmented=15, stored_count=15,
+            duplicate_count=0, unrecognized_count=0, failed_count=0, messages=[],
+        )
+
+    def _lifecycle_result(self):
+        return LifecycleRebuildResult(
+            keys_considered=1, keys_changed=1, keys_unchanged=0,
+            lifecycles_superseded=0, lifecycles_created=1,
+            lifecycle_events_created=1, signal_pointers_cleared=0,
+            signal_pointers_assigned=1,
+        )
+
+    def _operation(self):
+        return ChannelImportOperation(
+            id=1, channel_id=5, import_batch_id=7, reference_date="2026-01-01",
+            timezone="UTC", processed_count=15, stored_count=15, duplicate_count=0,
+            unrecognized_count=0, failed_count=0,
+            committed_at="2026-01-01T00:00:00.000000+00:00",
+        )
+
+    def test_is_a_real_dataclass(self):
+        self.assertTrue(dataclasses.is_dataclass(AtomicChannelImportResult))
+
+    def test_is_frozen(self):
+        result = AtomicChannelImportResult(
+            channel=self._channel(), batch_result=self._batch_result(),
+            lifecycle_result=self._lifecycle_result(), operation=self._operation(),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.channel = self._channel()
+
+    def test_construction_with_real_nested_objects(self):
+        channel = self._channel()
+        batch_result = self._batch_result()
+        lifecycle_result = self._lifecycle_result()
+        operation = self._operation()
+        result = AtomicChannelImportResult(
+            channel=channel, batch_result=batch_result,
+            lifecycle_result=lifecycle_result, operation=operation,
+        )
+        self.assertIs(result.channel, channel)
+        self.assertIs(result.batch_result, batch_result)
+        self.assertIs(result.lifecycle_result, lifecycle_result)
+        self.assertIs(result.operation, operation)
+        # Nested models keep their own fields separate - never collapsed
+        # into one flat namespace.
+        self.assertEqual(result.batch_result.stored_count, 15)
+        self.assertEqual(result.operation.stored_count, 15)
+
+    def test_field_names_exact(self):
+        expected_fields = {
+            "channel", "batch_result", "lifecycle_result", "operation"
+        }
+        actual_fields = {
+            f.name for f in dataclasses.fields(AtomicChannelImportResult)
+        }
+        self.assertEqual(actual_fields, expected_fields)
+
+    def test_field_order_exact(self):
+        # Field order is part of the exact dataclass contract - a plain
+        # set comparison alone would not catch a reordering.
+        actual_order = [f.name for f in dataclasses.fields(AtomicChannelImportResult)]
+        self.assertEqual(
+            actual_order,
+            ["channel", "batch_result", "lifecycle_result", "operation"],
+        )
+
+    def test_type_hints_exact(self):
+        hints = typing.get_type_hints(AtomicChannelImportResult)
+        self.assertEqual(hints["channel"], Channel)
+        self.assertEqual(hints["batch_result"], BatchIngestResult)
+        self.assertEqual(hints["lifecycle_result"], LifecycleRebuildResult)
+        self.assertEqual(hints["operation"], ChannelImportOperation)
+
+    def test_no_default_values(self):
+        for f in dataclasses.fields(AtomicChannelImportResult):
+            self.assertIs(f.default, dataclasses.MISSING)
+            self.assertIs(f.default_factory, dataclasses.MISSING)
 
 
 if __name__ == "__main__":

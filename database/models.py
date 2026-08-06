@@ -785,3 +785,39 @@ class ChannelImportChannelSummary:
     channel: "Channel"
     checkpoint: Optional["ChannelCheckpoint"]
     latest_operation: Optional[ChannelImportOperation]
+
+
+@dataclass(frozen=True)
+class AtomicChannelImportResult:
+    """Result of one successful
+    TradeService.import_channel_batch_with_lifecycle_rebuild() call
+    (Recovery Milestone R9b). Only ever returned after every write -
+    channel creation (create mode only), source creation (create mode
+    only, when the source did not already exist), ingestion, targeted
+    lifecycle rebuild, and the recorded operation row - committed
+    together in one transaction; a failed or rolled-back attempt never
+    produces this object at all (the call raises instead).
+
+    Attributes:
+        channel: The resolved Channel this batch was imported into - the
+            existing selected channel (existing mode) or the newly
+            created channel (create mode).
+        batch_result: The BatchIngestResult from this call's
+            _ingest_batch_no_commit() invocation - covers every segmented
+            message's stored/duplicate outcome, exactly as ingest_batch()
+            itself would report for the same inputs.
+        lifecycle_result: The LifecycleRebuildResult for this call's
+            targeted rebuild - a zero-valued result (equivalent to
+            _RebuildCounters().to_result()) when every segmented message
+            was a duplicate, since no lifecycle-affecting message was
+            newly stored.
+        operation: The newly recorded, successful ChannelImportOperation
+            row for this call - its mere existence is this operation's
+            own success signal, per ChannelImportOperation's own
+            contract.
+    """
+
+    channel: Channel
+    batch_result: BatchIngestResult
+    lifecycle_result: LifecycleRebuildResult
+    operation: ChannelImportOperation

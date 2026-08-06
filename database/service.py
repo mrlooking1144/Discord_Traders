@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from typing import Sequence
+from typing import Literal, Sequence
 
 from app.datetime_resolution import resolve_expiration, resolve_footer_timestamp
 from app.discord_adapter import SegmentedMessage, segment_discord_batch
@@ -47,7 +47,9 @@ from database.lifecycle import (
     build_lifecycle_sequence,
 )
 from database.models import (
+    AtomicChannelImportResult,
     BatchIngestResult,
+    Channel,
     ChannelCheckpoint,
     ChannelExternalIdAvailability,
     ChannelImportChannelSummary,
@@ -56,12 +58,15 @@ from database.models import (
     MessageIngestOutcome,
     ReprocessBatchResult,
     ReprocessOutcome,
+    Source,
     TradeSignal,
     TradeSignalCorrectionResult,
 )
 from database.repository import (
     clear_lifecycle_pointers_for_generation,
     compute_content_hash,
+    create_channel,
+    create_channel_import_operation,
     create_import_batch,
     create_lifecycle_unresolved_singleton,
     create_message_extraction,
@@ -765,6 +770,29 @@ def _current_correction_values(signal: TradeSignal) -> dict:
         "expiration": signal.expiration,
         "position_size": signal.position_size,
     }
+
+
+# ---------------------------------------------------------------------------
+# Recovery Milestone R9b: atomic Bulk Channel Import plus targeted
+# lifecycle rebuild. Kept separate from the R5/R6.4/R6.5a sections above;
+# the actual TradeService methods (_ingest_batch_no_commit(),
+# _collect_newly_stored_raw_message_ids(), and
+# import_channel_batch_with_lifecycle_rebuild()) are defined inside the
+# TradeService class below, immediately after ingest_batch().
+# ---------------------------------------------------------------------------
+
+
+class ChannelExternalIdCollisionError(ValueError):
+    """Raised by TradeService.import_channel_batch_with_lifecycle_rebuild()
+    in create mode when new_channel_external_id already belongs to an
+    existing channel for the resolved source - either discovered by the
+    up-front collision check, or discovered only after create_channel()
+    raised sqlite3.IntegrityError and a re-query confirmed a real,
+    existing colliding row (never for an IntegrityError that does not
+    correspond to a re-queryable collision - that case re-raises the
+    original IntegrityError unchanged). A ValueError subclass, matching
+    this module's existing convention for structured, catchable rejection
+    modes (TradeSignalNotFoundError, LifecycleUnsafeCorrectionError)."""
 
 
 class TradeService:
@@ -2244,92 +2272,440 @@ class TradeService:
                 if channel_external_id is not None
                 else get_or_create_unspecified_channel(self.conn, source.id)
             )
-
-            preflight = []
-            for message in segmented_messages:
-                resolved_id = _resolve_external_id(None, message.synthetic_id_input)
-                existing = get_raw_message_by_channel_and_external_id(
-                    self.conn, channel.id, resolved_id
-                )
-                preflight.append((message, resolved_id, existing))
-
-            if all(existing is not None for _, _, existing in preflight):
-                outcomes = [
-                    self._duplicate_outcome(
-                        message.sequence_in_batch, channel.id, existing,
-                        message.raw_text, resolved_id,
-                    )
-                    for message, resolved_id, existing in preflight
-                ]
-                return BatchIngestResult(
-                    import_batch_id=None,
-                    channel_id=channel.id,
-                    total_segmented=len(segmented_messages),
-                    stored_count=0,
-                    duplicate_count=len(segmented_messages),
-                    unrecognized_count=0,
-                    failed_count=0,
-                    messages=outcomes,
-                )
-
-            import_batch = create_import_batch(
-                self.conn, source.id, reference_date, timezone, raw_batch_text
+            return self._ingest_batch_no_commit(
+                source=source,
+                channel=channel,
+                raw_batch_text=raw_batch_text,
+                reference_date=reference_date,
+                timezone=timezone,
+                segmented_messages=segmented_messages,
             )
 
-            outcomes = []
-            for message, resolved_id, existing in preflight:
-                if existing is not None:
-                    outcomes.append(self._duplicate_outcome(
-                        message.sequence_in_batch, channel.id, existing,
-                        message.raw_text, resolved_id,
-                    ))
-                    continue
-                outcomes.append(self._ingest_channel_message_no_commit(
-                    source_id=source.id,
-                    channel_id=channel.id,
-                    source_name=source_name,
-                    trader_raw=message.trader_raw,
-                    external_trader_id=None,
-                    raw_text=message.raw_text,
-                    cleaned_text=message.cleaned_text,
-                    resolved_external_id=resolved_id,
-                    synthetic_id_input=message.synthetic_id_input,
-                    native_received_at=None,
-                    footer_timestamp_raw=message.footer_timestamp_raw,
-                    footer_timestamp_kind=message.footer_timestamp_kind,
-                    reference_date=reference_date,
-                    timezone=timezone,
-                    import_batch_id=import_batch.id,
-                    sequence_in_batch=message.sequence_in_batch,
-                    header_timestamp_raw=message.header_timestamp_raw,
-                    channel_tags=message.channel_tags,
-                    adapter_ambiguity_flags=message.ambiguity_flags,
-                    metadata_extra=None,
-                ))
+    def _ingest_batch_no_commit(
+        self,
+        *,
+        source: Source,
+        channel: Channel,
+        raw_batch_text: str,
+        reference_date: str,
+        timezone: str,
+        segmented_messages: Sequence[SegmentedMessage],
+    ) -> BatchIngestResult:
+        """Private. Ingest an already-segmented batch against an
+        already-resolved source/channel (Recovery Milestone R9b).
 
-            stored_count = sum(1 for outcome in outcomes if outcome.outcome == "stored")
-            if stored_count == 0:
-                # Every intended-new message was reclassified as a
-                # duplicate via the narrow unique-constraint race
-                # carve-out above - remove the now-orphaned, empty
-                # import_batches row so the result matches the "fully
-                # duplicate batch" contract exactly.
-                delete_import_batch_if_empty(self.conn, import_batch.id)
-                final_import_batch_id = None
-            else:
-                final_import_batch_id = import_batch.id
+        This is ingest_batch()'s own former transaction body, extracted
+        verbatim so both ingest_batch() and
+        import_channel_batch_with_lifecycle_rebuild() share exactly one
+        implementation of batch ingestion - never two independently
+        maintained copies of the preflight/duplicate/insert loop below.
 
+        Never begins, commits, or rolls back a transaction, and never
+        modifies isolation_level - the caller (ingest_batch(), or
+        import_channel_batch_with_lifecycle_rebuild()) fully owns that.
+        Never calls segment_discord_batch(), get_or_create_source(),
+        get_or_create_channel(), get_or_create_unspecified_channel(), or
+        any rebuild_* method - segmented_messages is used exactly as
+        supplied, and source/channel are used exactly as resolved by the
+        caller.
+
+        Args:
+            source: The already-resolved Source this batch belongs to.
+            channel: The already-resolved Channel this batch is scoped
+                to.
+            raw_batch_text: The complete pasted channel-history block,
+                stored verbatim on a newly created import_batches row
+                when at least one message is newly stored.
+            reference_date: Strict "YYYY-MM-DD" date anchoring every
+                message segmented from this batch.
+            timezone: A valid IANA timezone name, shared by every message
+                in this batch.
+            segmented_messages: The exact, already-segmented sequence to
+                ingest - never re-segmented here.
+
+        Returns:
+            A BatchIngestResult summarizing every segmented message's
+            outcome - identical in shape and contract to ingest_batch()'s
+            own return value.
+        """
+        preflight = []
+        for message in segmented_messages:
+            resolved_id = _resolve_external_id(None, message.synthetic_id_input)
+            existing = get_raw_message_by_channel_and_external_id(
+                self.conn, channel.id, resolved_id
+            )
+            preflight.append((message, resolved_id, existing))
+
+        if all(existing is not None for _, _, existing in preflight):
+            outcomes = [
+                self._duplicate_outcome(
+                    message.sequence_in_batch, channel.id, existing,
+                    message.raw_text, resolved_id,
+                )
+                for message, resolved_id, existing in preflight
+            ]
             return BatchIngestResult(
-                import_batch_id=final_import_batch_id,
+                import_batch_id=None,
                 channel_id=channel.id,
                 total_segmented=len(segmented_messages),
-                stored_count=stored_count,
-                duplicate_count=sum(1 for o in outcomes if o.outcome == "duplicate"),
-                unrecognized_count=sum(
-                    1 for o in outcomes if o.parse_status == "unrecognized"
-                ),
-                failed_count=sum(1 for o in outcomes if o.parse_status == "failed"),
+                stored_count=0,
+                duplicate_count=len(segmented_messages),
+                unrecognized_count=0,
+                failed_count=0,
                 messages=outcomes,
+            )
+
+        import_batch = create_import_batch(
+            self.conn, source.id, reference_date, timezone, raw_batch_text
+        )
+
+        outcomes = []
+        for message, resolved_id, existing in preflight:
+            if existing is not None:
+                outcomes.append(self._duplicate_outcome(
+                    message.sequence_in_batch, channel.id, existing,
+                    message.raw_text, resolved_id,
+                ))
+                continue
+            outcomes.append(self._ingest_channel_message_no_commit(
+                source_id=source.id,
+                channel_id=channel.id,
+                source_name=source.name,
+                trader_raw=message.trader_raw,
+                external_trader_id=None,
+                raw_text=message.raw_text,
+                cleaned_text=message.cleaned_text,
+                resolved_external_id=resolved_id,
+                synthetic_id_input=message.synthetic_id_input,
+                native_received_at=None,
+                footer_timestamp_raw=message.footer_timestamp_raw,
+                footer_timestamp_kind=message.footer_timestamp_kind,
+                reference_date=reference_date,
+                timezone=timezone,
+                import_batch_id=import_batch.id,
+                sequence_in_batch=message.sequence_in_batch,
+                header_timestamp_raw=message.header_timestamp_raw,
+                channel_tags=message.channel_tags,
+                adapter_ambiguity_flags=message.ambiguity_flags,
+                metadata_extra=None,
+            ))
+
+        stored_count = sum(1 for outcome in outcomes if outcome.outcome == "stored")
+        if stored_count == 0:
+            # Every intended-new message was reclassified as a
+            # duplicate via the narrow unique-constraint race
+            # carve-out above - remove the now-orphaned, empty
+            # import_batches row so the result matches the "fully
+            # duplicate batch" contract exactly.
+            delete_import_batch_if_empty(self.conn, import_batch.id)
+            final_import_batch_id = None
+        else:
+            final_import_batch_id = import_batch.id
+
+        return BatchIngestResult(
+            import_batch_id=final_import_batch_id,
+            channel_id=channel.id,
+            total_segmented=len(segmented_messages),
+            stored_count=stored_count,
+            duplicate_count=sum(1 for o in outcomes if o.outcome == "duplicate"),
+            unrecognized_count=sum(
+                1 for o in outcomes if o.parse_status == "unrecognized"
+            ),
+            failed_count=sum(1 for o in outcomes if o.parse_status == "failed"),
+            messages=outcomes,
+        )
+
+    def _collect_newly_stored_raw_message_ids(
+        self, batch_result: BatchIngestResult
+    ) -> list[int]:
+        """Collect every newly-stored raw_message_id from one
+        BatchIngestResult's messages (Recovery Milestone R9b), guarding
+        two internal invariants that should be structurally impossible
+        given MessageIngestOutcome's own contract (raw_message_id is
+        always populated per its docstring) but are checked explicitly
+        anyway, since silently rebuilding lifecycles against a None id,
+        or a miscounted subset, would be a much worse failure mode than a
+        loud, immediately-rolled-back RuntimeError.
+
+        Args:
+            batch_result: The BatchIngestResult from this call's own
+                _ingest_batch_no_commit() invocation.
+
+        Returns:
+            Every outcome.raw_message_id where outcome.outcome ==
+            "stored", in batch_result.messages order.
+
+        Raises:
+            RuntimeError: If a "stored" outcome has raw_message_id ==
+                None, or if the collected count does not equal
+                batch_result.stored_count.
+        """
+        newly_stored_ids: list[int] = []
+        for outcome in batch_result.messages:
+            if outcome.outcome != "stored":
+                continue
+            if outcome.raw_message_id is None:
+                raise RuntimeError(
+                    "Stored batch outcome is missing raw_message_id."
+                )
+            newly_stored_ids.append(outcome.raw_message_id)
+
+        if len(newly_stored_ids) != batch_result.stored_count:
+            raise RuntimeError(
+                "newly_stored_ids count does not match "
+                "batch_result.stored_count."
+            )
+        return newly_stored_ids
+
+    def import_channel_batch_with_lifecycle_rebuild(
+        self,
+        *,
+        source_name: str,
+        channel_mode: Literal["existing", "create"],
+        existing_channel_id: int | None = None,
+        new_channel_external_id: str | None = None,
+        new_channel_name: str | None = None,
+        reference_date: str,
+        timezone: str,
+        raw_batch_text: str,
+        segmented_messages: Sequence[SegmentedMessage],
+    ) -> AtomicChannelImportResult:
+        """Atomically import a previewed Bulk Channel Import batch and
+        rebuild only the lifecycles it affects (Recovery Milestone R9b).
+
+        Accepts a previously previewed batch of at least 15 exact
+        SegmentedMessage objects, resolves an existing channel or creates
+        a new one according to channel_mode, ingests the batch (reusing
+        _ingest_batch_no_commit(), never re-segmenting), rebuilds only
+        the lifecycles affected by the newly stored messages, and records
+        one successful channel_import_operations row - all inside one
+        _r5_write_transaction(). Channel creation (create mode), source
+        creation (create mode, when the source did not already exist),
+        every ingested row, every lifecycle change, and the operation
+        row all commit together or roll back together; a failed or
+        rolled-back attempt is never recorded as an operation row.
+
+        channel_mode == "existing": existing_channel_id is required (a
+        positive, non-boolean int); new_channel_external_id and
+        new_channel_name must both be None. The source is looked up via
+        get_source_by_name() only - never created - and the selected
+        channel must already exist, belong to the resolved source, and
+        must not be the reserved UNSPECIFIED_CHANNEL_EXTERNAL_ID
+        sentinel channel.
+
+        channel_mode == "create": existing_channel_id must be None;
+        new_channel_external_id is required, non-blank, and must not be
+        the reserved sentinel; new_channel_name is optional. The source
+        is resolved via get_or_create_source() - a new sources row may be
+        created as part of this same transaction. The channel is created
+        via create_channel() directly (never get_or_create_channel())
+        after an up-front collision check; a confirmed unique-constraint
+        race on create_channel() itself is translated to
+        ChannelExternalIdCollisionError only after a re-query confirms a
+        real, existing colliding row - an unconfirmed IntegrityError
+        propagates unchanged.
+
+        A duplicate-only batch (every segmented message already present)
+        creates no import_batches row, performs no lifecycle rebuild
+        (lifecycle_result is the zero-valued
+        _RebuildCounters().to_result()), and still records a successful
+        operation row with stored_count=0 and import_batch_id=None -
+        which becomes the channel's latest successful operation.
+
+        Args:
+            source_name: Source type name (e.g. 'discord').
+            channel_mode: Exactly "existing" or "create".
+            existing_channel_id: Required (and only allowed) when
+                channel_mode == "existing" - the channels.id to import
+                into.
+            new_channel_external_id: Required (and only allowed) when
+                channel_mode == "create" - the new channel's stable
+                external id.
+            new_channel_name: Optional, only allowed when channel_mode ==
+                "create" - the new channel's display name/slug.
+            reference_date: Strict "YYYY-MM-DD" date anchoring every
+                message segmented from this batch.
+            timezone: A valid IANA timezone name, shared by every message
+                in this batch.
+            raw_batch_text: The complete pasted channel-history block,
+                exactly as supplied - stored verbatim on a newly created
+                import_batches row when at least one message is newly
+                stored.
+            segmented_messages: The exact, already-segmented sequence to
+                ingest (e.g. from a prior app.discord_adapter.
+                segment_discord_batch() call) - never re-segmented here.
+                Must contain at least 15 messages.
+
+        Returns:
+            An AtomicChannelImportResult with the resolved channel, the
+            batch ingestion result, the targeted lifecycle rebuild
+            result, and the recorded channel import operation.
+
+        Raises:
+            ValueError: If channel_mode is not exactly "existing" or
+                "create"; if segmented_messages has fewer than 15
+                elements; if any _validate_batch_inputs() check fails; if
+                a mode-specific argument is missing, contradictory, or
+                malformed (see the method's own argument-validation
+                table); if existing_channel_id does not exist, does not
+                belong to the resolved source, or refers to the reserved
+                sentinel channel (existing mode); or if
+                new_channel_external_id is blank or refers to the
+                reserved sentinel (create mode). Zero writes occur for
+                any of these.
+            ChannelExternalIdCollisionError: Create mode only - if
+                new_channel_external_id already belongs to an existing
+                channel for the resolved source, whether detected
+                up-front or only after a confirmed create_channel() race.
+                A ValueError subclass.
+            RuntimeError: If self.conn already has unrelated pending
+                work, or if the internal newly-stored-raw-message-id
+                invariant is violated (see
+                _collect_newly_stored_raw_message_ids()).
+            LifecycleIntegrityError: If validate_lifecycle_membership_integrity()
+                reports any violation after the targeted rebuild's
+                writes. Rolled back before propagating.
+            LifecycleSnapshotError: If any existing generation's
+                persisted signal_snapshot cannot be safely decoded/
+                validated during the targeted rebuild. Rolled back before
+                propagating.
+            sqlite3.Error: On an unexpected database failure (the whole
+                transaction is rolled back before this propagates).
+        """
+        if channel_mode not in ("existing", "create"):
+            raise ValueError("channel_mode must be exactly 'existing' or 'create'.")
+        if len(segmented_messages) < 15:
+            raise ValueError(
+                "At least 15 segmented messages are required for a Bulk "
+                f"Channel Import batch; got {len(segmented_messages)}."
+            )
+        _validate_batch_inputs(source_name, reference_date, timezone, raw_batch_text)
+
+        if channel_mode == "existing":
+            if existing_channel_id is None:
+                raise ValueError(
+                    "existing_channel_id is required when channel_mode is "
+                    "'existing'."
+                )
+            if (
+                not isinstance(existing_channel_id, int)
+                or isinstance(existing_channel_id, bool)
+                or existing_channel_id <= 0
+            ):
+                raise ValueError("existing_channel_id must be a positive integer.")
+            if new_channel_external_id is not None:
+                raise ValueError(
+                    "new_channel_external_id must not be supplied when "
+                    "channel_mode is 'existing'."
+                )
+            if new_channel_name is not None:
+                raise ValueError(
+                    "new_channel_name must not be supplied when channel_mode "
+                    "is 'existing'."
+                )
+        else:
+            if existing_channel_id is not None:
+                raise ValueError(
+                    "existing_channel_id must not be supplied when "
+                    "channel_mode is 'create'."
+                )
+            if new_channel_external_id is None or not new_channel_external_id.strip():
+                raise ValueError(
+                    "new_channel_external_id must not be empty or "
+                    "whitespace-only when channel_mode is 'create'."
+                )
+            if new_channel_external_id.strip() == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+                raise ValueError(
+                    "new_channel_external_id must not be the reserved "
+                    "unspecified-channel sentinel value."
+                )
+
+        with self._r5_write_transaction():
+            if channel_mode == "existing":
+                source = get_source_by_name(self.conn, source_name)
+                if source is None:
+                    raise ValueError(f"Source {source_name!r} does not exist.")
+
+                channel = get_channel_by_id(self.conn, existing_channel_id)
+                if channel is None:
+                    raise ValueError(
+                        f"existing_channel_id {existing_channel_id} does not exist."
+                    )
+                if channel.source_id != source.id:
+                    raise ValueError(
+                        f"channel {existing_channel_id} does not belong to "
+                        f"source {source_name!r}."
+                    )
+                if channel.external_channel_id == UNSPECIFIED_CHANNEL_EXTERNAL_ID:
+                    raise ValueError(
+                        "existing_channel_id must not refer to the reserved "
+                        "unspecified channel."
+                    )
+            else:
+                source = get_or_create_source(self.conn, source_name)
+                normalized_id = new_channel_external_id.strip()
+
+                existing = get_channel_by_external_id(
+                    self.conn, source.id, normalized_id
+                )
+                if existing is not None:
+                    raise ChannelExternalIdCollisionError(
+                        f"external channel id {normalized_id!r} already "
+                        f"exists for source {source_name!r}."
+                    )
+                try:
+                    channel = create_channel(
+                        self.conn, source.id, external_channel_id=normalized_id,
+                        name=new_channel_name,
+                    )
+                except sqlite3.IntegrityError:
+                    raced_existing = get_channel_by_external_id(
+                        self.conn, source.id, normalized_id
+                    )
+                    if raced_existing is not None:
+                        raise ChannelExternalIdCollisionError(
+                            f"external channel id {normalized_id!r} already "
+                            f"exists for source {source_name!r} (confirmed "
+                            "race)."
+                        ) from None
+                    raise
+
+            batch_result = self._ingest_batch_no_commit(
+                source=source,
+                channel=channel,
+                raw_batch_text=raw_batch_text,
+                reference_date=reference_date,
+                timezone=timezone,
+                segmented_messages=segmented_messages,
+            )
+
+            newly_stored_ids = self._collect_newly_stored_raw_message_ids(batch_result)
+
+            if newly_stored_ids:
+                lifecycle_result = self._rebuild_lifecycles_for_raw_message_ids_no_commit(
+                    newly_stored_ids
+                )
+            else:
+                lifecycle_result = _RebuildCounters().to_result()
+
+            operation = create_channel_import_operation(
+                self.conn,
+                channel_id=channel.id,
+                import_batch_id=batch_result.import_batch_id,
+                reference_date=reference_date,
+                timezone=timezone,
+                processed_count=batch_result.total_segmented,
+                stored_count=batch_result.stored_count,
+                duplicate_count=batch_result.duplicate_count,
+                unrecognized_count=batch_result.unrecognized_count,
+                failed_count=batch_result.failed_count,
+            )
+
+            return AtomicChannelImportResult(
+                channel=channel,
+                batch_result=batch_result,
+                lifecycle_result=lifecycle_result,
+                operation=operation,
             )
 
     def reprocess_raw_message(self, raw_message_id: int) -> ReprocessOutcome:

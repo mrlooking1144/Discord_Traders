@@ -76,6 +76,18 @@ from pathlib import Path
 
 import streamlit as st
 
+from app.bulk_import_formatting import (
+    build_content_difference_warnings,
+    build_create_mode_prediction_notice,
+    build_last_operation_counts,
+    build_lifecycle_rebuild_summary,
+    build_preview_rows,
+    build_resume_guidance_message,
+    build_resume_panel,
+    count_new_vs_duplicate,
+    format_availability_message,
+    format_channel_option_label,
+)
 from app.dashboard_formatting import (
     LIFECYCLE_CSV_FIELDNAMES,
     SORT_DIRECTION_CHOICES,
@@ -91,6 +103,7 @@ from app.dashboard_formatting import (
     rank_trader_summaries,
     rows_to_csv_string,
 )
+from app.discord_adapter import segment_discord_batch
 from app.logging_config import (
     configure_console_logging,
     configure_file_logging,
@@ -102,6 +115,7 @@ from database.config import DatabaseConfig, resolve_database_path
 from database.db import get_connection, initialize_database
 from database.service import (
     AuditHistoryError,
+    ChannelExternalIdCollisionError,
     LifecycleIntegrityError,
     LifecycleSnapshotError,
     LifecycleUnsafeCorrectionError,
@@ -141,6 +155,119 @@ _DASHBOARD_OUTCOME_CHOICES = ["win", "loss", "breakeven", "not_scored", "data_er
 _DASHBOARD_DEFAULT_MIN_ELIGIBLE_LIFECYCLES = 3
 _DASHBOARD_CSV_EXPORT_FAILURE_MESSAGE = "Could not generate the CSV export."
 _DASHBOARD_SUMMARY_CSV_FILENAME = "trader_performance_summary.csv"
+
+# Recovery Milestone R9c: Bulk Channel Import. Fixed source name - never
+# user-editable, exactly like Manual Message Entry's own _SOURCE_NAME.
+_BULK_IMPORT_SOURCE_NAME = "discord"
+_BULK_IMPORT_MIN_MESSAGES = 15
+_BULK_IMPORT_TOO_FEW_MESSAGES_MESSAGE = (
+    "This batch has fewer than 15 messages ({count} found). Bulk Channel "
+    "Import requires at least 15. Use Manual Message Entry for smaller "
+    "batches."
+)
+_BULK_IMPORT_PREVIEW_VALIDATION_MESSAGE = (
+    "Please paste at least one message and select or specify a channel "
+    "before previewing this batch."
+)
+_BULK_IMPORT_CONFIRM_VALIDATION_MESSAGE = (
+    "Please check the confirmation box before importing."
+)
+_BULK_IMPORT_COLLISION_MESSAGE = (
+    "That external channel ID is already in use for this source."
+)
+_BULK_IMPORT_VALIDATION_MESSAGE = "Please correct the batch details and try again."
+_BULK_IMPORT_FAILURE_MESSAGE = "Could not complete the bulk channel import."
+_BULK_IMPORT_SUCCESS_MESSAGE = "Bulk channel import completed successfully."
+_BULK_IMPORT_DATABASE_ACCESS_FAILURE_MESSAGE = (
+    "Could not access the database for Bulk Channel Import."
+)
+_BULK_IMPORT_CHANNEL_LIST_FAILURE_MESSAGE = "Could not load channels for this source."
+_BULK_IMPORT_AVAILABILITY_LOAD_FAILURE_MESSAGE = (
+    "Could not check external channel ID availability."
+)
+_BULK_IMPORT_EXTERNAL_ID_VALIDATION_MESSAGE = (
+    "This external channel ID is not valid for Bulk Channel Import."
+)
+_BULK_IMPORT_PREDICTION_LOAD_FAILURE_MESSAGE = (
+    "Could not load duplicate predictions for this batch."
+)
+_BULK_IMPORT_SEGMENTATION_FAILURE_MESSAGE = "Could not segment this Discord batch."
+_BULK_IMPORT_REFRESH_FAILURE_MESSAGE = (
+    "The import succeeded, but refreshed checkpoint details could not be loaded."
+)
+_BULK_IMPORT_NO_CHANNELS_MESSAGE = (
+    "No channels exist for this source yet. Create a new channel below, "
+    "or use Manual Message Entry."
+)
+_BULK_IMPORT_NEW_CHANNEL_NOTICE = (
+    "This will create a new channel. No prior import history exists yet."
+)
+
+_BULK_IMPORT_STATE_KEYS = (
+    "bulk_import_preview",
+    "bulk_import_result",
+    "bulk_import_raw_text_input",
+    "bulk_import_channel_mode",
+    "bulk_import_existing_channel_select",
+    "bulk_import_new_channel_external_id",
+    "bulk_import_new_channel_name",
+    "bulk_import_reference_date",
+    "bulk_import_timezone",
+    "bulk_import_confirm_checkbox",
+)
+
+
+def _reset_bulk_import_state() -> None:
+    """Clear every R9c-owned session_state key, including every editable
+    widget's own key - safe because the editable widgets are never
+    rendered while bulk_import_result is set (the completed view's hard
+    gate), so there is no live widget instance to conflict with a
+    mid-render key removal. Called only by "Start Next Batch"."""
+    for key in _BULK_IMPORT_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _bulk_import_input_snapshot(
+    *,
+    raw_text: str,
+    channel_mode: str,
+    existing_channel_id: int | None,
+    new_channel_external_id: str,
+    new_channel_name: str,
+    reference_date,
+    timezone_name: str,
+) -> dict:
+    """Build one normalized, comparable snapshot of every Preview-Batch-
+    relevant input - used identically to freeze the preview, to detect
+    staleness on every later rerun, and to build the exact confirm-call
+    keyword arguments, so the three can never independently drift out of
+    sync with one another.
+
+    raw_text is used exactly as typed - never stripped, since a leading/
+    trailing blank line could legitimately change segmentation.
+    reference_date is normalized via .isoformat() - never compared as a
+    live date object. new_channel_external_id/timezone_name are
+    stripped. new_channel_name is stripped, then normalized to None when
+    blank (matching this codebase's own existing convention for every
+    other optional text input, e.g. Correct Signal's
+    position_size normalization). Mode-irrelevant fields are forced to
+    None so a value left over in the "other" mode's own fields can never
+    contribute to a staleness comparison or leak into the confirm call.
+    """
+    is_existing = channel_mode == "existing"
+    return {
+        "raw_text": raw_text,
+        "channel_mode": channel_mode,
+        "existing_channel_id": existing_channel_id if is_existing else None,
+        "new_channel_external_id": (
+            None if is_existing else new_channel_external_id.strip()
+        ),
+        "new_channel_name": (
+            None if is_existing else (new_channel_name.strip() or None)
+        ),
+        "reference_date": reference_date.isoformat(),
+        "timezone": timezone_name.strip(),
+    }
 
 
 def _correction_selectbox_choices(base_choices: list[str], current_value: str) -> list[str]:
@@ -184,7 +311,11 @@ configure_console_logging()
 logger.info("Discord Traders UI started")
 
 workflow = st.sidebar.radio(
-    "Workflow", ["Manual Message Entry", "Review Signals", "Trader Performance"]
+    "Workflow",
+    [
+        "Manual Message Entry", "Review Signals", "Trader Performance",
+        "Bulk Channel Import",
+    ],
 )
 
 if workflow == "Manual Message Entry":
@@ -791,3 +922,444 @@ elif workflow == "Trader Performance":
         finally:
             if conn is not None:
                 conn.close()
+
+elif workflow == "Bulk Channel Import":
+    st.title("Discord Traders - Bulk Channel Import")
+
+    if st.session_state.get("bulk_import_result") is not None:
+        # ----------------------------------------------------------------
+        # COMPLETED VIEW - a hard gate: the editable form and Preview
+        # Batch are never rendered here. The exact frozen paste and
+        # preview from bulk_import_preview are shown verbatim - never
+        # re-segmented, never re-predicted. Only "Start Next Batch"
+        # resets this state.
+        # ----------------------------------------------------------------
+        result = st.session_state["bulk_import_result"]
+        preview = st.session_state.get("bulk_import_preview") or {}
+
+        st.success(_BULK_IMPORT_SUCCESS_MESSAGE)
+
+        st.subheader("Pasted Text (This Batch)")
+        st.text_area(
+            "Pasted text (this batch)",
+            value=preview.get("raw_text", ""),
+            height=200,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+
+        st.subheader("Preview (As Imported)")
+        preview_rows = build_preview_rows(
+            preview.get("segmented", []), preview.get("predictions", [])
+        )
+        st.dataframe(preview_rows)
+
+        st.subheader("Last operation counts")
+        st.write(build_last_operation_counts(result.operation))
+
+        st.subheader("Lifecycle Rebuild Result")
+        st.write(build_lifecycle_rebuild_summary(result.lifecycle_result))
+
+        st.subheader("Updated Channel Checkpoint")
+        conn: sqlite3.Connection | None = None
+        try:
+            config = DatabaseConfig(db_path=resolve_database_path())
+            conn = get_connection(config)
+            service = TradeService(conn)
+            updated_summary = service.get_bulk_import_channel_summary(
+                source_name=_BULK_IMPORT_SOURCE_NAME, channel_id=result.channel.id,
+            )
+        except Exception as exc:
+            log_operation_failure(logger, "bulk import updated summary readback", exc)
+            st.warning(_BULK_IMPORT_REFRESH_FAILURE_MESSAGE)
+        else:
+            if updated_summary is not None:
+                # Post-success: the checkpoint conversion source is this
+                # new operation's own recorded timezone - never the
+                # pre-import form/preview timezone, and never any older
+                # latest_operation.timezone that might predate it.
+                panel = build_resume_panel(
+                    updated_summary, display_timezone=result.operation.timezone,
+                )
+                st.write(panel)
+            else:
+                # A None summary after a successful, committed import
+                # means the refreshed checkpoint could not be resolved -
+                # the same fixed warning as an outright readback
+                # exception; the successful result above remains fully
+                # visible either way.
+                st.warning(_BULK_IMPORT_REFRESH_FAILURE_MESSAGE)
+        finally:
+            if conn is not None:
+                conn.close()
+
+        if st.button("Start Next Batch", key="bulk_import_start_next_batch_button"):
+            _reset_bulk_import_state()
+            st.rerun()
+
+    else:
+        # ----------------------------------------------------------------
+        # EDITING / PREVIEWED - the editable form. Every widget below uses
+        # a stable, fixed key.
+        # ----------------------------------------------------------------
+        st.subheader("Paste Batch")
+        raw_text = st.text_area(
+            "Paste Discord channel history (at least 15 messages)",
+            height=250, key="bulk_import_raw_text_input",
+        )
+
+        st.subheader("Channel")
+        channel_mode_choice = st.radio(
+            "Channel", ["Use an existing channel", "Create a new channel"],
+            key="bulk_import_channel_mode",
+        )
+        channel_mode = (
+            "existing" if channel_mode_choice == "Use an existing channel" else "create"
+        )
+
+        st.subheader("Batch Details")
+        reference_date_value = st.date_input(
+            "Reference date", key="bulk_import_reference_date"
+        )
+        timezone_input = st.text_input(
+            "Timezone (IANA name, e.g. America/New_York)", key="bulk_import_timezone"
+        )
+
+        existing_channel_id: int | None = None
+        new_channel_external_id_input = ""
+        new_channel_name_input = ""
+        new_channel_external_id_valid = True
+
+        conn = None
+        service = None
+        try:
+            config = DatabaseConfig(db_path=resolve_database_path())
+            initialize_database(config)
+            conn = get_connection(config)
+            service = TradeService(conn)
+        except Exception as exc:
+            log_operation_failure(logger, "bulk channel import database access", exc)
+            st.error(_BULK_IMPORT_DATABASE_ACCESS_FAILURE_MESSAGE)
+
+        # Every editing/advisory/Preview Batch operation that uses conn
+        # is inside this try/finally, so conn is always closed even if
+        # channel-list loading, channel-label formatting, segmentation,
+        # or duplicate prediction raises unexpectedly - never left open
+        # on an uncaught error. The connection is deliberately not held
+        # open across the later, pure preview rendering or the Confirm
+        # transaction (which opens its own connection).
+        try:
+            if service is not None:
+                if channel_mode == "existing":
+                    # Correction 1: channel existence is unknown when
+                    # loading fails - a separate loaded flag keeps the
+                    # (factually correct) "no channels exist yet"
+                    # message from ever appearing after a failed load,
+                    # and keeps the selectbox itself from rendering at
+                    # all when loading failed.
+                    channel_list_loaded = False
+                    channel_summaries = []
+                    try:
+                        channel_summaries = service.list_bulk_import_channels(
+                            source_name=_BULK_IMPORT_SOURCE_NAME
+                        )
+                    except Exception as exc:
+                        log_operation_failure(logger, "bulk import channel list", exc)
+                        st.error(_BULK_IMPORT_CHANNEL_LIST_FAILURE_MESSAGE)
+                    else:
+                        channel_list_loaded = True
+
+                    summaries_by_id = {s.channel.id: s for s in channel_summaries}
+                    options = list(summaries_by_id)
+
+                    if channel_list_loaded and not options:
+                        st.info(_BULK_IMPORT_NO_CHANNELS_MESSAGE)
+
+                    if channel_list_loaded:
+                        # Stale-selection guard: a previously selected
+                        # channel that no longer appears is cleared
+                        # before the selectbox renders - the same
+                        # pattern already used for
+                        # dashboard_trader_select/correction_signal_id
+                        # elsewhere in this file.
+                        if (
+                            "bulk_import_existing_channel_select" in st.session_state
+                            and st.session_state["bulk_import_existing_channel_select"]
+                            not in options
+                        ):
+                            st.session_state.pop(
+                                "bulk_import_existing_channel_select", None
+                            )
+
+                        existing_channel_id = st.selectbox(
+                            "Select a channel", options, index=None,
+                            placeholder="Select a channel...",
+                            format_func=lambda cid: format_channel_option_label(
+                                summaries_by_id[cid].channel
+                            ),
+                            key="bulk_import_existing_channel_select",
+                        )
+
+                        if existing_channel_id is not None:
+                            selected_summary = summaries_by_id[existing_channel_id]
+                            # Pre-confirm resume-panel display source: the
+                            # current LIVE normalized batch timezone from
+                            # the form - never latest_operation.timezone.
+                            live_timezone = (
+                                st.session_state.get("bulk_import_timezone") or ""
+                            ).strip()
+                            panel = build_resume_panel(
+                                selected_summary, display_timezone=live_timezone or None,
+                            )
+                            st.write(panel)
+                            if selected_summary.checkpoint is not None:
+                                st.info(build_resume_guidance_message())
+                else:
+                    new_channel_external_id_input = st.text_input(
+                        "New channel external ID (stable, required)",
+                        key="bulk_import_new_channel_external_id",
+                    )
+                    new_channel_name_input = st.text_input(
+                        "New channel display name (optional)",
+                        key="bulk_import_new_channel_name",
+                    )
+                    st.info(_BULK_IMPORT_NEW_CHANNEL_NOTICE)
+
+                    if new_channel_external_id_input.strip():
+                        try:
+                            availability = service.check_new_channel_external_id_availability(
+                                source_name=_BULK_IMPORT_SOURCE_NAME,
+                                external_channel_id=new_channel_external_id_input.strip(),
+                            )
+                        except ValueError as exc:
+                            # Correction 5: an invalid candidate (blank,
+                            # or the reserved __unspecified__ sentinel)
+                            # is never silently swallowed - the existing
+                            # R9a method's own ValueError is the
+                            # validation result; no parallel sentinel
+                            # string comparison is implemented here.
+                            log_operation_failure(
+                                logger, "bulk import external id validation", exc
+                            )
+                            st.error(_BULK_IMPORT_EXTERNAL_ID_VALIDATION_MESSAGE)
+                            new_channel_external_id_valid = False
+                        except Exception as exc:
+                            log_operation_failure(
+                                logger, "bulk import availability check", exc
+                            )
+                            st.error(_BULK_IMPORT_AVAILABILITY_LOAD_FAILURE_MESSAGE)
+                        else:
+                            message = format_availability_message(availability)
+                            if availability.is_available:
+                                st.success(message)
+                            else:
+                                # A strong warning - never blocks Preview
+                                # Batch or Confirm; the authoritative
+                                # collision rejection remains entirely
+                                # R9b's own job at Confirm time.
+                                st.error(message)
+
+            preview_clicked = st.button(
+                "Preview Batch", key="bulk_import_preview_button",
+                disabled=(service is None),
+            )
+
+            if preview_clicked and service is not None:
+                # A stale approval can never survive any new Preview
+                # Batch attempt, success or failure.
+                st.session_state.pop("bulk_import_confirm_checkbox", None)
+
+                channel_ready = (
+                    (channel_mode == "existing" and existing_channel_id is not None)
+                    or (
+                        channel_mode == "create"
+                        and new_channel_external_id_input.strip()
+                        and new_channel_external_id_valid
+                    )
+                )
+                if not raw_text.strip() or not channel_ready:
+                    st.error(_BULK_IMPORT_PREVIEW_VALIDATION_MESSAGE)
+                else:
+                    # Correction 3: segmentation is never called without
+                    # an exception boundary - a failure here shows only
+                    # the fixed, sanitized message, never creates or
+                    # replaces bulk_import_preview (leaving any still-
+                    # valid prior preview exactly as it was), and never
+                    # reaches duplicate prediction or import.
+                    segmented = None
+                    try:
+                        segmented = segment_discord_batch(raw_text)
+                    except Exception as exc:
+                        log_operation_failure(
+                            logger, "bulk import batch segmentation", exc
+                        )
+                        st.error(_BULK_IMPORT_SEGMENTATION_FAILURE_MESSAGE)
+
+                    if segmented is not None:
+                        if len(segmented) < _BULK_IMPORT_MIN_MESSAGES:
+                            st.error(
+                                _BULK_IMPORT_TOO_FEW_MESSAGES_MESSAGE.format(
+                                    count=len(segmented)
+                                )
+                            )
+                        else:
+                            predictions = None
+                            if channel_mode == "existing":
+                                try:
+                                    predictions = service.predict_channel_import_duplicate_statuses(
+                                        channel_id=existing_channel_id,
+                                        segmented_messages=segmented,
+                                    )
+                                except Exception as exc:
+                                    log_operation_failure(
+                                        logger, "bulk import duplicate prediction", exc
+                                    )
+                                    st.error(_BULK_IMPORT_PREDICTION_LOAD_FAILURE_MESSAGE)
+                            else:
+                                # Create mode: no channel_id exists yet to
+                                # check against - never fabricated
+                                # prediction objects.
+                                predictions = []
+
+                            if predictions is not None:
+                                snapshot = _bulk_import_input_snapshot(
+                                    raw_text=raw_text, channel_mode=channel_mode,
+                                    existing_channel_id=existing_channel_id,
+                                    new_channel_external_id=new_channel_external_id_input,
+                                    new_channel_name=new_channel_name_input,
+                                    reference_date=reference_date_value,
+                                    timezone_name=timezone_input,
+                                )
+                                st.session_state["bulk_import_preview"] = {
+                                    **snapshot,
+                                    "segmented": segmented,
+                                    "predictions": predictions,
+                                }
+        finally:
+            if conn is not None:
+                conn.close()
+
+        # ----------------------------------------------------------------
+        # PREVIEW SECTION - rendered only when a preview exists and is not
+        # stale relative to the current live form inputs.
+        # ----------------------------------------------------------------
+        preview = st.session_state.get("bulk_import_preview")
+        if preview is not None:
+            live_snapshot = _bulk_import_input_snapshot(
+                raw_text=raw_text, channel_mode=channel_mode,
+                existing_channel_id=existing_channel_id,
+                new_channel_external_id=new_channel_external_id_input,
+                new_channel_name=new_channel_name_input,
+                reference_date=reference_date_value, timezone_name=timezone_input,
+            )
+            frozen_snapshot = {key: preview[key] for key in live_snapshot}
+
+            if live_snapshot != frozen_snapshot:
+                # Staleness (including a channel-mode switch, since
+                # channel_mode is itself one of the snapshot fields) -
+                # drop the preview and any lingering approval.
+                st.session_state.pop("bulk_import_preview", None)
+                st.session_state.pop("bulk_import_confirm_checkbox", None)
+            else:
+                st.subheader("Preview")
+                st.write(f"{len(preview['segmented'])} messages segmented.")
+
+                preview_rows = build_preview_rows(
+                    preview["segmented"], preview["predictions"]
+                )
+                st.dataframe(preview_rows)
+
+                if preview["channel_mode"] == "existing":
+                    counts = count_new_vs_duplicate(
+                        preview["predictions"], len(preview["segmented"])
+                    )
+                    st.write(
+                        f"New: {counts['new']} | "
+                        f"Predicted duplicate: {counts['predicted_duplicate']}"
+                    )
+                    for warning in build_content_difference_warnings(
+                        preview["segmented"], preview["predictions"]
+                    ):
+                        st.warning(warning)
+                else:
+                    notice = build_create_mode_prediction_notice()
+                    st.info(notice["notice"])
+                    st.write(f"{notice['new_label']}: {len(preview['segmented'])}")
+                    st.write(f"{notice['duplicate_label']}: {notice['duplicate_value']}")
+
+                st.checkbox(
+                    "I have reviewed this preview and want to import it",
+                    key="bulk_import_confirm_checkbox",
+                )
+                confirm_clicked = st.button(
+                    "Confirm Import", key="bulk_import_confirm_button"
+                )
+
+                if confirm_clicked:
+                    if not st.session_state.get("bulk_import_confirm_checkbox"):
+                        st.error(_BULK_IMPORT_CONFIRM_VALIDATION_MESSAGE)
+                    else:
+                        configure_file_logging()
+                        confirm_conn: sqlite3.Connection | None = None
+                        try:
+                            confirm_config = DatabaseConfig(
+                                db_path=resolve_database_path()
+                            )
+                            initialize_database(confirm_config)
+                            confirm_conn = get_connection(confirm_config)
+                            confirm_service = TradeService(confirm_conn)
+                            # Every argument comes from the frozen preview
+                            # snapshot - never a live widget read here.
+                            # import_channel_batch_with_lifecycle_rebuild()
+                            # owns its entire transaction end to end; this
+                            # branch never calls conn.commit()/
+                            # conn.rollback() around it.
+                            result = confirm_service.import_channel_batch_with_lifecycle_rebuild(
+                                source_name=_BULK_IMPORT_SOURCE_NAME,
+                                channel_mode=preview["channel_mode"],
+                                existing_channel_id=preview["existing_channel_id"],
+                                new_channel_external_id=preview["new_channel_external_id"],
+                                new_channel_name=preview["new_channel_name"],
+                                reference_date=preview["reference_date"],
+                                timezone=preview["timezone"],
+                                raw_batch_text=preview["raw_text"],
+                                segmented_messages=preview["segmented"],
+                            )
+                        except ChannelExternalIdCollisionError as exc:
+                            log_operation_failure(logger, "bulk channel import", exc)
+                            st.error(_BULK_IMPORT_COLLISION_MESSAGE)
+                        except ValueError as exc:
+                            log_operation_failure(logger, "bulk channel import", exc)
+                            st.error(_BULK_IMPORT_VALIDATION_MESSAGE)
+                        except (
+                            LifecycleIntegrityError,
+                            LifecycleSnapshotError,
+                            RuntimeError,
+                            sqlite3.Error,
+                            OSError,
+                        ) as exc:
+                            log_operation_failure(logger, "bulk channel import", exc)
+                            st.error(_BULK_IMPORT_FAILURE_MESSAGE)
+                        except Exception as exc:
+                            log_operation_failure(logger, "bulk channel import", exc)
+                            st.error(_BULK_IMPORT_FAILURE_MESSAGE)
+                        else:
+                            st.session_state["bulk_import_result"] = result
+                            # bulk_import_confirm_checkbox is deliberately
+                            # NOT popped here: it was already rendered
+                            # earlier in this same script pass, and
+                            # popping a widget's own key for a widget
+                            # already instantiated in the current run is
+                            # unsafe (it can leave Streamlit's own
+                            # widget-state bookkeeping inconsistent). This
+                            # is safe to skip: the checkbox is never
+                            # rendered again until "Start Next Batch"
+                            # resets the whole workflow (which itself
+                            # clears this same key, in a later, separate
+                            # script run - see _reset_bulk_import_state()),
+                            # so its stale True value can never reach the
+                            # user again regardless.
+                            st.rerun()
+                        finally:
+                            if confirm_conn is not None:
+                                confirm_conn.close()

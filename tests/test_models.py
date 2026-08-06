@@ -383,6 +383,7 @@ class ChannelImportChannelSummaryModelTests(unittest.TestCase):
             channel_id=5, channel_external_id="chan-1", channel_name="general",
             latest_received_at=None, latest_received_raw_message_id=None,
             latest_received_external_id=None, last_ingested_raw_message_id=99,
+            last_ingested_external_id="synthetic:" + "a" * 64,
             last_ingested_at="2026-01-01T00:00:00.000000+00:00", last_import_batch_id=7,
         )
         operation = ChannelImportOperation(

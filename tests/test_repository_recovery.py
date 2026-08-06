@@ -798,6 +798,26 @@ class ChannelCheckpointQueryTests(_RecoveryRepositoryTestCase):
 
         self.assertEqual(row["last_ingested_raw_message_id"], second.id)
         self.assertEqual(row["channel_external_id"], "chan-a")
+        self.assertEqual(row["last_ingested_external_id"], second.external_id)
+
+    def test_ingestion_cursor_external_id_reflects_highest_id_row_not_earlier_ones(self):
+        channel = get_or_create_channel(self.connection, self.source.id, "chan-ext-id")
+        self.connection.commit()
+        create_raw_message(
+            self.connection, self.source.id, "first", channel_id=channel.id,
+            external_id="first-external-id",
+        )
+        second = create_raw_message(
+            self.connection, self.source.id, "second", channel_id=channel.id,
+            external_id="second-external-id",
+        )
+        self.connection.commit()
+
+        rows = get_channel_ingestion_cursors(self.connection)
+        row = next(r for r in rows if r["channel_id"] == channel.id)
+
+        self.assertEqual(row["last_ingested_external_id"], "second-external-id")
+        self.assertEqual(row["last_ingested_external_id"], second.external_id)
 
     def test_channel_with_no_raw_messages_is_absent(self):
         channel = get_or_create_channel(self.connection, self.source.id, "chan-empty")

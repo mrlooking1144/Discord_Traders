@@ -52,8 +52,20 @@ from app.dashboard_formatting import (
 )
 from app.parser import parse_message
 from database.config import resolve_database_path
+from database.models import (
+    AtomicChannelImportResult,
+    BatchIngestResult,
+    Channel,
+    ChannelCheckpoint,
+    ChannelExternalIdAvailability,
+    ChannelImportChannelSummary,
+    ChannelImportDuplicatePrediction,
+    ChannelImportOperation,
+    LifecycleRebuildResult,
+)
 from database.service import (
     AuditHistoryError,
+    ChannelExternalIdCollisionError,
     LifecycleIntegrityError,
     LifecycleSnapshotError,
     LifecycleUnsafeCorrectionError,
@@ -963,16 +975,22 @@ class WorkflowNavigationTests(unittest.TestCase):
 
     def test_sidebar_offers_all_three_workflows(self):
         # Recovery Milestone R8a: the sidebar's options list itself must
-        # change to add "Trader Performance" - this is the one approved
-        # change to Manual Message Entry/Review Signals' own behavior;
-        # every other assertion in this file proves the other two
+        # change to add "Trader Performance"; Recovery Milestone R9c
+        # further appends "Bulk Channel Import" - these are the only
+        # approved changes to Manual Message Entry/Review Signals' own
+        # behavior; every other assertion in this file proves the other
         # workflows are otherwise unaffected.
         at = AppTest.from_file("app/streamlit_app.py")
         at.run()
 
         self.assertEqual(
             at.sidebar.radio[0].options,
-            ["Manual Message Entry", "Review Signals", "Trader Performance"],
+            [
+                "Manual Message Entry",
+                "Review Signals",
+                "Trader Performance",
+                "Bulk Channel Import",
+            ],
         )
 
     def test_manual_message_entry_is_the_default_selection(self):
@@ -2830,6 +2848,866 @@ class TraderPerformanceWorkflowTests(unittest.TestCase):
 
         self.mock_conn.commit.assert_not_called()
         self.mock_conn.rollback.assert_not_called()
+
+
+def _bulk_import_batch_text(count, start=0, trader="Bdorts", symbol="AVGO"):
+    """A pure literal fixture of `count` distinct, valid, segmentable
+    footer-line-format BOUGHT messages - mirrors
+    tests/test_bulk_channel_import_service.py's own _valid_batch_text()."""
+    messages = []
+    for offset in range(count):
+        i = start + offset
+        messages.append(
+            f"{trader}\nAPP\n — 04:{i:02d} PM\n"
+            f"BOUGHT {symbol} 07/24 {380 + i}P $1.{i:02d} [SMALL]\n"
+            f"{trader}•Today at 04:{i:02d} PM\n"
+        )
+    return "".join(messages)
+
+
+def _bulk_import_channel(**overrides):
+    values = dict(id=5, source_id=1, external_channel_id="chan-1", name="General")
+    values.update(overrides)
+    return Channel(**values)
+
+
+def _bulk_import_checkpoint(**overrides):
+    values = dict(
+        channel_id=5, channel_external_id="chan-1", channel_name="General",
+        latest_received_at="2026-01-01T12:00:00.000000+00:00",
+        latest_received_raw_message_id=10, latest_received_external_id="discord-msg-1",
+        last_ingested_raw_message_id=10, last_ingested_external_id="discord-msg-1",
+        last_ingested_at="2026-01-01T12:00:05.000000+00:00", last_import_batch_id=1,
+    )
+    values.update(overrides)
+    return ChannelCheckpoint(**values)
+
+
+def _bulk_import_operation(**overrides):
+    values = dict(
+        id=1, channel_id=5, import_batch_id=1, reference_date="2026-01-01",
+        timezone="America/New_York", processed_count=15, stored_count=15,
+        duplicate_count=0, unrecognized_count=0, failed_count=0,
+        committed_at="2026-01-01T12:00:05.000000+00:00",
+    )
+    values.update(overrides)
+    return ChannelImportOperation(**values)
+
+
+def _bulk_import_summary(**overrides):
+    values = dict(
+        channel=_bulk_import_channel(), checkpoint=_bulk_import_checkpoint(),
+        latest_operation=_bulk_import_operation(),
+    )
+    values.update(overrides)
+    return ChannelImportChannelSummary(**values)
+
+
+def _bulk_import_result(**overrides):
+    values = dict(
+        channel=_bulk_import_channel(),
+        batch_result=BatchIngestResult(
+            import_batch_id=1, channel_id=5, total_segmented=15, stored_count=15,
+            duplicate_count=0, unrecognized_count=0, failed_count=0, messages=[],
+        ),
+        lifecycle_result=LifecycleRebuildResult(
+            keys_considered=1, keys_changed=1, keys_unchanged=0,
+            lifecycles_superseded=0, lifecycles_created=1,
+            lifecycle_events_created=1, signal_pointers_cleared=0,
+            signal_pointers_assigned=1,
+        ),
+        operation=_bulk_import_operation(),
+    )
+    values.update(overrides)
+    return AtomicChannelImportResult(**values)
+
+
+class BulkChannelImportWorkflowTests(unittest.TestCase):
+    """Covers Recovery Milestone R9c: the Bulk Channel Import workflow.
+    database.db.get_connection and database.service.TradeService are
+    patched for the lifetime of each test (setUp/addCleanup), mirroring
+    TraderPerformanceWorkflowTests' own established pattern exactly -
+    every TradeService(...) instantiation anywhere in the branch returns
+    the same one mock instance, however many separate connections the
+    branch opens internally.
+
+    Every test that drives a Confirm Import click (which internally calls
+    st.rerun()) stops interacting with that same AppTest instance
+    immediately afterward - a further .run() call on the same instance
+    after a mid-script st.rerun() runs into a known AppTest/Streamlit
+    testing-harness limitation with a conditionally-rendered widget
+    (the confirmation checkbox) orphaned by the same click's own rerun,
+    unrelated to this application's own logic (confirmed by an isolated,
+    minimal reproduction outside this codebase during implementation).
+    Tests that need to observe the COMPLETED state without driving
+    through a live Confirm click instead pre-seed
+    st.session_state["bulk_import_result"] directly before the first
+    .run() call - a standard, supported AppTest technique - which avoids
+    the same-instance-double-rerun scenario entirely and has been proven
+    to render byte-identical completed-view content.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        db_path = Path(self._tmp.name) / "discord_traders.db"
+        db_path.write_bytes(b"")
+
+        env_patcher = patch.dict(
+            os.environ, {"DISCORD_TRADERS_DB_PATH": str(db_path)}, clear=False
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+        self.mock_conn = MagicMock()
+        conn_patcher = patch("database.db.get_connection", return_value=self.mock_conn)
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        init_patcher = patch("database.db.initialize_database")
+        init_patcher.start()
+        self.addCleanup(init_patcher.stop)
+
+        service_patcher = patch("database.service.TradeService")
+        mock_service_cls = service_patcher.start()
+        self.addCleanup(service_patcher.stop)
+        self.mock_service_cls = mock_service_cls
+        self.mock_service = mock_service_cls.return_value
+
+        # Sensible defaults every test can override piecemeal.
+        self.mock_service.list_bulk_import_channels.return_value = [_bulk_import_summary()]
+        self.mock_service.get_bulk_import_channel_summary.return_value = _bulk_import_summary()
+        self.mock_service.check_new_channel_external_id_availability.return_value = (
+            ChannelExternalIdAvailability(
+                external_channel_id="new-chan", is_available=True, existing_channel=None
+            )
+        )
+        self.mock_service.predict_channel_import_duplicate_statuses.return_value = []
+
+    def _open(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.run()
+        return at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+    def _fill_existing_mode(self, at, *, raw_text, channel_id=5, timezone="UTC"):
+        at.text_area(key="bulk_import_raw_text_input").set_value(raw_text)
+        at.text_input(key="bulk_import_timezone").set_value(timezone)
+        at = at.run()
+        at.selectbox(key="bulk_import_existing_channel_select").set_value(channel_id)
+        return at.run()
+
+    def _fill_create_mode(self, at, *, raw_text, external_id="new-chan", name="", timezone="UTC"):
+        at = at.radio(key="bulk_import_channel_mode").set_value(
+            "Create a new channel"
+        ).run()
+        at.text_area(key="bulk_import_raw_text_input").set_value(raw_text)
+        at.text_input(key="bulk_import_new_channel_external_id").set_value(external_id)
+        at.text_input(key="bulk_import_new_channel_name").set_value(name)
+        at.text_input(key="bulk_import_timezone").set_value(timezone)
+        return at.run()
+
+    # -- workflow availability -------------------------------------------
+
+    def test_sidebar_option_present_and_selectable(self):
+        at = self._open()
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual(at.title[0].value, "Discord Traders - Bulk Channel Import")
+
+    # -- 15-message floor --------------------------------------------------
+
+    def test_fewer_than_15_messages_rejected(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(14))
+
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertIn("Manual Message Entry", at.error[0].value)
+        self.assertIn("14", at.error[0].value)
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.assert_not_called()
+        self.assertNotIn("bulk_import_preview", at.session_state)
+
+    def test_exactly_15_messages_accepted(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15))
+
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertEqual(at.error, [])
+        preview = at.session_state["bulk_import_preview"]
+        self.assertEqual(len(preview["segmented"]), 15)
+
+    # -- existing vs. create mode -------------------------------------------
+
+    def test_existing_mode_confirm_uses_selected_channel_id_only(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.return_value = (
+            _bulk_import_result()
+        )
+        at.button(key="bulk_import_confirm_button").click().run()
+
+        call_kwargs = self.mock_service.import_channel_batch_with_lifecycle_rebuild.call_args.kwargs
+        self.assertEqual(call_kwargs["channel_mode"], "existing")
+        self.assertEqual(call_kwargs["existing_channel_id"], 5)
+        self.assertIsNone(call_kwargs["new_channel_external_id"])
+        self.assertIsNone(call_kwargs["new_channel_name"])
+
+    def test_create_mode_confirm_uses_new_channel_fields_only(self):
+        at = self._open()
+        at = self._fill_create_mode(
+            at, raw_text=_bulk_import_batch_text(15), external_id="brand-new", name="My Channel"
+        )
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.return_value = (
+            _bulk_import_result()
+        )
+        at.button(key="bulk_import_confirm_button").click().run()
+
+        call_kwargs = self.mock_service.import_channel_batch_with_lifecycle_rebuild.call_args.kwargs
+        self.assertEqual(call_kwargs["channel_mode"], "create")
+        self.assertIsNone(call_kwargs["existing_channel_id"])
+        self.assertEqual(call_kwargs["new_channel_external_id"], "brand-new")
+        self.assertEqual(call_kwargs["new_channel_name"], "My Channel")
+
+    def test_create_mode_preview_never_calls_duplicate_prediction(self):
+        at = self._open()
+        at = self._fill_create_mode(at, raw_text=_bulk_import_batch_text(15))
+
+        at.button(key="bulk_import_preview_button").click().run()
+
+        self.mock_service.predict_channel_import_duplicate_statuses.assert_not_called()
+
+    def test_existing_mode_preview_calls_duplicate_prediction_once(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+
+        at.button(key="bulk_import_preview_button").click().run()
+
+        self.mock_service.predict_channel_import_duplicate_statuses.assert_called_once()
+        self.assertEqual(
+            self.mock_service.predict_channel_import_duplicate_statuses.call_args.kwargs[
+                "channel_id"
+            ],
+            5,
+        )
+
+    # -- create-mode provisional wording and advisory collision -----------
+
+    def test_create_mode_provisional_wording(self):
+        at = self._open()
+        at = self._fill_create_mode(at, raw_text=_bulk_import_batch_text(15))
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        combined = (
+            " ".join(w.value for w in at.markdown)
+            + " ".join(i.value for i in at.info)
+        )
+        self.assertIn("Provisionally new", combined)
+        self.assertIn("Not available for create mode", combined)
+        self.assertNotIn("necessarily new", combined)
+
+    def test_advisory_collision_shows_strong_warning_never_blocks(self):
+        self.mock_service.check_new_channel_external_id_availability.return_value = (
+            ChannelExternalIdAvailability(
+                external_channel_id="taken", is_available=False,
+                existing_channel=_bulk_import_channel(id=99, external_channel_id="taken"),
+            )
+        )
+        at = self._open()
+        at = self._fill_create_mode(at, raw_text=_bulk_import_batch_text(15), external_id="taken")
+
+        self.assertTrue(any("already taken" in e.value for e in at.error))
+
+        at = at.button(key="bulk_import_preview_button").click().run()
+        # Preview Batch is never blocked by the advisory collision result.
+        self.assertIn("bulk_import_preview", at.session_state)
+
+    # -- sentinel exclusion / no silent selection ---------------------------
+
+    def test_channel_list_passed_through_unfiltered_never_adds_sentinel(self):
+        summaries = [_bulk_import_summary(channel=_bulk_import_channel(id=7, external_channel_id="real-chan"))]
+        self.mock_service.list_bulk_import_channels.return_value = summaries
+        at = self._open()
+
+        self.mock_service.list_bulk_import_channels.assert_called_once_with(
+            source_name="discord"
+        )
+        # Only the one channel list_bulk_import_channels() itself returned
+        # is ever offered - the UI never independently adds or removes an
+        # option (including never re-adding a sentinel). Exactly one
+        # option (its formatted label), and selecting it resolves to
+        # exactly the underlying real channel id, never a sentinel.
+        selectbox = at.selectbox(key="bulk_import_existing_channel_select")
+        self.assertEqual(selectbox.options, ["General (real-chan)"])
+        selectbox.select_index(0)
+        at = at.run()
+        self.assertEqual(
+            at.selectbox(key="bulk_import_existing_channel_select").value, 7
+        )
+
+    def test_no_channel_preselected_on_first_render(self):
+        at = self._open()
+        self.assertIsNone(
+            at.selectbox(key="bulk_import_existing_channel_select").value
+        )
+
+    # -- preview ordering, duplicate/content-difference display -----------
+
+    def test_preview_preserves_exact_segmented_order(self):
+        # A deliberately non-monotonic prediction list order does not
+        # affect the segmented rows' own natural paste order.
+        self.mock_service.predict_channel_import_duplicate_statuses.return_value = []
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        df = at.dataframe[-1].value
+        self.assertEqual(list(df["Seq"]), list(range(1, 16)))
+
+    def test_duplicate_and_content_difference_display(self):
+        segmented_count = 15
+        predictions = [
+            ChannelImportDuplicatePrediction(
+                sequence_in_batch=i, external_id=f"ext-{i}",
+                predicted_duplicate=(i <= 3), predicted_content_differs=(i == 1),
+            )
+            for i in range(1, segmented_count + 1)
+        ]
+        self.mock_service.predict_channel_import_duplicate_statuses.return_value = predictions
+        at = self._open()
+        at = self._fill_existing_mode(
+            at, raw_text=_bulk_import_batch_text(segmented_count), channel_id=5
+        )
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        combined = " ".join(w.value for w in at.markdown)
+        self.assertIn("New: 12", combined)
+        self.assertIn("Predicted duplicate: 3", combined)
+        self.assertTrue(any("Message 1" in w.value for w in at.warning))
+
+    # -- unresolved Discord time / checkpoint ids --------------------------
+
+    def test_unresolved_discord_time_still_shows_ingestion_checkpoint_id(self):
+        self.mock_service.list_bulk_import_channels.return_value = [
+            _bulk_import_summary(
+                checkpoint=_bulk_import_checkpoint(
+                    latest_received_at=None, latest_received_raw_message_id=None,
+                    latest_received_external_id=None,
+                    last_ingested_external_id="discord-msg-999",
+                )
+            )
+        ]
+        at = self._open()
+        at.selectbox(key="bulk_import_existing_channel_select").set_value(5)
+        at = at.run()
+
+        combined = str([j.value for j in at.json])
+        self.assertIn("Unresolved", combined)
+        self.assertIn("discord-msg-999", combined)
+
+    def test_synthetic_checkpoint_id_exact_label(self):
+        synthetic_id = "synthetic:" + "a" * 64
+        self.mock_service.list_bulk_import_channels.return_value = [
+            _bulk_import_summary(
+                checkpoint=_bulk_import_checkpoint(last_ingested_external_id=synthetic_id)
+            )
+        ]
+        at = self._open()
+        at.selectbox(key="bulk_import_existing_channel_select").set_value(5)
+        at = at.run()
+
+        combined = str([j.value for j in at.json])
+        self.assertIn("Synthetic checkpoint IDs", combined)
+
+    # -- timezone source: pre-confirm (live/frozen) vs post-confirm -------
+
+    def test_preconfirm_uses_live_form_timezone_not_latest_operation(self):
+        self.mock_service.list_bulk_import_channels.return_value = [
+            _bulk_import_summary(
+                checkpoint=_bulk_import_checkpoint(
+                    latest_received_at="2026-01-01T20:00:00.000000+00:00"
+                ),
+                latest_operation=_bulk_import_operation(timezone="Asia/Tokyo"),
+            )
+        ]
+        at = self._open()
+        at.selectbox(key="bulk_import_existing_channel_select").set_value(5)
+        at.text_input(key="bulk_import_timezone").set_value("America/New_York")
+        at = at.run()
+
+        combined = str([j.value for j in at.json])
+        # 20:00 UTC -> 15:00 America/New_York (EST, no DST in January) -
+        # never the unrelated Asia/Tokyo operation timezone.
+        self.assertIn("15:00:00", combined)
+        self.assertNotIn("Asia/Tokyo", combined)
+
+    def test_postconfirm_uses_result_operation_timezone(self):
+        # Pre-seed COMPLETED state directly (see class docstring) with a
+        # result.operation.timezone deliberately different from any
+        # pre-import form timezone, and an updated summary whose own
+        # latest_operation matches that same new timezone.
+        result = _bulk_import_result(operation=_bulk_import_operation(timezone="Asia/Tokyo"))
+        self.mock_service.get_bulk_import_channel_summary.return_value = _bulk_import_summary(
+            checkpoint=_bulk_import_checkpoint(
+                latest_received_at="2026-01-01T20:00:00.000000+00:00"
+            ),
+            latest_operation=_bulk_import_operation(timezone="Asia/Tokyo"),
+        )
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = result
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": _bulk_import_batch_text(15), "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        combined = str([j.value for j in at.json])
+        # 20:00 UTC -> 05:00 (next day) Asia/Tokyo (UTC+9).
+        self.assertIn("05:00:00", combined)
+
+    def test_duplicate_only_operation_does_not_use_older_operation_timezone_for_checkpoint(self):
+        # The checkpoint's own latest_received_at is unchanged by a
+        # duplicate-only operation, but the completed panel must still use
+        # THIS new operation's own timezone - never an older one.
+        result = _bulk_import_result(
+            operation=_bulk_import_operation(
+                timezone="America/New_York", stored_count=0, duplicate_count=15,
+                import_batch_id=None,
+            ),
+            batch_result=BatchIngestResult(
+                import_batch_id=None, channel_id=5, total_segmented=15, stored_count=0,
+                duplicate_count=15, unrecognized_count=0, failed_count=0, messages=[],
+            ),
+        )
+        self.mock_service.get_bulk_import_channel_summary.return_value = _bulk_import_summary(
+            checkpoint=_bulk_import_checkpoint(
+                latest_received_at="2026-01-01T20:00:00.000000+00:00"
+            ),
+            latest_operation=_bulk_import_operation(timezone="America/New_York"),
+        )
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = result
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": _bulk_import_batch_text(15), "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        combined = str([j.value for j in at.json])
+        self.assertIn("15:00:00", combined)  # 20:00 UTC -> 15:00 EST
+
+    # -- duplicate-only / mixed-result success ------------------------------
+
+    def test_duplicate_only_success_shows_zero_stored(self):
+        result = _bulk_import_result(
+            operation=_bulk_import_operation(
+                stored_count=0, duplicate_count=15, import_batch_id=None,
+            ),
+            batch_result=BatchIngestResult(
+                import_batch_id=None, channel_id=5, total_segmented=15, stored_count=0,
+                duplicate_count=15, unrecognized_count=0, failed_count=0, messages=[],
+            ),
+        )
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = result
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        combined = str([j.value for j in at.json])
+        self.assertIn('"Stored": 0', combined)
+        self.assertIn('"Duplicate": 15', combined)
+
+    def test_mixed_result_success_shows_all_four_counts(self):
+        result = _bulk_import_result(
+            operation=_bulk_import_operation(
+                stored_count=10, duplicate_count=5, unrecognized_count=2, failed_count=1,
+            ),
+            batch_result=BatchIngestResult(
+                import_batch_id=1, channel_id=5, total_segmented=15, stored_count=10,
+                duplicate_count=5, unrecognized_count=2, failed_count=1, messages=[],
+            ),
+        )
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = result
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        combined = str([j.value for j in at.json])
+        self.assertIn('"Stored": 10', combined)
+        self.assertIn('"Duplicate": 5', combined)
+        self.assertIn('"Unrecognized": 2', combined)
+        self.assertIn('"Failed": 1', combined)
+
+    # -- confirmation checkbox clearing -------------------------------------
+
+    def test_checkbox_cleared_on_staleness(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+        self.assertTrue(at.session_state["bulk_import_confirm_checkbox"])
+
+        at.text_area(key="bulk_import_raw_text_input").set_value(_bulk_import_batch_text(16))
+        at = at.run()
+
+        self.assertNotIn("bulk_import_preview", at.session_state)
+        self.assertNotIn("bulk_import_confirm_checkbox", at.session_state)
+
+    def test_checkbox_cleared_on_replacement_preview(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        # The checkbox widget still renders (a fresh, valid replacement
+        # preview exists) - "cleared" manifests as a reset-to-False
+        # value, not the widget's absence (absence only happens when the
+        # whole preview disappears - see test_checkbox_cleared_on_staleness).
+        self.assertFalse(at.checkbox(key="bulk_import_confirm_checkbox").value)
+
+    def test_checkbox_cleared_on_failed_preview_attempt(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        # Same normalized inputs (no staleness) but a forced prediction
+        # failure on re-preview - the OLD, still-valid preview (and its
+        # checkbox widget) remains rendered, but the checkbox itself is
+        # still reset to unchecked.
+        self.mock_service.predict_channel_import_duplicate_statuses.side_effect = RuntimeError(
+            "boom"
+        )
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertFalse(at.checkbox(key="bulk_import_confirm_checkbox").value)
+        self.assertIn("bulk_import_preview", at.session_state)
+
+    # -- confirm failure preservation ----------------------------------------
+
+    def test_confirm_failure_preserves_valid_preview(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.side_effect = (
+            ChannelExternalIdCollisionError("taken")
+        )
+        at = at.button(key="bulk_import_confirm_button").click().run()
+
+        self.assertTrue(any("already in use" in e.value for e in at.error))
+        self.assertIn("bulk_import_preview", at.session_state)
+        self.assertNotIn("bulk_import_result", at.session_state)
+
+    def test_confirm_generic_failure_shows_fixed_message(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.side_effect = RuntimeError(
+            "boom"
+        )
+        at = at.button(key="bulk_import_confirm_button").click().run()
+
+        self.assertTrue(any("Could not complete" in e.value for e in at.error))
+        self.assertNotIn("bulk_import_result", at.session_state)
+
+    def test_confirm_requires_checkbox(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        at = at.button(key="bulk_import_confirm_button").click().run()
+
+        self.assertTrue(any("check the confirmation box" in e.value for e in at.error))
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.assert_not_called()
+
+    # -- immediate completed render after confirm ---------------------------
+
+    def test_immediate_completed_render_after_confirm(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.return_value = (
+            _bulk_import_result()
+        )
+        at = at.button(key="bulk_import_confirm_button").click().run()
+
+        self.assertIn("Last operation counts", [s.value for s in at.subheader])
+        self.assertIn("bulk_import_result", at.session_state)
+
+    def test_completed_paste_and_preview_both_visible(self):
+        segmented_fixture = [
+            {"sequence_in_batch": 1},
+        ]
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "EXACT ORIGINAL PASTE TEXT", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        pasted_area = at.text_area(key=None) if False else None
+        text_areas = [t.value for t in at.text_area]
+        self.assertIn("EXACT ORIGINAL PASTE TEXT", text_areas)
+        self.assertIn("Preview (As Imported)", [s.value for s in at.subheader])
+
+    def test_completed_view_never_resegments_or_repredicts(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": _bulk_import_batch_text(15), "segmented": [], "predictions": [],
+        }
+        at.run()
+        with patch("app.streamlit_app.segment_discord_batch") as mock_segment:
+            at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+        mock_segment.assert_not_called()
+        self.mock_service.predict_channel_import_duplicate_statuses.assert_not_called()
+
+    def test_result_persists_across_unrelated_rerun(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+        self.assertIn("bulk_import_result", at.session_state)
+
+        # An unrelated rerun (re-selecting the same workflow again) never
+        # automatically clears the completed result.
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+        self.assertIn("bulk_import_result", at.session_state)
+        self.assertIn("Last operation counts", [s.value for s in at.subheader])
+
+    # -- reset ----------------------------------------------------------------
+
+    def test_start_next_batch_clears_all_state_and_shows_blank_form(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        at = at.button(key="bulk_import_start_next_batch_button").click().run()
+
+        # Pure state-dict keys, plus the confirm checkbox (only rendered
+        # inside the preview section, which no longer exists): fully
+        # gone, since the completed/preview views that own them are no
+        # longer rendered at all.
+        for key in (
+            "bulk_import_result", "bulk_import_preview", "bulk_import_confirm_checkbox",
+        ):
+            self.assertNotIn(key, at.session_state)
+
+        # Widget-backed keys: the blank FORM still renders these widgets
+        # (so the keys remain present in session_state), but each must
+        # hold its genuine reset/default value, not a stale one. The
+        # channel-mode radio itself resets to its default ("Existing
+        # Channel"), so the create-mode-only text inputs
+        # (bulk_import_new_channel_external_id/_name) are not rendered
+        # at all on this blank form - there is nothing to assert on
+        # them here (mirrors test_immediate_blank_form_after_reset).
+        self.assertEqual(at.text_area(key="bulk_import_raw_text_input").value, "")
+        self.assertIsNone(
+            at.selectbox(key="bulk_import_existing_channel_select").value
+        )
+
+    def test_immediate_blank_form_after_reset(self):
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+        at = at.button(key="bulk_import_start_next_batch_button").click().run()
+
+        self.assertEqual(at.text_area(key="bulk_import_raw_text_input").value, "")
+        self.assertIsNone(
+            at.selectbox(key="bulk_import_existing_channel_select").value
+        )
+        self.assertNotIn("Last operation counts", [s.value for s in at.subheader])
+
+    # -- advisory read failures ----------------------------------------------
+
+    def test_channel_list_failure_shows_fixed_message(self):
+        self.mock_service.list_bulk_import_channels.side_effect = RuntimeError("boom")
+        at = self._open()
+        self.assertTrue(any("Could not load channels" in e.value for e in at.error))
+
+    def test_channel_list_failure_does_not_show_false_empty_state_message(self):
+        # Correction 1: channel existence is unknown when loading
+        # failed - the "no channels exist yet" message is factually
+        # wrong here and must never appear; no selectable channel is
+        # shown either, and the paste field is preserved.
+        self.mock_service.list_bulk_import_channels.side_effect = RuntimeError("boom")
+        at = self._open()
+        at.text_area(key="bulk_import_raw_text_input").set_value("some pasted text")
+        at = at.run()
+
+        self.assertTrue(any("Could not load channels" in e.value for e in at.error))
+        self.assertFalse(any("No channels exist" in i.value for i in at.info))
+        # No selectable channel is offered at all when loading failed -
+        # not even an empty one.
+        self.assertEqual(len(at.selectbox), 0)
+        self.assertEqual(
+            at.text_area(key="bulk_import_raw_text_input").value, "some pasted text"
+        )
+
+    def test_availability_check_failure_shows_fixed_message(self):
+        self.mock_service.check_new_channel_external_id_availability.side_effect = (
+            RuntimeError("boom")
+        )
+        at = self._open()
+        at = at.radio(key="bulk_import_channel_mode").set_value("Create a new channel").run()
+        at.text_input(key="bulk_import_new_channel_external_id").set_value("new-chan")
+        at = at.run()
+
+        self.assertTrue(any("availability" in e.value for e in at.error))
+
+    def test_successful_import_remains_visible_when_updated_summary_readback_fails(self):
+        self.mock_service.get_bulk_import_channel_summary.side_effect = RuntimeError("boom")
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        # The success result itself must still render in full - never
+        # appearing as though the import itself failed.
+        self.assertIn("Last operation counts", [s.value for s in at.subheader])
+        self.assertEqual(at.error, [])
+        self.assertTrue(
+            any("refreshed checkpoint details" in w.value for w in at.warning)
+        )
+
+    def test_none_summary_readback_shows_refresh_warning(self):
+        # Correction 2: a None summary after a successful, committed
+        # import is itself a readback failure - not silently rendered
+        # as an empty section - and gets the exact same fixed warning
+        # as an outright exception. The successful result must remain
+        # fully visible either way.
+        self.mock_service.get_bulk_import_channel_summary.return_value = None
+        at = AppTest.from_file("app/streamlit_app.py")
+        at.session_state["bulk_import_result"] = _bulk_import_result()
+        at.session_state["bulk_import_preview"] = {
+            "raw_text": "x", "segmented": [], "predictions": [],
+        }
+        at.run()
+        at = at.sidebar.radio[0].set_value("Bulk Channel Import").run()
+
+        self.assertIn("Last operation counts", [s.value for s in at.subheader])
+        self.assertEqual(at.error, [])
+        self.assertTrue(
+            any("refreshed checkpoint details" in w.value for w in at.warning)
+        )
+        self.assertIn("bulk_import_result", at.session_state)
+
+    # -- segmentation failure boundary ----------------------------------------
+
+    def test_segmentation_failure_shows_fixed_message_never_raw_text(self):
+        with patch(
+            "app.discord_adapter.segment_discord_batch",
+            side_effect=RuntimeError("sensitive raw text"),
+        ):
+            at = self._open()
+            at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15))
+            at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertTrue(
+            any("Could not segment this Discord batch" in e.value for e in at.error)
+        )
+        self.assertFalse(any("sensitive raw text" in e.value for e in at.error))
+        self.mock_service.predict_channel_import_duplicate_statuses.assert_not_called()
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.assert_not_called()
+        self.assertNotIn("bulk_import_preview", at.session_state)
+
+    def test_segmentation_failure_on_unchanged_reprepreview_preserves_old_preview(self):
+        at = self._open()
+        at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15), channel_id=5)
+        at = at.button(key="bulk_import_preview_button").click().run()
+        at = at.checkbox(key="bulk_import_confirm_checkbox").set_value(True).run()
+
+        # Same normalized inputs (no staleness), but this Preview Batch
+        # attempt hits a forced segmentation failure.
+        with patch(
+            "app.discord_adapter.segment_discord_batch",
+            side_effect=RuntimeError("boom"),
+        ):
+            at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertTrue(
+            any("Could not segment this Discord batch" in e.value for e in at.error)
+        )
+        # The still-valid old preview survives untouched, but the
+        # confirmation checkbox is reset (every Preview Batch attempt
+        # clears it first, unconditionally).
+        self.assertIn("bulk_import_preview", at.session_state)
+        self.assertFalse(at.checkbox(key="bulk_import_confirm_checkbox").value)
+        self.assertIn("Preview", [s.value for s in at.subheader])
+
+    # -- editing connection cleanup -------------------------------------------
+
+    def test_editing_connection_closed_when_segmentation_raises(self):
+        with patch(
+            "app.discord_adapter.segment_discord_batch",
+            side_effect=RuntimeError("boom"),
+        ):
+            at = self._open()
+            at = self._fill_existing_mode(at, raw_text=_bulk_import_batch_text(15))
+            at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.mock_conn.close.assert_called()
+
+    # -- invalid external id validation ---------------------------------------
+
+    def test_invalid_external_id_shows_fixed_message_and_blocks_preview(self):
+        self.mock_service.check_new_channel_external_id_availability.side_effect = (
+            ValueError("must not be the reserved unspecified-channel sentinel")
+        )
+        at = self._open()
+        at = self._fill_create_mode(
+            at, raw_text=_bulk_import_batch_text(15), external_id="__unspecified__"
+        )
+
+        self.assertTrue(
+            any(
+                "not valid for Bulk Channel Import" in e.value
+                for e in at.error
+            )
+        )
+
+        at = at.button(key="bulk_import_preview_button").click().run()
+
+        self.assertNotIn("bulk_import_preview", at.session_state)
+        self.mock_service.predict_channel_import_duplicate_statuses.assert_not_called()
+        self.mock_service.import_channel_batch_with_lifecycle_rebuild.assert_not_called()
 
 
 if __name__ == "__main__":

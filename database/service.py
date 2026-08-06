@@ -2946,6 +2946,7 @@ class TradeService:
                         if chronological else None
                     ),
                     last_ingested_raw_message_id=ingestion["last_ingested_raw_message_id"],
+                    last_ingested_external_id=ingestion["last_ingested_external_id"],
                     last_ingested_at=ingestion["last_ingested_at"],
                     last_import_batch_id=ingestion["last_import_batch_id"],
                 )

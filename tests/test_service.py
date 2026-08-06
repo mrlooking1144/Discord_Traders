@@ -2055,7 +2055,8 @@ class R5ResultDataclassFieldTests(unittest.TestCase):
                 "channel_id", "channel_external_id", "channel_name",
                 "latest_received_at", "latest_received_raw_message_id",
                 "latest_received_external_id", "last_ingested_raw_message_id",
-                "last_ingested_at", "last_import_batch_id",
+                "last_ingested_external_id", "last_ingested_at",
+                "last_import_batch_id",
             ],
         )
 
@@ -3240,6 +3241,7 @@ class ChannelCheckpointServiceTests(_R5ServiceTestCase):
         # The ingestion cursor still reflects the most recently INSERTED
         # row - the older-content message pasted second.
         self.assertEqual(checkpoint.last_ingested_raw_message_id, older.raw_message_id)
+        self.assertEqual(checkpoint.last_ingested_external_id, older.external_id)
 
     def test_unresolved_timestamps_report_no_false_chronological_checkpoint(self):
         outcome = self.service.ingest_channel_message(
@@ -3255,6 +3257,35 @@ class ChannelCheckpointServiceTests(_R5ServiceTestCase):
         self.assertIsNone(checkpoint.latest_received_raw_message_id)
         self.assertIsNone(checkpoint.latest_received_external_id)
         self.assertEqual(checkpoint.last_ingested_raw_message_id, outcome.raw_message_id)
+        # The ingestion checkpoint's own external id remains available -
+        # never None - even though the chronological half is entirely
+        # unresolved (None above); it must never be confused with, or
+        # used as a substitute for, a resolved Discord time.
+        self.assertEqual(checkpoint.last_ingested_external_id, outcome.external_id)
+        self.assertIsNotNone(checkpoint.last_ingested_external_id)
+
+    def test_checkpoint_ingestion_external_id_is_synthetic_for_no_real_message_id(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-synth", trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", synthetic_id_input="s-synth-checkpoint",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        checkpoints = self.service.get_channel_checkpoints()
+        checkpoint = next(c for c in checkpoints if c.channel_id == outcome.channel_id)
+
+        self.assertTrue(checkpoint.last_ingested_external_id.startswith("synthetic:"))
+        self.assertEqual(checkpoint.last_ingested_external_id, outcome.external_id)
+
+    def test_checkpoint_ingestion_external_id_is_real_when_supplied(self):
+        outcome = self.service.ingest_channel_message(
+            source_name="discord", channel_external_id="chan-real-id", trader_raw="alice",
+            raw_text="hi", cleaned_text="hi", external_id="discord-msg-12345",
+            reference_date="2026-07-24", timezone="UTC",
+        )
+        checkpoints = self.service.get_channel_checkpoints()
+        checkpoint = next(c for c in checkpoints if c.channel_id == outcome.channel_id)
+
+        self.assertEqual(checkpoint.last_ingested_external_id, "discord-msg-12345")
 
     def test_duplicate_imports_do_not_change_checkpoint(self):
         self.service.ingest_channel_message(

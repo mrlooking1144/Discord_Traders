@@ -1635,9 +1635,9 @@ def get_channel_ingestion_cursors(conn: sqlite3.Connection) -> list[dict]:
     Returns:
         One dict per channel that has at least one raw_messages row, with
         keys: channel_id, channel_external_id, channel_name,
-        last_ingested_raw_message_id, last_ingested_at,
-        last_import_batch_id. Empty list if no channel has any raw
-        message.
+        last_ingested_raw_message_id, last_ingested_external_id,
+        last_ingested_at, last_import_batch_id. Empty list if no channel
+        has any raw message.
     """
     rows = conn.execute(
         "SELECT "
@@ -1645,6 +1645,7 @@ def get_channel_ingestion_cursors(conn: sqlite3.Connection) -> list[dict]:
         "c.external_channel_id AS channel_external_id, "
         "c.name AS channel_name, "
         "rm.id AS last_ingested_raw_message_id, "
+        "rm.external_id AS last_ingested_external_id, "
         "rm.ingested_at AS last_ingested_at, "
         "rm.import_batch_id AS last_import_batch_id "
         "FROM channels c "

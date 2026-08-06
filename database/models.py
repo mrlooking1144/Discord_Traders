@@ -391,7 +391,26 @@ class ReprocessBatchResult:
 
 @dataclass(frozen=True)
 class ChannelCheckpoint:
-    """One channel's composite resume/audit checkpoint.
+    """One channel's composite resume/audit checkpoint - two independent
+    halves that must never be confused with one another.
+
+    The CHRONOLOGICAL checkpoint (latest_received_at,
+    latest_received_raw_message_id, latest_received_external_id) is based
+    only on the *resolved Discord message timestamp*. All three are None
+    together whenever no message in this channel has any resolved
+    timestamp at all - this explicitly signals "chronological resume
+    information unavailable" and must never be substituted with insertion
+    order.
+
+    The INGESTION checkpoint (last_ingested_raw_message_id,
+    last_ingested_external_id, last_ingested_at, last_import_batch_id) is
+    based only on insertion order (MAX(raw_messages.id)) and is always
+    fully populated for any channel with at least one raw_messages row -
+    including when that row's own Discord timestamp is unresolved.
+    last_ingested_external_id is therefore safe to display as "the id of
+    the most recently imported message" even when the chronological half
+    is entirely None; it must never be presented as a substitute for a
+    resolved Discord time, only as its own distinct ingestion/audit fact.
 
     Attributes:
         channel_id: FK to channels.id.
@@ -412,6 +431,17 @@ class ChannelCheckpoint:
         last_ingested_raw_message_id: MAX(raw_messages.id) for this
             channel - always populated (every channel returned here has
             at least one raw_messages row).
+        last_ingested_external_id: That same row's external_id (a real
+            Discord message id, or a "synthetic:"-prefixed deterministic
+            id when no real Discord id was available - see
+            TradeService._resolve_external_id()'s own approved contract).
+            Always populated: every raw_messages row a channel-scoped R5+
+            ingestion path writes always resolves a real-or-synthetic
+            external_id before insert, and the only rows that can ever
+            have a NULL external_id belong to the pre-R5, legacy
+            ingest_message() path, which never sets channel_id at all and
+            therefore can never be "the latest ingested row" for any
+            channel this dataclass is constructed for.
         last_ingested_at: That same row's ingested_at.
         last_import_batch_id: That same row's import_batch_id, or None for
             a channel whose most recently inserted message came from
@@ -425,6 +455,7 @@ class ChannelCheckpoint:
     latest_received_raw_message_id: Optional[int]
     latest_received_external_id: Optional[str]
     last_ingested_raw_message_id: int
+    last_ingested_external_id: str
     last_ingested_at: str
     last_import_batch_id: Optional[int]
 

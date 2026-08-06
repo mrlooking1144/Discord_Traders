@@ -1,0 +1,512 @@
+====================================================================
+Discord Traders - Recovery Milestone R9b Handoff
+Atomic Bulk Channel Import
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity and Status
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R9b - "Atomic Bulk Channel Import" - the
+second of three sub-milestones of the Bulk Channel Import module
+(Recovery Milestone R9: R9a + R9b + R9c).
+
+Status: COMPLETE. Implemented, tested (focused, regression, and full
+suite), reviewed through two correction passes, committed, and pushed to
+`origin/main`.
+
+Exact commit hash and message:
+    e9b49df9c00d6d7e9b5d088711932a0d3e22bf6b
+    "Implement atomic bulk channel import"
+
+Pushed as a normal fast-forward from Recovery Milestone R9a's own
+implementation commit:
+    387d2aa1166bd74527da7565f6c3ec4a1367f451
+    "Implement channel import backend contracts"
+
+Preceding milestones (all complete and pushed before R9b began): R1-R5,
+R6.1-R6.4, R6.5a, R6.5b, R6.6, R6.7, R7, R8a, R8b (the entire
+Trader-Performance Dashboard module), and R9a (Bulk Channel Import
+Backend Read Contracts - see Section 2 below; no dedicated handoff file
+was written for R9a at the time it was committed, so it is summarized
+here for continuity).
+
+# 2. Recap: What R9a Already Provided
+
+R9a (commit `387d2aa1166bd74527da7565f6c3ec4a1367f451`, "Implement
+channel import backend contracts") added the database, model, repository,
+and advisory service foundations for Bulk Channel Import, but no
+authoritative atomic service-level import operation and no UI. Its four
+new public `TradeService` methods were strictly read-only and advisory;
+the migration and several of its own new repository functions
+(`create_channel()`, `create_channel_import_operation()`, and others) are
+write-capable, but were only ever called directly by tests and by R9b's
+own later service-level code - not by any R9a `TradeService` method
+itself:
+
+    - Migration `database/migrations/0008_channel_import_operations.sql`
+      - the `channel_import_operations` table, one row per successfully
+      completed confirmed operation, with CHECK constraints including
+      `processed_count >= 15` (the approved minimum-batch-size floor,
+      enforced at the database level).
+    - `database/models.py`: `ChannelImportOperation`,
+      `ChannelExternalIdAvailability`, `ChannelImportDuplicatePrediction`,
+      `ChannelImportChannelSummary`.
+    - `database/repository.py`: `create_channel()`,
+      `get_channel_by_external_id()`, `get_channel_by_id()`,
+      `list_channels()`, `create_channel_import_operation()`,
+      `get_latest_channel_import_operation()`; `UNSPECIFIED_CHANNEL_EXTERNAL_ID`
+      and `compute_content_hash()` promoted to public.
+    - `database/service.py`: four new read-only `TradeService` methods -
+      `list_bulk_import_channels()`, `get_bulk_import_channel_summary()`,
+      `check_new_channel_external_id_availability()`,
+      `predict_channel_import_duplicate_statuses()` - each advisory only;
+      every one explicitly deferred authoritative duplicate/collision
+      detection to "Recovery Milestone R9b, not yet implemented."
+
+R9b is exactly that deferred, authoritative write path.
+
+# 3. Exact Implementation Files
+
+Exactly four files changed, all in the approved commit
+`e9b49df9c00d6d7e9b5d088711932a0d3e22bf6b`:
+
+    database/models.py                          ( 36 additions,  0 deletions,  36 changes)
+    database/service.py                         (451 additions, 75 deletions, 526 changes)
+    tests/test_bulk_channel_import_service.py   (965 additions, 10 deletions, 975 changes)
+    tests/test_models.py                        ( 95 additions,  0 deletions,  95 changes)
+
+    4 files changed, 1547 additions, 85 deletions, 1632 total changes
+
+(The 526 and 975 figures above are each file's total changed-line count
+- additions plus deletions - not additions alone; `git diff --stat`
+reports this combined total per file.)
+
+No schema file, no migration, no `database/repository.py`, no
+`database/lifecycle.py`, no `app/*.py`, and no `requirements.txt` change
+of any kind.
+
+# 4. Detailed Implementation Summary
+
+`database/models.py` (additive only):
+
+    - New frozen dataclass `AtomicChannelImportResult`, exactly four
+      fields in this order: `channel`, `batch_result`, `lifecycle_result`,
+      `operation`. Constructed inside the transaction after the operation
+      row is created, but returned to the caller only after the
+      surrounding transaction context exits and commits successfully. If
+      commit or any earlier step fails, the call raises and no result
+      reaches the caller - a failed or rolled-back attempt never produces
+      one.
+
+`database/service.py`:
+
+    - New exception `ChannelExternalIdCollisionError(ValueError)` -
+      raised in create mode when a candidate new channel external id
+      already belongs to an existing channel for the resolved source.
+    - `ingest_batch()` (Recovery Milestone R5) mechanically extracted:
+      its former complete transaction body was moved, unchanged in
+      logic, into a new private `_ingest_batch_no_commit()`; `ingest_batch()`
+      itself becomes a thin wrapper that still validates its own inputs,
+      still segments the raw text itself, still resolves source/channel
+      via `get_or_create_source()`/`get_or_create_channel()`/
+      `get_or_create_unspecified_channel()` exactly as before, then
+      delegates the rest. `ingest_batch()`'s own public contract -
+      every return value, count, the all-duplicate short-circuit, the
+      narrow unique-constraint race carve-out, and its own transaction
+      behavior - is completely unchanged; its full pre-existing
+      regression suite in `tests/test_service.py` passed unmodified.
+    - New private `_ingest_batch_no_commit(self, *, source, channel,
+      raw_batch_text, reference_date, timezone, segmented_messages)`:
+      never begins/commits/rolls back a transaction; never calls
+      `segment_discord_batch()`, `get_or_create_source()`,
+      `get_or_create_channel()`, `get_or_create_unspecified_channel()`,
+      or any `rebuild_*` method. Reuses the existing
+      `_duplicate_outcome()` and `_ingest_channel_message_no_commit()`
+      helpers exactly as `ingest_batch()` already did - no second
+      implementation of duplicate detection, the SAVEPOINT race
+      carve-out, or extraction/signal creation exists anywhere.
+    - New private `_collect_newly_stored_raw_message_ids(self,
+      batch_result)`: collects every "stored" outcome's `raw_message_id`,
+      raising a fixed `RuntimeError` if one is ever `None` ("Stored batch
+      outcome is missing raw_message_id.") or if the collected count does
+      not match `batch_result.stored_count` ("newly_stored_ids count does
+      not match batch_result.stored_count.") - defensive validation for
+      an invariant that should be structurally impossible given
+      `MessageIngestOutcome`'s own contract, but is checked explicitly
+      anyway; either failure still rolls back the entire surrounding
+      transaction.
+    - New public `import_channel_batch_with_lifecycle_rebuild()` - see
+      Sections 5-9 below for its complete contract.
+
+`tests/test_bulk_channel_import_service.py` (extended, not a new file -
+R9a's own module docstring already named this as the intended home for
+R9b's coverage):
+
+    - Eight new test classes covering the full approved matrix:
+      `AtomicImportValidationTests`, `AtomicImportExistingModeTests`,
+      `AtomicImportCreateModeTests`, `AtomicImportMixedOutcomeTests`,
+      `AtomicImportDuplicateOnlyTests`, `AtomicImportOperationRecordTests`,
+      `AtomicImportLifecycleRebuildTests`, `AtomicImportRollbackTests`.
+    - A dedicated `CollectNewlyStoredRawMessageIdsTests` class for direct
+      unit coverage of the guarded helper, independent of the public
+      rollback proof.
+    - Every R9a test class in this file is unchanged.
+
+`tests/test_models.py` (extended, not a new file):
+
+    - New `AtomicChannelImportResultModelTests` class: frozen-dataclass
+      check, exact field-name set, exact field ORDER as an explicit list
+      (never only a set comparison, since order is part of the dataclass
+      contract), exact type hints via `typing.get_type_hints()`, a
+      no-default-values check, and construction with real nested
+      `Channel`/`BatchIngestResult`/`LifecycleRebuildResult`/
+      `ChannelImportOperation` instances.
+    - Every pre-existing test class in this file is unchanged.
+
+# 5. Frozen Behavioral Contracts
+
+    - `AtomicChannelImportResult` has exactly the four fields named
+      above, in that exact order, with no defaults.
+    - `ChannelExternalIdCollisionError` is a `ValueError` subclass,
+      matching this module's existing structured-rejection convention
+      (`TradeSignalNotFoundError`, `LifecycleUnsafeCorrectionError`).
+    - The 15-message minimum is enforced ONLY by the new
+      `import_channel_batch_with_lifecycle_rebuild()` - never by
+      `ingest_batch()` or `_ingest_batch_no_commit()`, both of which
+      still accept a batch smaller than 15 exactly as before.
+    - `segmented_messages` is always the exact, already-segmented
+      sequence the caller supplies (e.g. from a prior
+      `app.discord_adapter.segment_discord_batch()` call) - the atomic
+      method never calls `segment_discord_batch()` itself, proven by a
+      dedicated mock-based test.
+    - Create mode always calls `create_channel()` directly -
+      `get_or_create_channel()` is never called anywhere in the atomic
+      method.
+
+# 6. Transaction and Rollback Guarantees
+
+The entire operation - source/channel resolution (including channel
+creation in create mode and source creation in create mode, when the
+source did not already exist), `_ingest_batch_no_commit()`, the targeted
+lifecycle rebuild, and `create_channel_import_operation()` - runs inside
+exactly one existing `_r5_write_transaction()` (the same context manager
+every other Recovery-track write method already uses; no new transaction
+machinery was introduced).
+
+Any exception raised anywhere in that sequence - a validation
+`ValueError`, `ChannelExternalIdCollisionError`, an unconfirmed
+`sqlite3.IntegrityError`, an ingestion failure, `LifecycleIntegrityError`/
+`LifecycleSnapshotError` from the rebuild, the internal invariant
+`RuntimeError`, or a failure while inserting the operation row itself -
+rolls back every write made so far in that same call, including a newly
+created `sources` row and a newly created `channels` row. A failed or
+rolled-back attempt is never recorded as a `channel_import_operations`
+row.
+
+This is proven by four dedicated forced-failure tests
+(`AtomicImportRollbackTests`) plus one in `AtomicImportCreateModeTests`
+specifically targeting create-mode source rollback, each asserting a
+complete ten-table dictionary (`sources`, `channels`, `traders`,
+`import_batches`, `raw_messages`, `message_extractions`, `trade_signals`,
+`trade_lifecycles`, `trade_lifecycle_events`, `channel_import_operations`)
+is identical before and after the forced failure, via a new
+`_atomic_write_counts()` test helper (added during the test-hardening
+correction pass - see Section 15).
+
+To be precise about where each guarantee applies:
+
+    - A failure in the pure, pre-transaction validation (Section 7)
+      performs zero writes and requires no rollback - `self.conn` is
+      never touched, so there is nothing to undo.
+    - Once `_r5_write_transaction()` begins, any exception raised
+      anywhere inside it rolls back every write already made by the call
+      up to that point.
+    - Existing-mode source/channel validation (`get_source_by_name()`,
+      then the channel existence/ownership/sentinel checks) happens
+      inside the transaction, but strictly before any ingestion write -
+      it is itself read-only, so a rejection there still leaves nothing
+      to roll back even though `self.conn` is already inside the open
+      transaction at that point.
+    - Create-mode source creation (`get_or_create_source()`) can itself
+      write a new `sources` row inside the transaction; that row is
+      rolled back together with everything else if any later step in the
+      same call fails.
+
+# 7. Existing-Mode and Create-Mode Validation Rules
+
+Pure, pre-transaction checks perform no database query or write and open
+no transaction. `TradeService` already holds the caller-provided
+connection (`self.conn`) from construction; these checks simply never use
+it before raising:
+
+    - `channel_mode` must be exactly `"existing"` or `"create"`.
+    - `len(segmented_messages) >= 15`.
+    - The shared `_validate_batch_inputs()` (source_name/reference_date/
+      timezone/raw_batch_text shape).
+    - Existing mode: `existing_channel_id` is required; must be a
+      positive, non-boolean integer (bool explicitly rejected, since
+      `isinstance(True, int)` is `True` in Python); `new_channel_external_id`
+      and `new_channel_name` must both be `None` (rejected as
+      contradictory arguments otherwise).
+    - Create mode: `existing_channel_id` must be `None` (rejected as
+      contradictory otherwise); `new_channel_external_id` is required and
+      non-blank after stripping; the stripped value must not equal the
+      reserved `UNSPECIFIED_CHANNEL_EXTERNAL_ID` sentinel;
+      `new_channel_name` remains fully optional with `create_channel()`'s
+      own existing behavior preserved exactly (no new nonblank-name
+      rule).
+
+Inside the transaction:
+
+    - Existing mode: `source = get_source_by_name(...)` only - NEVER
+      `get_or_create_source()`; a missing source is a fixed rejection
+      (`"Source {source_name!r} does not exist."`) with no sources row
+      ever created. The selected channel must exist
+      (`"existing_channel_id {id} does not exist."`), must belong to the
+      resolved source (`"channel {id} does not belong to source
+      {source_name!r}."`), and must not be the reserved sentinel channel
+      (`"existing_channel_id must not refer to the reserved unspecified
+      channel."`).
+    - Create mode: `source = get_or_create_source(...)` - MAY create a
+      new `sources` row as part of the same atomic transaction (rolled
+      back together with everything else on any later failure). An
+      up-front `get_channel_by_external_id()` check raises
+      `ChannelExternalIdCollisionError` if the id is already taken;
+      otherwise `create_channel()` is called directly; a
+      `sqlite3.IntegrityError` from that call is re-queried once - a
+      confirmed real collision translates to
+      `ChannelExternalIdCollisionError`, but an unconfirmed
+      `IntegrityError` (the re-query also finds nothing) propagates
+      completely unchanged, never mistranslated.
+
+# 8. Duplicate-Only Behavior
+
+When every element of `segmented_messages` is already present for the
+resolved channel:
+
+    - `_ingest_batch_no_commit()` takes its own existing "all duplicates"
+      short-circuit: no `import_batches` row is created;
+      `BatchIngestResult(import_batch_id=None, stored_count=0,
+      duplicate_count=len(segmented_messages), ...)`.
+    - No newly-stored raw-message ids exist, so the targeted-rebuild
+      private helper `_rebuild_lifecycles_for_raw_message_ids_no_commit()`
+      is never even called (proven by a dedicated mock assertion,
+      `mock_rebuild.assert_not_called()`, added during the test-hardening
+      pass) - `lifecycle_result` is instead the zero-valued result
+      equivalent to `_RebuildCounters().to_result()`.
+    - `create_channel_import_operation()` is still called, with
+      `import_batch_id=None`, `stored_count=0`,
+      `duplicate_count=batch_result.total_segmented` - satisfying the
+      table's own CHECK constraint exactly, and recording a genuine
+      success row that immediately becomes the channel's latest
+      successful operation (`get_latest_channel_import_operation()`).
+
+# 9. Targeted Lifecycle-Rebuild Behavior
+
+Newly-stored raw-message ids (collected via the guarded
+`_collect_newly_stored_raw_message_ids()`, Section 4) are passed to the
+existing, unmodified private
+`_rebuild_lifecycles_for_raw_message_ids_no_commit()` - the same targeted
+rebuild engine `correct_trade_signal()` already uses internally. Only the
+lifecycle keys touched by those specific raw messages are rebuilt; a
+pre-existing, unrelated current lifecycle for a different
+trader/symbol/channel is left completely untouched - proven by a
+dedicated test that seeds an unrelated lifecycle first, then confirms its
+id, `is_current` flag, and event count are byte-for-byte unchanged after
+an unrelated atomic import.
+
+No change was made to `database/lifecycle.py` or the lifecycle
+repository layer.
+
+# 10. Test Coverage Summary
+
+Full approved matrix implemented, plus a subsequent test-hardening
+correction pass (see Section 15):
+
+    - 14-message rejection; exactly 15 accepted; invalid `channel_mode`.
+    - Existing-mode: success, wrong-source rejection, missing-channel
+      rejection, sentinel rejection, absent-source rejection (no sources
+      row created), every contradictory-argument case, positive-integer
+      and boolean rejection of `existing_channel_id`.
+    - Create-mode: success, sentinel rejection, blank rejection, `None`
+      rejection, up-front collision rejection, contradictory-argument
+      rejection, confirmed-race collision translation (mock-driven),
+      unconfirmed-`IntegrityError` propagation (mock-driven), absent
+      source created, forced-failure source rollback.
+    - Mixed new/duplicate messages; duplicate-only success (with the
+      targeted-rebuild-never-called proof).
+    - A deterministic real "unrecognized" message and a deterministic
+      patched-extractor "failed" message, each proven counted correctly
+      in both the batch result and the recorded operation row.
+    - Targeted-vs-unrelated lifecycle isolation.
+    - Four rollback proofs (ingestion failure, lifecycle-rebuild failure,
+      operation-insert failure, stored-id invariant failure), each
+      asserting the complete ten-table `_atomic_write_counts()`
+      dictionary unchanged.
+    - No-commit proof for `_ingest_batch_no_commit()` called directly.
+    - Exact-ordered-sequence proof (never a set) that the caller-supplied
+      `segmented_messages` are used unchanged, with `segment_discord_batch()`
+      proven never called.
+    - Direct unit tests for `_collect_newly_stored_raw_message_ids()`
+      (missing-id and count-mismatch fixed-message `RuntimeError`s, plus
+      a normal-path ordering check).
+    - `ingest_batch()`'s complete pre-existing regression suite in
+      `tests/test_service.py` re-run unmodified, proving its public
+      contract is unaffected by the extraction.
+
+# 11. Exact Focused, Regression, and Full-Suite Results
+
+Focused (final, post-correction-pass):
+    python -m unittest tests.test_bulk_channel_import_service tests.test_models
+    Ran 124 tests in 5.901s
+    OK
+
+Regression:
+    python -m unittest tests.test_service tests.test_service_lifecycle tests.test_repository_recovery
+    Ran 451 tests in 36.032s
+    OK
+    (Expected simulated-COMMIT/ROLLBACK-failure log lines appear from the
+    pre-existing, unmodified R5TransactionContextManagerTests - not test
+    failures; final summary line is OK in every run.)
+
+Full suite (pre-commit):
+    python -m unittest discover -s tests -p "test_*.py"
+    Ran 1535 tests in 134.139s
+    OK
+
+1535 = 1491 (R9a baseline) + 44 new R9b tests. 0 failures, 0 errors in
+every run.
+
+# 12. Confirmation of Normal Fast-Forward Push
+
+    git push origin main
+    To https://github.com/mrlooking1144/Discord_Traders.git
+       387d2aa..e9b49df  main -> main
+
+A plain range notation (`387d2aa..e9b49df`), never a forced-update `+`
+marker; no `--force`/`--force-with-lease` flag was used at any point; no
+tag option was passed.
+
+# 13. Current Local/Origin Synchronization State
+
+    Local main:  e9b49df9c00d6d7e9b5d088711932a0d3e22bf6b
+    origin/main: e9b49df9c00d6d7e9b5d088711932a0d3e22bf6b
+    Ahead 0 / behind 0.
+
+No `Co-Authored-By` trailer exists on the commit - the message is exactly
+`Implement atomic bulk channel import`, nothing appended.
+
+# 14. Protected Untracked-File Confirmation
+
+All 12 pre-existing, project-unrelated untracked paths were confirmed
+present and untouched before, during, and after every step of this
+milestone (planning, implementation, the test-hardening correction pass,
+commit, and push):
+
+    CLAUDE.md
+    R6.4_quality_review_bundle.txt
+    app/__pycache__/
+    database/__pycache__/
+    docs/DATABASE_DESIGN_V1.md
+    docs/DECISIONS/DECISION_TEMPLATE.md
+    docs/DECISIONS/README.md
+    docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt
+    docs/HANDOFFS/HANDOFF_TEMPLATE.md
+    docs/HANDOFFS/README.md
+    docs/REVIEW_RULES.md
+    tests/__pycache__/
+
+None was staged, modified, deleted, renamed, or cleaned at any point.
+
+# 15. Process Notes: Two Review Passes Before Commit
+
+R9b went through the project's full Development workflow (design ->
+review -> implement -> test -> review -> commit) with two distinct
+correction passes on the plan/implementation before the commit above was
+made:
+
+    1. Architecture correction (applied to the plan, then implemented):
+       source resolution now branches by `channel_mode` - existing mode
+       never creates a source (uses `get_source_by_name()` only), create
+       mode may (`get_or_create_source()`, with full rollback proof for
+       the newly created row); strict rejection of contradictory
+       mode-specific arguments was added; `existing_channel_id` is
+       validated as a strict positive, non-boolean integer; the
+       confirmed-race collision test design was corrected to be
+       mock-driven rather than a real second-connection writer, since
+       `_r5_write_transaction()`'s own `BEGIN IMMEDIATE` makes a genuine
+       concurrent race unreachable under this connection's transaction
+       convention.
+    2. Test-hardening correction pass (applied to the implementation,
+       after initial implementation review): the exact-ordered-sequence
+       proof replaced a set-only comparison; the ten-table
+       `_atomic_write_counts()` helper was added and applied to every
+       forced-failure/unconfirmed-error test, including explicit
+       per-table assertions for the final-step
+       (`test_operation_insert_failure_rolls_back_everything`) proof; the
+       duplicate-only test now proves the targeted-rebuild helper is
+       never called; a missing create-mode `None`-required-id test was
+       added; three substring assertions were tightened to exact fixed
+       messages. No strengthened test exposed a production-code defect -
+       every one passed against the unchanged, already-reviewed
+       `database/service.py`/`database/models.py`.
+
+# 16. Explicit Statement: R9c UI Is Not Started
+
+No Streamlit/dashboard/UI work of any kind was performed in R9a or R9b.
+No `app/*.py` file was created or modified by either milestone. Bulk
+Channel Import remains completely unreachable from the running
+application - a Product Owner cannot yet paste a Discord batch through
+the UI. Recovery Milestone R9c has no reviewed design, has not started,
+and no R9c planning of any kind (design, file list, signatures, or test
+matrix) has been produced as of this handoff.
+
+# 17. Exact Next Milestone
+
+    Recovery Milestone R9c - Bulk Channel Import UI
+
+The final sub-milestone of the Bulk Channel Import module (Recovery
+Milestone R9, R9a + R9b + R9c). It requires its own separate
+scoping/design planning pass and explicit Product Owner / Technical
+Architect (ChatGPT) approval before any implementation begins, in a new
+ChatGPT session - it must not begin automatically, and must not begin
+before this documentation update is itself reviewed, approved, committed,
+and pushed.
+
+R9c scope reminder (per the approved Bulk Channel Import module scope,
+carried forward from earlier planning correspondence), at minimum:
+
+    - Let the user paste at least 15 Discord messages in one batch.
+    - Let the user select an existing channel or create a new channel.
+    - Preview the batch's segmentation before import.
+    - Show duplicate prediction for the previewed messages (using the
+      existing R9a advisory `predict_channel_import_duplicate_statuses()`).
+    - Show per-channel checkpoint/resume information (using the existing
+      `get_channel_checkpoints()` / R9a channel-summary contracts).
+    - Confirm and run the atomic import via
+      `TradeService.import_channel_batch_with_lifecycle_rebuild()`
+      (Recovery Milestone R9b, this milestone).
+    - Display the just-completed operation's counts (stored/duplicate/
+      unrecognized/failed, from the returned `AtomicChannelImportResult`).
+    - Refresh the existing Trader-Performance Dashboard (Recovery
+      Milestone R8) so newly imported trades are reflected.
+    - Preserve the completed result on screen until the user explicitly
+      starts a new batch (a "Start Next Batch" control) - never clearing
+      it automatically on the next rerun.
+
+Recovery Milestone R9 as a whole is NOT yet complete. It becomes complete
+only once R9c is implemented, tested, reviewed, committed, and pushed.
+
+====================================================================
+End of Recovery Milestone R9b Handoff
+====================================================================

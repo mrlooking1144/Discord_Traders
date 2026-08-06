@@ -1,0 +1,508 @@
+====================================================================
+Discord Traders - Recovery Milestone R9c Handoff
+Bulk Channel Import UI
+====================================================================
+
+This is a standalone handoff. A new Claude Code or ChatGPT session should
+be able to resume work from this file and the committed repository state
+alone, without needing the conversation that produced it.
+
+# 1. Milestone Identity and Completion Status
+
+Project: Discord Traders - a source-independent Trade Database
+application (Discord is the first data source; Telegram, X, Email, CSV,
+REST APIs, and manual entry are future sources).
+
+Project phase: Recovery Phase, layered on top of the released `v0.1.0`
+manual-entry track (Phase 2D, complete).
+
+Milestone: Recovery Milestone R9c - "Bulk Channel Import UI" - the third
+and final sub-milestone of the Bulk Channel Import module (Recovery
+Milestone R9: R9a + R9b + R9c).
+
+Status: COMPLETE. Implemented, tested (focused, regression, and full
+suite), reviewed through an initial implementation pass plus a separate
+UI-robustness correction pass, committed, and pushed to `origin/main`.
+
+Recovery Milestone R9 (Bulk Channel Import: R9a + R9b + R9c) is now
+FULLY COMPLETE as of this milestone. The Product Owner's target
+workflow - pasting Discord messages directly into the running
+application and viewing performance by trader - is now fully achievable
+end to end.
+
+Preceding milestones (all complete and pushed before R9c began): R1-R5,
+R6.1-R6.4, R6.5a, R6.5b, R6.6, R6.7, R7, R8a, R8b (the entire
+Trader-Performance Dashboard module), R9a (Bulk Channel Import Backend
+Read Contracts), and R9b (Atomic Bulk Channel Import).
+
+# 2. Repository and Branch
+
+Repository: `C:\Users\sstay\Desktop\Claude New\Discord_Traders`
+Branch: `main` (the only branch in active use)
+Remote: `origin` (GitHub, `mrlooking1144/Discord_Traders`)
+
+At the time of this documentation pass, local `main` and `origin/main`
+are synchronized at the R9c implementation commit (Section 3), 0 ahead /
+0 behind, with only this documentation update (this file and the
+corresponding `docs/PROJECT_STATUS.md` edit) present as uncommitted
+working-tree changes on top of it.
+
+# 3. Implementation Commit and Push Status
+
+Implementation commit hash and message:
+    e2063adf96c0a6db5af88c14aed046db35535e1b
+    "Implement bulk channel import UI"
+
+Pushed as a normal fast-forward from Recovery Milestone R9b's own
+documentation commit:
+    9beb7aebc0c80d1416a0ba2eda6b98dfcdc27e22
+
+No `Co-Authored-By` trailer exists on the commit. No tag was created or
+moved during implementation, the UI-robustness correction pass, the
+commit, or the push; the pre-existing `v0.1.0` tag remains unrelated and
+unchanged. All 12 pre-existing, unrelated untracked repository entries
+(see Section 17) were confirmed present and untouched throughout every
+step.
+
+A separate, later-approved UI-robustness correction pass (Section 13)
+was folded into this same implementation commit before it was committed
+- there is only one R9c implementation commit, not two.
+
+# 4. Exact 11-File Implementation Scope
+
+Exactly these 11 files were created or modified for Recovery Milestone
+R9c, and are exactly what commit `e2063adf96c0a6db5af88c14aed046db35535e1b`
+contains (11 files changed, 2797 insertions(+), 10 deletions(-)):
+
+Modified (8):
+    app/streamlit_app.py
+    database/models.py
+    database/repository.py
+    database/service.py
+    tests/test_app.py
+    tests/test_models.py
+    tests/test_repository_recovery.py
+    tests/test_service.py
+
+Created (3):
+    app/bulk_import_formatting.py
+    tests/test_bulk_import_formatting.py
+    tests/test_bulk_import_integration.py
+
+No migration, schema (`database/schema.sql`), parser (`app/parser.py`),
+Discord adapter (`app/discord_adapter.py`), lifecycle engine
+(`database/lifecycle.py`), analytics engine (`database/analytics.py`),
+dependency, or `requirements.txt` change of any kind was made.
+
+# 5. Product Behavior
+
+A fourth sidebar workflow, `"Bulk Channel Import"`, was added to the
+existing `st.sidebar.radio("Workflow", [...])` control in
+`app/streamlit_app.py` - the one approved change to that line; Manual
+Message Entry, Review Signals, and Trader Performance remain
+behaviorally unchanged and are fully regression-tested (183 pre-existing
+`tests/test_app.py` tests, all still passing).
+
+The workflow lets the Product Owner:
+    - Paste a raw Discord channel-history block of at least 15 messages.
+    - Choose to import into an existing channel, or create a new one.
+    - Preview the exact segmentation and (existing mode only) duplicate
+      prediction before any write occurs - Preview performs zero
+      business-data writes.
+    - Confirm the import, which atomically resolves/creates the channel,
+      ingests the batch, rebuilds only the newly affected lifecycles,
+      and records the operation (all via the existing Recovery Milestone
+      R9b atomic service method - see Section 9).
+    - See the completed result (frozen paste, frozen preview, operation
+      counts, lifecycle rebuild result, and a refreshed per-channel
+      checkpoint) preserved on screen until explicitly starting the next
+      batch.
+
+Small batches below the 15-message floor remain handled entirely by the
+pre-existing Manual Message Entry workflow, which this milestone does
+not modify.
+
+# 6. Existing-Channel Workflow
+
+Channel mode "Use an existing channel" calls the existing Recovery
+Milestone R9a read-only method `TradeService.list_bulk_import_channels(
+source_name="discord")` to populate a `st.selectbox` (fixed key
+`bulk_import_existing_channel_select`, `index=None` with a placeholder -
+no channel is ever preselected). Selecting a channel shows its resume
+panel (Section 11) and, when it already has a checkpoint, a resume
+guidance message about re-including the last previously imported
+message in the next paste (duplicate detection will simply mark it a
+duplicate again - it is never required to be excluded).
+
+On Preview Batch, existing mode calls
+`TradeService.predict_channel_import_duplicate_statuses(channel_id=...,
+segmented_messages=...)` (the existing R9a advisory method) and displays
+"New: N | Predicted duplicate: N" plus any content-difference warnings
+(a message predicted duplicate whose content differs from the stored
+original).
+
+# 7. Create-Channel Workflow
+
+Channel mode "Create a new channel" requires a stable, non-blank
+external channel ID (`bulk_import_new_channel_external_id`) and accepts
+an optional display name (`bulk_import_new_channel_name`). The reserved
+sentinel value `__unspecified__` is invalid for Bulk Channel Import and
+is rejected before Preview can ever create a preview for it (Section
+13, Correction 5) - it is never silently ignored.
+
+While a non-blank external ID is entered, an advisory (non-blocking)
+availability check via the existing R9a method
+`TradeService.check_new_channel_external_id_availability()` shows either
+a success message (available) or a strong warning (already in use for
+this source) - Preview and Confirm remain allowed either way; Recovery
+Milestone R9b's own atomic transaction always repeats the authoritative
+collision check at Confirm time.
+
+Create mode never calls duplicate prediction (no channel exists yet to
+check against) and never fabricates prediction objects. Instead, Preview
+shows a fixed notice: duplicate prediction is not available until the
+new channel is created, and every segmented message is shown as
+"Provisionally new: N" with "Predicted duplicate: Not available for
+create mode" - explicit wording that the classification is provisional,
+subject to the authoritative confirm-time channel-collision and
+duplicate checks.
+
+# 8. Preview Behavior and 15-Message Minimum
+
+Preview Batch (fixed key `bulk_import_preview_button`) segments the
+pasted text via the existing, unmodified `app.discord_adapter.
+segment_discord_batch()` adapter - never re-implemented in the UI. A
+result of fewer than 15 segmented messages is rejected with a fixed
+message directing the user to Manual Message Entry for smaller batches;
+this floor is enforced only for the UI's own Preview gate (Recovery
+Milestone R9b's `import_channel_batch_with_lifecycle_rebuild()` also
+independently enforces the same floor at Confirm time).
+
+A successful Preview freezes a snapshot of every editing-relevant input
+(raw text unchanged; `channel_mode`; the resolved channel id or the
+stripped external id/name; `reference_date.isoformat()`; the stripped
+timezone; mode-irrelevant fields forced to `None`) together with the
+segmented messages and any predictions, into `st.session_state[
+"bulk_import_preview"]`. On every subsequent rerun, the live snapshot is
+recomputed and compared to the frozen one - any mismatch (including a
+channel-mode switch) drops the preview and the confirmation checkbox;
+an unchanged re-Preview attempt that fails (e.g. a forced segmentation
+error) leaves a still-valid old preview in place. Every new Preview
+Batch click unconditionally clears the confirmation checkbox first,
+success or failure.
+
+Preview never creates or modifies any `sources`/`channels`/
+`import_batches`/`raw_messages`/`message_extractions`/`trade_signals`/
+`traders`/`trade_lifecycles`/`trade_lifecycle_events`/
+`channel_import_operations` row - proven with a real-SQLite,
+ten-table row-count-unchanged integration test (Section 15).
+
+# 9. Confirmation and R9b Transaction Ownership
+
+Confirm Import (fixed key `bulk_import_confirm_button`) requires the
+confirmation checkbox (fixed key `bulk_import_confirm_checkbox`) and
+then calls exactly one write method, using only the frozen preview
+snapshot's values - never a live widget read:
+
+    TradeService.import_channel_batch_with_lifecycle_rebuild(
+        source_name="discord",
+        channel_mode=preview["channel_mode"],
+        existing_channel_id=preview["existing_channel_id"],
+        new_channel_external_id=preview["new_channel_external_id"],
+        new_channel_name=preview["new_channel_name"],
+        reference_date=preview["reference_date"],
+        timezone=preview["timezone"],
+        raw_batch_text=preview["raw_text"],
+        segmented_messages=preview["segmented"],
+    )
+
+This is the exact, unmodified Recovery Milestone R9b atomic service
+method. R9b owns the entire transaction end to end - channel/source
+creation (create mode), ingestion, deduplication, the targeted lifecycle
+rebuild, and the recorded `channel_import_operations` row all commit or
+roll back together, inside R9b's own existing `_r5_write_transaction()`.
+The UI never calls `conn.commit()`/`conn.rollback()` around this call,
+never re-implements deduplication or channel creation, and never
+performs its own lifecycle rebuild. A failed or rolled-back attempt
+never sets `bulk_import_result`, preserving the paste and preview for
+retry with a fixed, sanitized error message (Section 13).
+
+# 10. Completed-State Persistence and "Start Next Batch"
+
+On a successful Confirm, `st.session_state["bulk_import_result"]` is set
+to the returned `AtomicChannelImportResult` and `st.rerun()` is called.
+The completed view is a hard gate: while `bulk_import_result` is set,
+the editable form and Preview Batch are never rendered at all - only:
+
+    - A success banner.
+    - The exact frozen pasted text (disabled `st.text_area`).
+    - The exact frozen preview table (never re-segmented, never
+      re-predicted).
+    - "Last operation counts" (the exact label; the operation's
+      processed/stored/duplicate/unrecognized/failed counts).
+    - "Lifecycle Rebuild Result" (the targeted rebuild's counters).
+    - "Updated Channel Checkpoint" - a fresh
+      `get_bulk_import_channel_summary()` readback rendered through the
+      resume panel (Section 11), using `result.operation.timezone`
+      (Section 12).
+
+The only reset path is the "Start Next Batch" button (fixed key
+`bulk_import_start_next_batch_button`), which calls
+`_reset_bulk_import_state()` (clearing every R9c-owned session_state key,
+including every editable widget's own key) and `st.rerun()`, returning
+to a genuinely blank Editing form - no channel preselected, no stale
+value of any kind.
+
+# 11. Channel Checkpoint Model Extension
+
+`database/models.py`'s `ChannelCheckpoint` gained one additive field,
+`last_ingested_external_id: str`, placed immediately after
+`last_ingested_raw_message_id`. The dataclass docstring now explicitly
+distinguishes two independent halves that must never be confused:
+
+    - The CHRONOLOGICAL checkpoint (`latest_received_at`,
+      `latest_received_raw_message_id`, `latest_received_external_id`)
+      is based only on the resolved Discord message timestamp. All three
+      are `None` together whenever no message in the channel has any
+      resolved timestamp at all - this explicitly signals "chronological
+      resume information unavailable" and must never be substituted
+      with insertion order or ingestion time.
+    - The INGESTION checkpoint (`last_ingested_raw_message_id`,
+      `last_ingested_external_id`, `last_ingested_at`,
+      `last_import_batch_id`) is based only on insertion order
+      (`MAX(raw_messages.id)`) and is always fully populated for any
+      channel with at least one `raw_messages` row - including when
+      that row's own Discord timestamp is unresolved.
+
+`database/repository.py`'s `get_channel_ingestion_cursors()` now selects
+`rm.external_id AS last_ingested_external_id` (same join, same row, no
+new query); `database/service.py`'s `get_channel_checkpoints()` maps it
+straight through.
+
+The UI shows three distinct fields in the resume panel:
+    - "Latest resolved Discord time" - from `latest_received_at`;
+      "Unresolved" when absent; never substituted with ingestion time.
+    - "Chronological message ID" - from `latest_received_external_id`;
+      unavailable exactly when the Discord time itself is unresolved.
+    - "Latest ingestion checkpoint ID" - from `last_ingested_external_id`;
+      always available whenever a checkpoint exists at all; labeled
+      exactly "Synthetic checkpoint IDs" when the id carries the
+      `"synthetic:"` prefix (no real Discord message id was available -
+      the case for every Discord-sourced message, since the Discord
+      adapter never produces a real platform message id).
+
+# 12. Timezone Rules
+
+Before confirmation, the editing state's resume panel converts using the
+current LIVE form timezone (`bulk_import_timezone`); the frozen preview
+state (if the preview section itself independently displayed a
+checkpoint - it does not in the current implementation, only the
+editing-state panel and the post-success panel do) would use its own
+frozen preview timezone. After a successful import, the post-success
+checkpoint panel uses `result.operation.timezone` exclusively - never an
+older `latest_operation.timezone` that might predate the just-completed
+operation, and never the pre-import form/preview timezone.
+
+Canonical UTC is always shown secondarily alongside the converted local
+time. `format_checkpoint_timestamp()` (Section 14) never raises: a
+blank or invalid timezone name degrades to UTC-only display; an
+unresolved Discord time shows "Unresolved" regardless of timezone.
+
+# 13. Error Handling and Robustness Corrections
+
+Every advisory/read-only operation is individually wrapped and shows a
+fixed, sanitized message - the real exception is logged server-side only
+via the existing `log_operation_failure()` contract, never surfaced as
+raw text to the user:
+
+    - Database connection/service construction failure -> "Could not
+      access the database for Bulk Channel Import."
+    - Channel-list load failure -> "Could not load channels for this
+      source."
+    - Availability-check failure (non-`ValueError`) -> "Could not check
+      external channel ID availability."
+    - Duplicate-prediction failure -> "Could not load duplicate
+      predictions for this batch."
+    - Post-success checkpoint readback failure -> "The import succeeded,
+      but refreshed checkpoint details could not be loaded." (the
+      successful result itself always remains fully visible - the UI
+      never appears as though the import failed).
+
+A separate, later-approved UI-robustness correction pass hardened five
+specific behaviors, folded into the same implementation commit:
+
+    1. Channel-list load failure no longer falsely claims "No channels
+       exist for this source yet..." - a separate `channel_list_loaded`
+       flag gates that message (only shown when loading succeeded and
+       genuinely returned zero channels), and no selectable channel
+       (not even an empty one) renders at all when loading failed; the
+       pasted text and other form fields remain untouched.
+    2. A `None` return from the post-success
+       `get_bulk_import_channel_summary()` readback (as opposed to a
+       raised exception) is now treated identically - the exact same
+       fixed refresh warning shows, with the successful result remaining
+       fully visible either way.
+    3. `segment_discord_batch()` is now called inside a try/except (a
+       new fixed message, "Could not segment this Discord batch.",
+       shows on failure); a failure never creates or replaces
+       `bulk_import_preview`, never reaches duplicate prediction or
+       import, and leaves any still-valid prior preview (unchanged
+       inputs) exactly as it was - the confirmation checkbox is still
+       cleared, since every Preview Batch click already clears it
+       unconditionally first.
+    4. The editing/advisory/Preview Batch database connection is now
+       guaranteed to close via a real `try/finally` wrapping every
+       operation that uses it (channel list, selectbox/resume panel,
+       availability check, segmentation, duplicate prediction, preview
+       construction) - closed even if any of them raises unexpectedly.
+       The connection is still not held open during the later pure
+       preview rendering or the Confirm transaction (which opens its own
+       connection).
+    5. An invalid reserved external ID (a `ValueError` from
+       `check_new_channel_external_id_availability()` - blank, or the
+       `__unspecified__` sentinel) is no longer silently swallowed with
+       a bare `pass`. A new fixed message, "This external channel ID is
+       not valid for Bulk Channel Import.", shows, and the candidate is
+       marked invalid for Preview Batch - no preview can be created or
+       replaced for it, so Confirm can never be reached for it either.
+       No parallel `__unspecified__` string comparison was implemented -
+       the existing R9a method's own `ValueError` is the sole validation
+       source. An ordinary unavailable/colliding ID (no `ValueError`,
+       `is_available=False`) is unaffected: the strong advisory warning
+       still shows and Preview remains allowed, per R9b's own
+       authoritative collision rejection at Confirm time.
+
+# 14. Pure Formatting Module
+
+`app/bulk_import_formatting.py` (new) mirrors the existing
+`app/dashboard_formatting.py` convention exactly: no `streamlit`/
+`sqlite3`/`database.repository`/`database.service` import; every
+function takes already-fetched data and returns display-ready values.
+Public functions: `format_channel_option_label`,
+`is_synthetic_external_id`, `format_checkpoint_external_id`,
+`format_availability_message`, `build_preview_rows` (never sorts -
+preserves exact segmented-batch order, matching predictions by
+`sequence_in_batch`), `count_new_vs_duplicate`,
+`build_create_mode_prediction_notice`,
+`build_content_difference_warnings`, `format_checkpoint_timestamp`
+(converts to local timezone first, canonical UTC secondary; "Unresolved"
+when the Discord time itself is unresolved - never substituted with
+ingestion time; degrades to UTC-only for a blank/invalid timezone; never
+raises), `build_resume_panel`, `build_last_operation_counts`,
+`build_lifecycle_rebuild_summary`, `build_resume_guidance_message`.
+
+# 15. Test Coverage
+
+    - `tests/test_app.py`'s `BulkChannelImportWorkflowTests`: 41 tests
+      (35 from the original implementation pass + 6 from the
+      UI-robustness correction pass) - workflow availability, the
+      15-message floor, existing/create mode confirm-argument
+      correctness, create-mode-never-calls-prediction and
+      provisional-wording, advisory-collision-warning, sentinel
+      exclusion, preview ordering, duplicate/content-difference display,
+      unresolved-time+checkpoint-id display (real and synthetic),
+      pre/post-confirm timezone source, checkbox-clearing (staleness/
+      replacement/failed-attempt), confirm-failure preservation,
+      immediate completed-state render, completed-state paste/preview
+      visibility and non-re-segmentation, result persistence across an
+      unrelated rerun, full reset via "Start Next Batch", channel-list
+      failure (both the fixed message and the absence of the false
+      empty-state message), the `None`-summary-readback warning,
+      segmentation-failure sanitization (both a fresh failure and an
+      unchanged-input re-Preview case preserving the old preview),
+      editing-connection cleanup on a segmentation failure, and the
+      invalid-external-ID validation block.
+    - `tests/test_app.py` complete: 189/189 passing.
+    - `app/bulk_import_formatting.py`'s own new
+      `tests/test_bulk_import_formatting.py`: 39 pure-module tests, no
+      database or Streamlit involved.
+    - New `tests/test_bulk_import_integration.py`: 8 real-SQLite tests
+      (no service/repository mocking, except one targeted
+      fault-injection patch in the one rollback test) - existing-channel
+      happy path, create-channel happy path (plus a fresh-session
+      blank-form proof), a duplicate-only reimport across two sessions,
+      a Trader Performance dashboard refresh proof, a
+      preview-writes-zero-rows proof (ten-table before/after count
+      comparison), a real checkpoint-external-id-through-the-pipeline
+      proof, and one late-failure rollback test (patching
+      `database.service.create_channel_import_operation`).
+    - `tests/test_bulk_channel_import_service.py` (Recovery Milestone
+      R9b's own service-level suite, unchanged by R9c): 77/77 passing.
+    - `tests/test_models.py`, `tests/test_repository_recovery.py`,
+      `tests/test_service.py`: extended additively for the
+      `ChannelCheckpoint.last_ingested_external_id` field (Section 11);
+      all pass unmodified alongside the new coverage.
+
+# 16. Full-Suite Result
+
+    python -m unittest discover -s tests -p "test_*.py"
+    Ran 1626 tests in ~176-183s - OK (0 failures, 0 errors)
+
+1626/1626 tests passing overall (1620 pre-existing immediately before
+the UI-robustness correction pass + 6 new correction tests).
+`git diff --check` passed with no output (empty) at every checkpoint
+during implementation, correction, commit, and push.
+
+# 17. Protected Untracked Paths
+
+These 12 untracked repository entries existed before Recovery Milestone
+R9c began and were confirmed present, unchanged, and untouched
+throughout implementation, correction, review, commit, push, and this
+documentation pass:
+
+    CLAUDE.md
+    R6.4_quality_review_bundle.txt
+    app/__pycache__/
+    database/__pycache__/
+    docs/DATABASE_DESIGN_V1.md
+    docs/DECISIONS/DECISION_TEMPLATE.md
+    docs/DECISIONS/README.md
+    docs/HANDOFFS/Discord_Traders_Real_Message_Corpus_Planning_Prompt.txt
+    docs/HANDOFFS/HANDOFF_TEMPLATE.md
+    docs/HANDOFFS/README.md
+    docs/REVIEW_RULES.md
+    tests/__pycache__/
+
+# 18. Governance Reminders
+
+Per `CLAUDE.md`: Claude Code implements approved designs only - it does
+not design or approve features on its own. Every step of Recovery
+Milestone R9c (planning, a subsequent architecture-correction pass,
+implementation, a subsequent UI-robustness correction pass, commit, and
+push) was performed only after explicit, separate Product Owner /
+Technical Architect (ChatGPT) approval for that specific step. No
+`Co-Authored-By` trailer is ever added to a commit for this project (a
+standing, confirmed user preference). No milestone beyond R9c has been
+started. This documentation pass modifies only `docs/PROJECT_STATUS.md`
+and creates only this handoff file - no implementation or test file was
+touched, and nothing has been staged, committed, pushed, or tagged as
+part of this documentation pass.
+
+# 19. Current Repository State
+
+    Branch: main
+    Local main / origin/main: e2063adf96c0a6db5af88c14aed046db35535e1b
+    Ahead / behind: 0 / 0
+    Uncommitted working-tree changes: docs/PROJECT_STATUS.md (modified)
+        and docs/HANDOFFS/R9c_bulk_channel_import_ui_handoff.txt (new) -
+        this documentation pass only; nothing staged.
+    Protected untracked paths: all 12 present and unchanged (Section 17).
+    Tags: only the pre-existing v0.1.0 (unrelated, unchanged).
+
+# 20. Recommended Next Action
+
+This documentation update (this file and the corresponding
+`docs/PROJECT_STATUS.md` edit) requires Product Owner / Technical
+Architect (ChatGPT) review before it is staged, committed, or pushed.
+Once approved, commit and push it as a separate commit from the
+already-pushed R9c implementation commit
+`e2063adf96c0a6db5af88c14aed046db35535e1b`, and verify local `main` and
+`origin/main` remain identical (0 ahead / 0 behind) afterward.
+
+Recovery Milestone R9 (Bulk Channel Import: R9a + R9b + R9c) is now
+fully complete. No further Recovery milestone has a reviewed design or
+approval yet - the next candidate module must not begin before this
+documentation update is synchronized to `origin/main`, and will require
+its own separate scoping/design planning pass and explicit Product
+Owner / Technical Architect (ChatGPT) approval, in a new ChatGPT
+session, before any implementation begins.
